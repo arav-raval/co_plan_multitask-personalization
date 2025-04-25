@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import abc
+import copy
 import json
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -60,17 +62,34 @@ class MealPreferenceModel(abc.ABC):
         """Load the meal model."""
 
     @abc.abstractmethod
-    def shift_preferences(self, rng: np.random.Generator) -> None:
-        """Shift the user's preferences."""
+    def shift_preferences(self, rng: np.random.Generator, current_step: int) -> bool:
+        """Shift the user's preferences.
+
+        Returns:
+            bool: True if a shift occurred, False otherwise
+        """
+
+    @abc.abstractmethod
+    def sync_variables(self, other) -> None:
+        """Sync the variables of this object with another object."""
+
+    @abc.abstractmethod
+    def adapt_to_preference_shift(self) -> None:
+        """Adapt the model to a preference shift by potentially resetting
+        memory."""
 
 
 class MealSpecMealPreferenceModel(MealPreferenceModel):
     """An explicit list of a user's meal preferences."""
 
     def __init__(
-        self, meal_specs: list[MealSpec], preference_shift_spec: PreferenceShiftSpec
+        self,
+        meal_specs: list[MealSpec],
+        preference_shift_spec: PreferenceShiftSpec,
+        lifelong_learning: dict | None = None,
     ) -> None:
         self._universal_meal_specs = {m.name: m for m in meal_specs}
+        print(f"self._universal_meal_specs: {self._universal_meal_specs}")
         assert len(self._universal_meal_specs) == len(
             meal_specs
         ), "Meal names must be unique"
@@ -93,11 +112,8 @@ class MealSpecMealPreferenceModel(MealPreferenceModel):
         # Lifelong learning setup.
         # If a shift occurs, all ingredients will shift at the same time.
         # The amount is sampled within a range.
-        # number of feedbacks given as a proxy for number of meals user had
-        # since the last shift
-        self._n_feedbacks_given = 0
 
-        # min number of meals before preference shift
+        # min number of steps before preference shift
         self._min_shift_interval = preference_shift_spec.min_shift_interval
         # probability of a preference shift
         self._shift_prob = preference_shift_spec.shift_prob
@@ -105,11 +121,45 @@ class MealSpecMealPreferenceModel(MealPreferenceModel):
         # Given old range [x-r, x+r], new range is [max(0, x*f-r), x*f+r]
         self._shift_factor_range = preference_shift_spec.shift_factor_range
 
-    def shift_preferences(self, rng: np.random.Generator) -> None:
+        # Lifelong learning configuration
+        self._lifelong_learning = lifelong_learning or {
+            "enabled": False,
+            "method": "periodic_reset",
+            "reset_interval": 100,
+        }
+        # Counter for tracking number of update calls
+        self._update_counter = 0
+
+    def sync_variables(self, other):
+        """Sync the variables of this object with another object."""
+        assert isinstance(other, self.__class__)
+        self._universal_meal_specs = copy.deepcopy(
+            other._universal_meal_specs  # pylint: disable=protected-access
+        )
+        # the models don't matter because the model update happens
+        # in the approach copies of hidden spec
+
+    def shift_preferences(self, rng: np.random.Generator, current_step: int) -> bool:
+        """Shift the user's preferences.
+
+        Returns:
+            bool: True if a shift occurred, False otherwise
+        """
         if (
-            self._n_feedbacks_given >= self._min_shift_interval
+            current_step > 0
+            and current_step % self._min_shift_interval == 0
             and rng.uniform() < self._shift_prob
         ):
+            # print the ingredient preferences before shift
+            logging.info("Ingredient preferences before shift:")
+            for meal_name, meal_spec in self._universal_meal_specs.items():
+                logging.info(f"Meal: {meal_name}")
+                for ing_spec in meal_spec.ingredients:
+                    logging.info(
+                        f"Ingredient: {ing_spec.name}, "
+                        + f"Temperature: {ing_spec.temperature}, "
+                        + f"Quantity: {ing_spec.quantity}"
+                    )
             ing_shift_factors = {}
             for meal_name, meal_spec in self._universal_meal_specs.items():
                 shifted_ing_specs = []
@@ -150,8 +200,55 @@ class MealSpecMealPreferenceModel(MealPreferenceModel):
                     meal_name, shifted_ing_specs
                 )
 
-            # Reset counter after shift.
-            self._n_feedbacks_given = 0
+            # print the ingredient preferences after shift
+            logging.info("Ingredient preferences after shift:")
+            for meal_name, meal_spec in self._universal_meal_specs.items():
+                logging.info(f"Meal: {meal_name}")
+                for ing_spec in meal_spec.ingredients:
+                    logging.info(
+                        f"Ingredient: {ing_spec.name}, "
+                        + f"Temperature: {ing_spec.temperature}, "
+                        + f"Quantity: {ing_spec.quantity}"
+                    )
+
+            # log ing_shift_factors
+            logging.info(
+                f"Shifted preferences at step {current_step} with "
+                + f"factors {ing_shift_factors}"
+            )
+
+            return True
+        return False
+
+    def adapt_to_preference_shift(self) -> None:
+        """Adapt the model to a preference shift by potentially resetting
+        memory."""
+        self._update_counter += 1
+        if self._lifelong_learning["enabled"]:
+            # logging.info(f"Total update calls: {self._update_counter}")
+            if (
+                self._lifelong_learning["method"] == "periodic_reset"
+                and self._update_counter > 1
+                and (self._update_counter - 1)
+                % self._lifelong_learning["reset_interval"]
+                == 0
+            ):
+                logging.info(f"Resetting memory after {self._update_counter} updates")
+                # reset for all meals and all ingredients
+                self._temperature_models = {}
+                self._quantity_models = {}
+                for meal_name, meal_spec in self._universal_meal_specs.items():
+                    self._temperature_models[meal_name] = {}
+                    self._quantity_models[meal_name] = {}
+                    for ing_spec in meal_spec.ingredients:
+                        temp_lo, temp_hi = ing_spec.temperature
+                        self._temperature_models[meal_name][ing_spec.name] = (
+                            Bounded1DClassifier(temp_lo, temp_hi)
+                        )
+                        quant_lo, quant_hi = ing_spec.quantity
+                        self._quantity_models[meal_name][ing_spec.name] = (
+                            Bounded1DClassifier(quant_lo, quant_hi)
+                        )
 
     def sample(self, rng: np.random.Generator) -> Meal:
         meal_spec_idx = rng.choice(len(self._universal_meal_specs))
@@ -211,7 +308,7 @@ class MealSpecMealPreferenceModel(MealPreferenceModel):
                 missing=missing,
             )
             critiques.append(critique)
-        self._n_feedbacks_given += 1
+
         return critiques
 
     def update(self, meal: Meal, critiques: list[IngredientCritique]) -> None:
