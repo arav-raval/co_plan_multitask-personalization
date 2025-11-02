@@ -78,6 +78,46 @@ MEDITERRANEAN_FEAST = RecipeSpec(
     },
 )
 
+ULTRA_COMPLEX_FEAST = RecipeSpec(
+    name="UltraComplexFeast",
+    spices=(
+        "salt", "pepper", "olive_oil", "onion", "garlic", "ginger",
+        "turmeric", "cumin", "coriander", "tomato", "chili", "paprika",
+        "cinnamon", "clove", "bay_leaf", "yogurt", "honey", "mint"
+    ),
+    predecessors={
+        # base seasoning chain
+        "salt": (),
+        "pepper": ("salt",),
+
+        # aromatic base
+        "olive_oil": ("salt",),
+        "onion": ("olive_oil",),
+        "garlic": ("onion",),
+        "ginger": ("onion",),
+
+        # spice fusion branch
+        "turmeric": ("garlic", "ginger"),
+        "cumin": ("turmeric",),
+        "coriander": ("turmeric", "cumin"),
+        "chili": ("coriander", "pepper"),
+        "paprika": ("chili", "coriander"),
+
+        # sweet–warm branch
+        "cinnamon": ("turmeric",),
+        "clove": ("cinnamon",),
+        "bay_leaf": ("clove", "cumin"),
+
+        # base integration
+        "tomato": ("coriander", "onion"),
+        "yogurt": ("tomato", "bay_leaf"),
+        "honey": ("yogurt", "paprika"),
+
+        # finishing
+        "mint": ("honey", "pepper", "yogurt"),
+    },
+)
+
 # RECIPE LOOKUP
 # # ---------------------------------------------------------------------------
 
@@ -88,6 +128,7 @@ ALL_RECIPES = {
     "SweetCurry": SWEET_CURRY,
     "GrandmasSoup": GRANDMAS_SOUP,
     "MediterraneanFeast": MEDITERRANEAN_FEAST,
+    "UltraComplexFeast": ULTRA_COMPLEX_FEAST,
 }
 
 def get_recipe(name: str) -> RecipeSpec:

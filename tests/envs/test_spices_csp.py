@@ -1,6 +1,7 @@
 """Tests for spices_csp.py."""
 
 import numpy as np
+import matplotlib.pyplot as plt
 
 from multitask_personalization.csp_solvers import RandomWalkCSPSolver
 from multitask_personalization.envs.spices.spices_csp import SpicesAssignCSPGenerator
@@ -15,9 +16,10 @@ def _make_env(seed: int, name: str = "BreakingBread") -> SpiceEnv:
     scene_spec = SpiceSceneSpec(recipe=recipe)
     return SpiceEnv(scene_spec, hidden_spec=None, seed=seed, eval_mode=False, verbose=True)
 
-def test_spices_csp_single_recipe(num_episodes: int = 4, recipe_name: str = "GrandmasSoup"):
+def test_spices_csp_single_recipe(num_episodes: int = 5, recipe_name: str = "UltraComplexFeast"):
     env_seed = 123
     csp_seed = 456
+    assert env_seed != csp_seed
 
     average_satisfactions = []
     actor_distributions = []
@@ -46,7 +48,7 @@ def test_spices_csp_single_recipe(num_episodes: int = 4, recipe_name: str = "Gra
             csp, samplers, policy, initialization = csp_generator.generate(obs)
 
             # import pdb; pdb.set_trace()
-            solver = RandomWalkCSPSolver(csp_seed, num_improvements=1, show_progress_bar=False)
+            solver = RandomWalkCSPSolver(csp_seed, show_progress_bar=False)
             sol = solver.solve(
                 csp,
                 initialization,
@@ -70,11 +72,35 @@ def test_spices_csp_single_recipe(num_episodes: int = 4, recipe_name: str = "Gra
         distribution = {k: round(v / len(filtered), 3) for k, v in distribution.items()}
         actor_distributions.append(distribution)
 
-    print(f"Average satisfactions: {average_satisfactions}")
-    print(f"Actor distributions: {actor_distributions}")
+        #print(f"Average satisfactions: {average_satisfactions}")
+        #print(f"Actor distributions: {actor_distributions}")
+    
+    visualize(num_episodes, average_satisfactions, actor_distributions)
     env.close()
 
+def visualize(num_episodes, average_satisfactions, actor_distributions):
+    fig, ax = plt.subplots(1, 2, figsize=(10, 5))
 
+    # Average satisfaction
+    ax[0].plot(range(1, num_episodes + 1), average_satisfactions, marker='o')
+    ax[0].set_title("Learning Curve: Average Satisfaction per Episode")
+    ax[0].set_xlabel("Episode")
+    ax[0].set_ylabel("Average Satisfaction")
+    ax[0].grid(True)
+
+    # Actor distributions
+    humans = [d.get("human", 0) for d in actor_distributions]
+    robots = [d.get("robot", 0) for d in actor_distributions]
+
+    ax[1].bar(range(len(humans)), humans, label="Human", alpha=0.7)
+    ax[1].bar(range(len(robots)), robots, bottom=humans, label="Robot", alpha=0.7)
+    ax[1].set_xlabel("Episode")
+    ax[1].set_ylabel("Actor Fraction")
+    ax[1].set_title("Actor Choice Distribution Over Time")
+    ax[1].legend()
+
+    plt.tight_layout()
+    plt.show()
 # def test_spices_csp():
 #     """Tests for spices_csp.py."""
 #     env_seed = 123
