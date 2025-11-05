@@ -21,8 +21,11 @@ def test_spices_csp_single_recipe(num_episodes: int = 5, recipe_name: str = "Ult
     csp_seed = 456
     assert env_seed != csp_seed
 
-    average_satisfactions = []
-    actor_distributions = []
+    metrics = {
+        "average_satisfactions": [],
+        "satisfaction_variances": [],
+        "actor_distributions": [],
+    }
 
     # Make environment and CSP generator
     env = _make_env(seed=env_seed, name=recipe_name)
@@ -65,42 +68,47 @@ def test_spices_csp_single_recipe(num_episodes: int = 5, recipe_name: str = "Ult
             csp_generator.observe_transition(prev_obs, action, obs, env_terminated, info)
             terminated = env_terminated
         
-        average_satisfactions.append(info["average_satisfaction"])
+        metrics["average_satisfactions"].append(info["average_satisfaction"])
+        metrics["satisfaction_variances"].append(info['satisfaction_variance'])
 
         filtered = [actor for _, actor in info['action_history'] if actor is not None]
         distribution = Counter(filtered)
         distribution = {k: round(v / len(filtered), 3) for k, v in distribution.items()}
-        actor_distributions.append(distribution)
+        metrics["actor_distributions"].append(distribution)
 
-        #print(f"Average satisfactions: {average_satisfactions}")
-        #print(f"Actor distributions: {actor_distributions}")
-    
-    visualize(num_episodes, average_satisfactions, actor_distributions)
+    visualize(num_episodes, metrics)
     env.close()
 
-def visualize(num_episodes, average_satisfactions, actor_distributions):
-    fig, ax = plt.subplots(1, 2, figsize=(10, 5))
+def visualize(num_episodes, metrics):
+    num_metrics = len(metrics)
+    fig, axes = plt.subplots(num_metrics, 1, figsize=(8, 3 * num_metrics))
 
-    # Average satisfaction
-    ax[0].plot(range(1, num_episodes + 1), average_satisfactions, marker='o')
-    ax[0].set_title("Learning Curve: Average Satisfaction per Episode")
-    ax[0].set_xlabel("Episode")
-    ax[0].set_ylabel("Average Satisfaction")
-    ax[0].grid(True)
+    if num_metrics == 1:
+        axes = [axes]
 
-    # Actor distributions
-    humans = [d.get("human", 0) for d in actor_distributions]
-    robots = [d.get("robot", 0) for d in actor_distributions]
+    for i, (metric_name, metric) in enumerate(metrics.items()):
+        ax = axes[i]
 
-    ax[1].bar(range(len(humans)), humans, label="Human", alpha=0.7)
-    ax[1].bar(range(len(robots)), robots, bottom=humans, label="Robot", alpha=0.7)
-    ax[1].set_xlabel("Episode")
-    ax[1].set_ylabel("Actor Fraction")
-    ax[1].set_title("Actor Choice Distribution Over Time")
-    ax[1].legend()
-
+        # TODO: Make this dynamic (temp just hardcoded for distribution metrics)
+        if metric_name == "actor_distributions":
+            humans = [d.get("human", 0) for d in metric]
+            robots = [d.get("robot", 0) for d in metric]
+            ax.bar(range(len(humans)), humans, label="Human", alpha=0.7)
+            ax.bar(range(len(robots)), robots, bottom=humans, label="Robot", alpha=0.7)
+            ax.set_xlabel("Episode")
+            ax.set_ylabel("Actor Fraction")
+            ax.set_title("Actor Choice Distribution Over Time")
+            ax.legend()
+        else: 
+            ax.plot(range(1, num_episodes + 1), metric, marker='o')
+            ax.set_title(f"{metric_name} per Episode")
+            ax.set_xlabel("Episode")
+            ax.set_ylabel(metric_name)
+            ax.grid(True)
+    
     plt.tight_layout()
     plt.show()
+
 # def test_spices_csp():
 #     """Tests for spices_csp.py."""
 #     env_seed = 123
