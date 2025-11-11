@@ -204,7 +204,6 @@ class CSPPolicy(abc.ABC, Generic[ObsType, ActType]):
     def __init__(self, csp_variables: Collection[CSPVariable], seed: int = 0) -> None:
         self._csp_variables = csp_variables
         self._seed = seed
-        self._rng = np.random.default_rng(seed)
         self._current_solution: dict[CSPVariable, Any] | None = None
         self._csp_var_name_to_var = {v.name: v for v in self._csp_variables}
 
