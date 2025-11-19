@@ -16,10 +16,12 @@ from collections import Counter
 # ---------------- PARAMETER SETUP ----------------
 PARAMETERS = {
     "num_episodes": 5,
+    "profile": "ChefA",
     "recipe_name": "UltraComplexFeast",
     "env_seed": 123,
     "csp_seed": 456,
     "logging_level": logging.INFO,
+    "train_frac": 0.8,
 }
 verbose = True
 # --------------------------------------------------
@@ -28,6 +30,7 @@ verbose = True
 def _make_env(seed: int, name: str = PARAMETERS["recipe_name"]) -> SpiceEnv:
     recipe = get_recipe(name)
     scene_spec = SpiceSceneSpec(recipe=recipe)
+
     return SpiceEnv(scene_spec, hidden_spec=None, seed=seed, eval_mode=False, verbose=verbose)
 
 def run_one_episode(env, generator, solver_seed=123):
@@ -171,10 +174,10 @@ def test_spices_csp_single_recipe(num_episodes: int = PARAMETERS["num_episodes"]
     env.close()
 
 @pytest.mark.multiple_recipes
-def test_spices_csp_multiple_recipes(num_episodes: int = 3, profile="ChefA"):
-    env_seed = 123
-    csp_seed = 456
-    train_frac = 0.8
+def test_spices_csp_multiple_recipes(num_episodes: int = PARAMETERS["num_episodes"], profile: str = PARAMETERS["profile"]):
+    env_seed = PARAMETERS["env_seed"]
+    csp_seed = PARAMETERS["csp_seed"]
+    train_frac = PARAMETERS["train_frac"]
     assert env_seed != csp_seed
 
     # Profile
@@ -186,50 +189,52 @@ def test_spices_csp_multiple_recipes(num_episodes: int = 3, profile="ChefA"):
     train_recipes = all_recipes[:num_train]
     test_recipes  = all_recipes[num_train:]
 
-    print(f"\n[Profile: {profile}]")
-    print(f"Train recipes: {train_recipes}")
-    print(f"Test recipes:  {test_recipes}")
+    logging.info(f"\n[Profile: {profile}]")
+    logging.info(f"Train recipes: {train_recipes}")
+    logging.info(f"Test recipes:  {test_recipes}")
 
     # Spice vocabulary
     all_spices = sorted({s for r in all_recipes for s in get_recipe(r).spices})
     generator = SpicesAssignCSPGenerator(spice_list=all_spices, seed=csp_seed)
 
-    # Training
+    # ----------------- TRAINING -----------------
     train_results = {}
     for recipe_name in train_recipes:
         env = _make_env(seed=env_seed, name=recipe_name)
+        logging.info(f"\n[Train] {recipe_name}")
         episode_sats = []
         for ep in range(num_episodes):
             info = run_one_episode(env, generator)
             episode_sats.append(info.get("average_satisfaction", np.nan))
-            print(f"\n[Train] {recipe_name} | Ep {ep+1}: mean sat={episode_sats[-1]:.3f}")
+            logging.info(f"\t Ep {ep+1}: mean sat={episode_sats[-1]:.3f}")
         train_results[recipe_name] = episode_sats
         env.close()
 
     # train_profile_vec = get_profile_vector(generator._pref_gen)
 
-    # Testing
+    # ----------------- TESTING -----------------
     test_results = {}
-    test_profiles = {}
+    #test_profiles = {}
+    
+    # disable learning during test
+    generator._disable_learning = True
     for recipe_name in test_recipes:
         env = _make_env(seed=env_seed, name=recipe_name)
         episode_sats = []
         for ep in range(num_episodes):
-            # disable learning during test
-            generator._disable_learning = True
             info = run_one_episode(env, generator)
             episode_sats.append(info.get("average_satisfaction", np.nan))
-            print(f"[Test] {recipe_name} | Ep {ep+1}: mean sat={episode_sats[-1]:.3f}")
+            logging.info(f"[Test] {recipe_name} | Ep {ep+1}: mean sat={episode_sats[-1]:.3f}")
 
         test_results[recipe_name] = episode_sats
-        test_profiles[recipe_name] = get_profile_vector(generator._pref_gen)
+        #test_profiles[recipe_name] = get_profile_vector(generator._pref_gen)
         env.close()
     
     # METRICS
     mean_train_sat = np.mean([np.mean(v) for v in train_results.values()])
     mean_test_sat  = np.mean([np.mean(v) for v in test_results.values()])
-    print(f"\nMean train satisfaction = {mean_train_sat:.3f}")
-    print(f"Mean test satisfaction  = {mean_test_sat:.3f}")
+    logging.info(f"\nMean train satisfaction = {mean_train_sat:.3f}")
+    logging.info(f"Mean test satisfaction  = {mean_test_sat:.3f}")
 
     # # CROSS-RECIPE SIMILARITY
     # profile_vectors = {**{r: train_profile_vec for r in train_recipes}, **test_profiles}

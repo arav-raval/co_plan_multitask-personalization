@@ -8,7 +8,7 @@ Central repository for symbolic cooking recipes
 from multitask_personalization.envs.spices.spices_env import RecipeSpec, ProfileSpec
 
 SIMPLE_DAL = RecipeSpec(
-        name="simple_dal",
+        name="SimpleDal",
         spices=("cumin", "mustard", "turmeric", "chili", "garam_masala"),
         predecessors={
             "cumin": (),

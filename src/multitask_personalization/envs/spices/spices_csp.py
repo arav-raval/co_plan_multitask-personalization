@@ -91,16 +91,11 @@ class _AssignPreferenceGenerator(CSPConstraintGenerator[SpiceState, SpiceAction]
         current = obs.current_spice
 
         def _logprob(actor: str) -> float:
-            
             if self._classifier is None:
                 return np.log(0.5)
             x = self._featurize(current, actor)
-            p = self._classifier.predict_proba([x])[0][1]
-            p = np.clip(p, 1e-6, 1.0 - 1e-6)
-            y = float(np.log(p))
-
-            #print(f"[DEBUG] spice={current}, actor={actor}, p={p:.3f}, logp={y:.3f}, threshold={np.log(0.5):.3f}")
-            return y
+            p = self._safe_predict_proba(x)
+            return np.log(p)
 
         return LogProbCSPConstraint(name, [actor_vars], _logprob, threshold=np.log(1e-6))
 
@@ -118,7 +113,7 @@ class _AssignPreferenceGenerator(CSPConstraintGenerator[SpiceState, SpiceAction]
         # Predict probabilities over the grid
         Z = np.zeros(len(grid))
         for i, g in enumerate(grid):
-            probs = self._classifier.predict_proba([g])[0]
+            probs = self._safe_predict_proba(g)
             Z[i] = probs[1]  # probability of positive label (True)
         Z = Z.reshape(xx.shape)
 
@@ -151,6 +146,17 @@ class _AssignPreferenceGenerator(CSPConstraintGenerator[SpiceState, SpiceAction]
     def _featurize(self, spice: str, actor: str) -> NDArray:
         return np.array([self._spice_to_index[spice], self._actor_to_index[actor]], dtype=float)
     
+    def _safe_predict_proba(self, x: NDArray) -> float:
+        if self._classifier is None:
+            return 0.5
+        try: 
+            proba = self._classifier.predict_proba([x])
+            if proba.size == 0 or len(proba[0]) == 0:
+                return 0.5
+            return float(np.clip(proba[0][1], 1e-6, 1.0 - 1e-6))
+        except (ValueError, IndexError):
+            return 0.5
+
     def _update_constraint_parameters(self) -> None:
         # Wait until we've seen both positive and negative examples to learn.
         if len(set(self._training_outputs)) < 2:
@@ -230,13 +236,8 @@ class SpicesAssignCSPGenerator(CSPGenerator[SpiceState, SpiceAction]):
         def _cost_fn(actor_val: str) -> float:    
             # Calculate log-probability for this actor
             x = self._pref_gen._featurize(current, actor_val)
-            p = self._pref_gen._classifier.predict_proba([x])[0][1]
-            # Clip to avoid log(0.0) = -inf
-            p = np.clip(p, 1e-6, 1.0 - 1e-6)
-            logprob = float(np.log(p))
-            
-            # Return negative log-prob as cost (solver minimizes, we want to maximize logprob)
-            return -logprob
+            p = self._pref_gen._safe_predict_proba(x)
+            return -np.log(p)
         
         return CSPCost("maximize_preference", [actor], _cost_fn)
     
@@ -255,8 +256,8 @@ class SpicesAssignCSPGenerator(CSPGenerator[SpiceState, SpiceAction]):
             probs = []
             for a in ["human", "robot"]:
                 x = self._pref_gen._featurize(current_spice, a)
-                p = self._pref_gen._classifier.predict_proba([x])[0][1]
-                probs.append(np.clip(p, 1e-6, 1.0 - 1e-6))  # avoid zero probabilities
+                p = self._pref_gen._safe_predict_proba(x)
+                probs.append(p)  # avoid zero probabilities
 
             # Normalize to sum to 1
             probs = np.array(probs)
