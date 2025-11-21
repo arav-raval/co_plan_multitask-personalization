@@ -51,7 +51,8 @@ class _SpiceCSPPolicy(CSPPolicy[SpiceState, SpiceAction]):
             # If called again after done, keep returning done
             return (1, None)
         
-        # Assign the selected actor for the current spice
+
+        #Assign the selected actor for the current spice
         if self._actor in ("human", "robot"):
             actor = self._actor
             if self._verbose:
@@ -207,13 +208,14 @@ class SpicesAssignCSPGenerator(CSPGenerator[SpiceState, SpiceAction]):
             probs[spice] = spice_probs
         return probs
 
-
     def _generate_variables(self, obs: SpiceState) -> tuple[list[CSPVariable], dict[CSPVariable, Any]]:
         actor = CSPVariable("actor", EnumSpace(["human", "robot"]))
         variables = [actor]
 
         # Randomize the initial assignment
         initialization = {actor: self._init_rng.choice(["human", "robot"])}
+        state = self._init_rng.__getstate__() if hasattr(self._init_rng, '__getstate__') else "unknown"
+   
         return variables, initialization
 
     def _generate_personal_constraints(self, obs: SpiceState, variables: list[CSPVariable]) -> list[CSPConstraint]:
@@ -248,7 +250,6 @@ class SpicesAssignCSPGenerator(CSPGenerator[SpiceState, SpiceAction]):
         def _sample_actor(sol: dict[CSPVariable, Any], rng: np.random.Generator) -> dict[CSPVariable, Any]:
             # Fall back to random choice 
             if self._pref_gen._classifier is None:
-                #print(f"[Sampler] No classifier trained yet, using random choice")
                 chosen = rng.choice(["human", "robot"])
                 return {actor: chosen}
 
@@ -265,9 +266,6 @@ class SpicesAssignCSPGenerator(CSPGenerator[SpiceState, SpiceAction]):
 
             # Sample actor according to learned probabilities (soft sampling)
             chosen = rng.choice(["human", "robot"], p=probs)
-
-            # Debugging
-            #print(f"[Sampler] {current_spice}: P(human)={probs[0]:.2f}, P(robot)={probs[1]:.2f} → chosen={chosen}")
 
             return {actor: chosen}
         return [FunctionalCSPSampler(_sample_actor, csp, {actor})]

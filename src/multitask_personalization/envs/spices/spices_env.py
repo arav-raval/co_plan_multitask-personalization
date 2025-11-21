@@ -216,9 +216,7 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
         # Non-empty case
         last_spice = self._added[-1]
         preferred = self._hidden_spec.preferred_actor[last_spice]
-        if self.verbose:
-            logging.info(f"Preferred actor for {last_spice}: {preferred}")
-
+        
         # Done and successfully had at least one (spice, actor) pair
         satisfaction = 1.0 if preferred == self._last_actor else -1.0
         self._satisfaction_history.append(satisfaction)

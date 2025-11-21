@@ -15,15 +15,15 @@ from collections import Counter
 
 # ---------------- PARAMETER SETUP ----------------
 PARAMETERS = {
-    "num_episodes": 5,
+    "num_episodes": 2,
     "profile": "ChefA",
-    "recipe_name": "UltraComplexFeast",
+    "recipe_name": "GrandmasSoup",
     "env_seed": 123,
-    "csp_seed": 456,
+    "csp_seed": 369,
     "logging_level": logging.INFO,
     "train_frac": 0.8,
+    "verbose": True,
 }
-verbose = True
 # --------------------------------------------------
 
 # ---------------- HELPER FUNCTIONS ----------------
@@ -31,7 +31,7 @@ def _make_env(seed: int, name: str = PARAMETERS["recipe_name"]) -> SpiceEnv:
     recipe = get_recipe(name)
     scene_spec = SpiceSceneSpec(recipe=recipe)
 
-    return SpiceEnv(scene_spec, hidden_spec=None, seed=seed, eval_mode=False, verbose=verbose)
+    return SpiceEnv(scene_spec, hidden_spec=None, seed=seed, eval_mode=False, verbose=PARAMETERS["verbose"])
 
 def run_one_episode(env, generator, solver_seed=123):
     """Run a full episode of a recipe and update the generator (training step)."""
@@ -95,8 +95,7 @@ def visualize(num_episodes, metrics):
         axes = [axes]
 
     print(f"Metrics: {metrics}")
-    print(num_episodes)
-
+    
     for i, (metric_name, metric) in enumerate(metrics.items()):
         ax = axes[i]
 
@@ -154,7 +153,7 @@ def test_spices_csp_single_recipe(num_episodes: int = PARAMETERS["num_episodes"]
     
     # Run episodes
     for i in range(num_episodes):
-        if verbose:
+        if PARAMETERS["verbose"]:
             logging.info(f"\nEpisode {i+1}/{num_episodes}")
 
         # Run a single episode
