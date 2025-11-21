@@ -15,9 +15,9 @@ from collections import Counter
 
 # ---------------- PARAMETER SETUP ----------------
 PARAMETERS = {
-    "num_episodes": 2,
+    "num_episodes": 5,
     "profile": "ChefA",
-    "recipe_name": "GrandmasSoup",
+    "recipe_name": "UltraComplexFeast",
     "env_seed": 123,
     "csp_seed": 369,
     "logging_level": logging.INFO,
@@ -95,7 +95,7 @@ def visualize(num_episodes, metrics):
         axes = [axes]
 
     print(f"Metrics: {metrics}")
-    
+
     for i, (metric_name, metric) in enumerate(metrics.items()):
         ax = axes[i]
 

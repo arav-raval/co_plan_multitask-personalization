@@ -9,7 +9,9 @@ import gymnasium as gym
 import numpy as np
 from gymnasium.core import RenderFrame
 from tomsutils.spaces import EnumSpace
-
+import networkx as nx
+import matplotlib.pyplot as plt
+import matplotlib.cm as cm
 from multitask_personalization.structs import PublicSceneSpec
 
 @dataclass(frozen=True)
@@ -23,6 +25,102 @@ class RecipeSpec:
     spices: tuple[str, ...]
     # Partial order: predecessor map: for spice s, all spices that must be added before s.
     predecessors: dict[str, tuple[str, ...]]
+
+    def build_dag(self) -> nx.DiGraph:
+        """Build a directed acyclic graph (DAG) from the recipe."""
+        dag = nx.DiGraph()
+
+        # Add nodes
+        for spice in self.spices:
+            dag.add_node(spice)
+
+        # Add edges
+        for spice, predecessors in self.predecessors.items():
+            for predecessor in predecessors:
+                dag.add_edge(predecessor, spice)
+
+        # Check if the DAG is valid
+        if not nx.is_directed_acyclic_graph(dag):
+            raise ValueError("The recipe is not a valid DAG")
+
+        return dag
+    
+    def get_topological_sort(self) -> list[str]:
+        """Get a topological sort of the recipe."""
+        return list(nx.topological_sort(self.build_dag()))
+
+    def layers(self) -> list[list[str]]:
+        """Get the layers of the recipe."""
+        G = self.build_dag()
+        layers = []
+
+        current_layer = [n for n in G.nodes if G.in_degree(n) == 0]
+        visited = set(current_layer)
+
+        while current_layer:
+            layers.append(current_layer)
+            next_layer = []
+            for node in current_layer:
+                for succ in G.successors(node):
+                    if all(pred in visited for pred in G.predecessors(succ)):
+                        next_layer.append(succ)
+            visited.update(next_layer)
+            current_layer = next_layer
+
+        return layers
+
+    
+    def visualize_dag(self) -> None:
+        """
+        Visualize the recipe DAG using a multipartite layout based on its layers.
+        Each layer corresponds to a topological level.
+        """
+        G = self.build_dag()
+        layers = self.layers()  # list of lists of nodes
+
+        # Build layer index
+        layer_index = {}
+        for i, layer in enumerate(layers):
+            for s in layer:
+                layer_index[s] = i
+        nx.set_node_attributes(G, layer_index, "layer")
+
+        # Build a color map for layers
+        num_layers = len(layers)
+        cmap = cm.get_cmap("viridis", num_layers)
+        colors = [cmap(layer_index[n]) for n in G.nodes]
+
+        # Layout
+        pos = nx.multipartite_layout(G, subset_key="layer", align="horizontal")
+
+        plt.figure(figsize=(10, 4))
+        nx.draw(
+            G,
+            pos,
+            with_labels=True,
+            node_size=2000,
+            node_color=colors,
+            font_size=10,
+            font_weight="bold",
+            arrowsize=20,
+            font_color="white"
+        )
+
+        plt.title(f"Recipe DAG: {self.name}")
+        plt.axis("off")
+        plt.tight_layout()
+        plt.show()
+
+    
+@dataclass(frozen=True)
+class MoodSpec:
+    import numpy as np
+
+@dataclass(frozen=True)
+class MoodSpec:
+    """Defines the mood categories."""
+    moods: tuple[str, ...] = ("all_self", "neutral", "none_self")
+    priors: tuple[float, ...] = (0.33, 0.34, 0.33)
 
 @dataclass(frozen=True)
 class SpiceSceneSpec(PublicSceneSpec):
@@ -50,6 +148,17 @@ If flag = 0, then payload is the name of the actor that is assigned to SpiceStat
 """
 SpiceAction: TypeAlias = tuple[int, str | None] # (flag: 0=add, 1=done, 2=wait, payload: "Add <spice>" or None)
 
+class MoodModel:
+    """Handles sampling and updating the current day's mood."""
+    def __init__(self, spec: MoodSpec, rng: np.random.Generator):
+        self.spec = spec
+        self.rng = rng
+        self.current_mood = None
+
+    def sample_mood(self) -> str:
+        self.current_mood = self.rng.choice(self.spec.moods, p=self.spec.priors)
+        return self.current_mood
+
 class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
     """A simple spices symbolic environment for rapid testing of co-planning.
     
@@ -70,7 +179,6 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
 
         self._rng = np.random.default_rng(seed)
         self._hidden_spec = hidden_spec
-
         self.scene_spec = scene_spec
         self.action_space = gym.spaces.OneOf(
             (
@@ -78,6 +186,11 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
                 EnumSpace([None]),
             )
         )
+        self._mood_spec = MoodSpec()
+        self._mood_model = MoodModel(self._mood_spec, self._rng)
+        self._dag = self.scene_spec.recipe.build_dag()
+        self._topo_order = self.scene_spec.recipe.get_topological_sort()
+        self._layers = self.scene_spec.recipe.layers()
 
         self._t = 0
         self._added: list[str] = []
@@ -85,6 +198,7 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
         self._last_actor: str | None = None
         self._satisfaction_history: list[float] = []
         self._action_history: list[SpiceAction] = []
+
 
         self.eval_mode = eval_mode
         self.verbose = verbose
@@ -111,10 +225,13 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
         self._satisfaction_history: list[float] = []
         self._current_spice = self._pick_current_spice()
         self._action_history: list[SpiceAction] = []
+        self._current_mood = self._mood_model.sample_mood()
 
         if self.verbose:
             logging.info("[SpiceEnv] Resetting environment")
+            logging.info(f"[Mood] Current mood: {self._current_mood}")
             self._log_recipe_and_prefs()
+            #self.scene_spec.recipe.visualize_dag()
 
         return self._get_state(), self._get_info()
 
@@ -150,6 +267,7 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
             terminated = True
 
             if self.verbose:
+                #self.visualize_current_frontier()
                 logging.info(f"[STEP {self._t - 1}] Assign {info['last_spice']} → {info['last_actor']} "
                   f"(pref={info['preferred_actor']})  sat={info['satisfaction']:+}")
                 logging.info(f"[RECIPE COMPLETED] Average Satisfaction={info['average_satisfaction']:+.2f}")
@@ -211,14 +329,38 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
                 "feasible_next": tuple(self.__feasible_next()),
                 "average_satisfaction": 0.0,
                 "action_history": self._action_history,
+                "mood": self._current_mood,
             }
+
+        # Mood table (shift in preferences)
+        MOOD_BIAS = {
+            "all_self":   {"human": +6.0, "robot": -6.0},
+            "neutral":    {"human": 0.0,  "robot": 0.0},
+            "none_self":  {"human": -6.0, "robot": +6.0},
+        }
         
         # Non-empty case
         last_spice = self._added[-1]
         preferred = self._hidden_spec.preferred_actor[last_spice]
-        
-        # Done and successfully had at least one (spice, actor) pair
-        satisfaction = 1.0 if preferred == self._last_actor else -1.0
+
+        # φ component: long-term preference signal
+        phi = +2.0 if preferred == self._last_actor else -2.0
+
+        # mood component
+        mood_adj = MOOD_BIAS[self._current_mood][self._last_actor]
+
+        # Combine additively into a logit
+        logit = phi + mood_adj
+
+        # Probabilistic satisfaction
+        p = 1 / (1 + np.exp(-logit))
+        satisfaction = self._rng.choice([+1, -1], p=[p, 1-p])
+
+
+        logging.info(f"[Mood] Mood bias: {mood_adj}")
+        logging.info(f"[Mood] Base satisfaction: {phi}")
+        logging.info(f"[Mood] Satisfaction: {satisfaction}")
+
         self._satisfaction_history.append(satisfaction)
 
         return {
@@ -233,17 +375,27 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
             "satisfaction_variance": np.var(self._satisfaction_history),
             "feasible_next": tuple(self.__feasible_next()),
             "action_history": self._action_history,
+            "mood": self._current_mood,
         }
 
     def __feasible_next(self) -> Iterable[str]:
         """The spices that can be added next."""
+        dag = self._dag
+
         added = set(self._added)
-        for spice in self.scene_spec.recipe.spices:
-            if spice in added:
+
+        feasible = []
+
+        for node in dag.nodes:
+            if node in added:
                 continue
-            predecessors = set(self.scene_spec.recipe.predecessors.get(spice, ()))
-            if predecessors.issubset(added):
-                yield spice
+
+            preds = set(dag.predecessors(node))
+            if preds.issubset(added):
+                feasible.append(node)
+
+        return feasible
+
 
     def _pick_current_spice(self) -> str | None:
         """Deterministically pick among the feasible spices to add next."""
@@ -251,14 +403,49 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
         if not feasible:
             return None
 
-        # Tie break by given recipe order
-        recipe_order = {spice: idx for idx, spice in enumerate(self.scene_spec.recipe.spices)}
-        feasible.sort(key=lambda x: recipe_order[x])
-
-        # Return first in recipe order from feasible set
+        topo = self.scene_spec.recipe.get_topological_sort()
+        # Pick the feasible spice with the earliest topo position
+        feasible.sort(key=lambda s: topo.index(s))
         return feasible[0]
 
     def __randomize_hidden_preferences(self) -> None:
         """Randomize the hidden preferences."""
         preferences = {spice: self._rng.choice(["human", "robot"]) for spice in self.scene_spec.recipe.spices}
         self._hidden_spec = SpiceHiddenSpec(preferred_actor=preferences)
+        
+    
+    # def visualize_current_frontier(self):
+    #     """
+    #     Visualize only the current DAG frontier (feasible next spices).
+    #     """
+    #     import matplotlib.pyplot as plt
+    #     import networkx as nx
+
+    #     frontier = list(self.__feasible_next())
+
+    #     # Build a tiny graph that only contains frontier nodes
+    #     G = nx.DiGraph()
+    #     for s in frontier:
+    #         G.add_node(s)
+
+    #     # Layout: simple horizontal placement
+    #     pos = {s: (i, 0) for i, s in enumerate(frontier)}
+
+    #     plt.figure(figsize=(8, 2))
+
+    #     nx.draw(
+    #         G,
+    #         pos,
+    #         with_labels=True,
+    #         node_color="#ffd700",  # gold for frontier
+    #         node_size=1800,
+    #         font_size=10,
+    #         font_weight="bold"
+    #     )
+
+    #     plt.title(f"Current Frontier at t={self._t}")
+    #     plt.axis("off")
+    #     plt.tight_layout()
+    #     plt.show()
+
+
