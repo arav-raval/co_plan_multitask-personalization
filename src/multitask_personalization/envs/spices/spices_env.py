@@ -90,25 +90,35 @@ class RecipeSpec:
         cmap = cm.get_cmap("viridis", num_layers)
         colors = [cmap(layer_index[n]) for n in G.nodes]
 
-        # Layout
-        pos = nx.multipartite_layout(G, subset_key="layer", align="horizontal")
+        # Layout: place layers from left to right for clearer reading
+        pos = nx.multipartite_layout(
+            G,
+            subset_key="layer",
+            align="vertical",  # vertical alignment => layers spread on the x-axis (left→right)
+            scale=2.0,
+        )
 
-        plt.figure(figsize=(4, 10))
+        plt.figure(figsize=(10, 4), dpi=150)
         nx.draw(
             G,
             pos,
             with_labels=True,
-            node_size=2000,
+            node_size=2200,
             node_color=colors,
-            font_size=8,
+            edgecolors="black",
+            linewidths=1.0,
+            font_size=10,
             font_weight="bold",
-            arrowsize=20,
-            font_color="white"
+            arrowsize=18,
+            arrowstyle="-|>",
+            width=1.4,
+            connectionstyle="arc3,rad=0.05",
+            font_color="white",
         )
 
-        plt.title(f"Recipe DAG: {self.name}")
+        plt.title(f"Recipe DAG: {self.name}", fontsize=12, pad=10, fontweight="bold")
         plt.axis("off")
-        plt.tight_layout()
+        plt.tight_layout(pad=1.0)
         plt.show()
 
 # --- MOOD SPECIFICATIONS ---
