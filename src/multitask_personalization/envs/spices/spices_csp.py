@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pickle as pkl
 from pathlib import Path
-from typing import Any, Collection
+from typing import Any, Collection, List, Tuple
 import logging
 import numpy as np
 from numpy.typing import NDArray
@@ -17,6 +17,7 @@ from multitask_personalization.csp_generation import (
 )
 
 from multitask_personalization.envs.spices.spices_env import SpiceAction, SpiceState
+from multitask_personalization.envs.spices.spices_hbm import HierarchicalPreferenceModel
 
 from multitask_personalization.structs import (
     CSP,
@@ -67,40 +68,246 @@ class _SpiceCSPPolicy(CSPPolicy[SpiceState, SpiceAction]):
         return self._done_emitted
     
 class _AssignPreferenceGenerator(CSPConstraintGenerator[SpiceState, SpiceAction]):
-    def __init__(self, spice_list: list[str], seed: int = 0, verbose: bool = False) -> None:
+    def __init__(
+        self, 
+        spice_list: list[str],
+        recipe_list: list[str] | None = None,  # All recipes seen so far
+        base_satisfaction_bias: float = 3.0,
+        neutral_confidence_threshold: float = 0.5, # only learn spice preferences when P(neutral) > threshold
+        use_hbm: bool = True,  # Use HBM for continuous learning
+        seed: int = 0, 
+        verbose: bool = False) -> None:
         super().__init__(seed)
         self._spice_to_index = {spice: i for i, spice in enumerate(spice_list)}
         self._actor_to_index = {actor: i for i, actor in enumerate(["human", "robot"])}
 
+        # HBM for continuous preference learning
+        self._use_hbm = use_hbm
+        self._recipe_list = recipe_list if recipe_list is not None else []
+        
+        # Initialize classifier attributes (only used if use_hbm=False)
         self._classifier: RadiusNeighborsClassifier | None = None
         self._training_inputs: list[NDArray] = []
         self._training_outputs: list[bool] = []
+        self._neutral_training_inputs: list[NDArray] = []
+        self._neutral_training_outputs: list[bool] = []
+        
+        if self._use_hbm:
+            self._hbm = HierarchicalPreferenceModel(
+                spices=spice_list,
+                recipes=self._recipe_list,
+                base_satisfaction_bias=base_satisfaction_bias,
+                mu0=0.0,
+                sigma0=1.0,
+                sigma_h=1.0,
+                sigma_r=1.0,
+                sigma_obs=0.3,  # Further reduced observation noise for more stable learning
+            )
+            # Sync HBM mood posterior with our mood inference
+            self._hbm.mood_posterior = np.array([0.05, 0.9, 0.05], dtype=float)
+        else:
+            self._hbm = None
 
+        # Mood bias
+        self._base_satisfaction_bias = base_satisfaction_bias
+        self._mood_bias_strength = base_satisfaction_bias * 2.0
+        self._neutral_confidence_threshold = neutral_confidence_threshold
+
+        self._mood_bias = {
+            "all_self":   {"human": +self._mood_bias_strength, "robot": -self._mood_bias_strength},
+            "neutral":    {"human": 0.0,  "robot": 0.0},
+            "none_self":  {"human": -self._mood_bias_strength, "robot": +self._mood_bias_strength},
+        }
+
+        # Mood inference state (per episode)
+        # Stronger prior for neutral to require more evidence to switch
+        self._mood_prior = np.array([0.05, 0.9, 0.05], dtype=float) # strong bias towards neutral mood
+        self._mood_posterior = self._mood_prior.copy()
+
+        # Per-episode buffers for mood inference (still needed for our mood inference)
+        self._episode_observations: List[Tuple[str, str, float]] = []  # (actor, spice, satisfaction)
+        self._current_recipe_name: str | None = None  # Track current recipe for HBM
+        
         self._verbose = verbose
+
+    def _get_preference_phi(self, spice: str, actor: str, recipe_name: str | None = None) -> float:
+        """Get preference phi value for a spice-actor pair.
+        
+        Returns phi estimate: positive if actor matches preference, negative otherwise.
+        Uses HBM if available, otherwise falls back to classifier or returns 0.
+        """
+        if self._use_hbm and self._hbm is not None:
+            # Use HBM's recipe-specific preference
+            if recipe_name is None:
+                # If no recipe specified, use the most recent recipe or first available
+                recipe_name = self._recipe_list[-1] if self._recipe_list else None
+                if recipe_name is None:
+                    return 0.0
+            
+            # Get phi from HBM (recipe-specific preference)
+            phi = self._hbm.get_phi(recipe_name, spice)
+            
+            # Convert to actor-specific preference signal
+            # phi > 0 means prefer human, phi < 0 means prefer robot
+            sign_actor = +1.0 if actor == "human" else -1.0
+            phi_est = sign_actor * phi
+            
+            # Clamp to reasonable range
+            phi_est = np.clip(phi_est, -self._base_satisfaction_bias, self._base_satisfaction_bias)
+            return phi_est
+        
+        # Fallback to classifier (legacy mode)
+        if hasattr(self, '_classifier') and self._classifier is not None:
+            x = self._featurize(spice, actor)
+            p_pref = self._safe_predict_proba(x)
+            sign_actor = +1.0 if actor == "human" else -1.0
+            logit_pref = np.log(p_pref / (1 - p_pref)) if p_pref not in (0, 1) else 0.0
+            phi_est = sign_actor * logit_pref
+            phi_est = np.clip(phi_est, -self._base_satisfaction_bias, self._base_satisfaction_bias)
+            return phi_est
+        
+        return 0.0  # No preference information yet
+    
+    def _update_mood_posterior(self) -> None:
+        """Update mood posterior from all observations in current episode.
+        
+        Uses learned preferences to better distinguish mood effects from preference matches.
+        Key insight: if satisfaction matches preference → could be neutral or mood.
+        If satisfaction doesn't match preference → more likely mood effect.
+        """
+        if not self._episode_observations:
+            return
+        
+        MOODS = ("all_self", "neutral", "none_self")
+        logps = []
+        
+        for m in MOODS:
+            lp = np.log(self._mood_prior[MOODS.index(m)])
+            
+            # Compute likelihood under this mood hypothesis
+            for (actor, spice, sat) in self._episode_observations:
+                # Get preference phi (learned from neutral episodes)
+                phi_pref = self._get_preference_phi(spice, actor, self._current_recipe_name)
+                
+                # Compute logit under this mood hypothesis
+                sign_actor = +1.0 if actor == "human" else -1.0
+                
+                if m == "neutral":
+                    # Neutral mood: satisfaction depends primarily on preference match
+                    # phi_pref already encodes the preference (positive if preferred, negative if not)
+                    logit = sign_actor * phi_pref + self._mood_bias[m][actor]
+                else:
+                    # Non-neutral mood: mood bias is strong, but preference provides signal
+                    # If satisfaction doesn't match preference, it's stronger evidence for mood
+                    # If satisfaction matches preference, it's weaker evidence (could be either)
+                    mood_bias = self._mood_bias[m][actor]
+                    
+                    # Check if satisfaction matches preference expectation
+                    pref_logit = sign_actor * phi_pref
+                    pref_expectation = pref_logit > 0  # positive if preference suggests satisfaction
+                    sat_positive = sat > 0
+                    matches_preference = pref_expectation == sat_positive
+                    
+                    if matches_preference:
+                        # Satisfaction matches preference: could be mood OR preference
+                        # Use mood bias but with some preference influence
+                        logit = mood_bias + sign_actor * phi_pref * 0.2  # preference has 20% weight
+                    else:
+                        # Satisfaction doesn't match preference: strong evidence for mood
+                        # Mood bias dominates
+                        logit = mood_bias + sign_actor * phi_pref * 0.1  # preference has minimal weight
+                
+                p = 1.0 / (1.0 + np.exp(-logit))
+                
+                if sat > 0:
+                    lp += np.log(max(p, 1e-9))
+                else:
+                    lp += np.log(max(1 - p, 1e-9))
+            
+            logps.append(lp)
+        
+        # Normalize
+        logps = np.array(logps)
+        logps -= np.max(logps)
+        ps = np.exp(logps)
+        ps /= ps.sum()
+        
+        self._mood_posterior = ps
+    
+    def get_expected_mood(self) -> float:
+        """Return expected mood value: -1.0 (none_self) to +1.0 (all_self)."""
+        MOODS = ("all_self", "neutral", "none_self")
+        mood_values = {"all_self": +1.0, "neutral": 0.0, "none_self": -1.0}
+        return sum(self._mood_posterior[i] * mood_values[m] for i, m in enumerate(MOODS))
+    
+    def get_mood_posterior_breakdown(self) -> dict[str, float]:
+        """Return mood posterior probabilities for each mood."""
+        MOODS = ("all_self", "neutral", "none_self")
+        return {mood: float(self._mood_posterior[i]) for i, mood in enumerate(MOODS)}
+
+    def get_most_likely_mood(self) -> tuple[str, float]:
+        """Return the most likely mood and its probability."""
+        MOODS = ("all_self", "neutral", "none_self")
+        idx = int(np.argmax(self._mood_posterior))
+        return MOODS[idx], float(self._mood_posterior[idx])
+
+    def is_confident_neutral(self) -> bool:
+        """Check if we're confident we're in neutral mood."""
+        MOODS = ("all_self", "neutral", "none_self")
+        neutral_idx = MOODS.index("neutral")
+        return self._mood_posterior[neutral_idx] >= self._neutral_confidence_threshold
+
     def save(self, model_dir: Path) -> None:
-        outfile = model_dir / "assign_preference_classifier.pkl"
-        with open(outfile, "wb") as f:
-            pkl.dump(self._classifier, f)
+        if self._use_hbm and self._hbm is not None:
+            # Save HBM state (would need to implement save/load in HBM)
+            if self._verbose:
+                logging.info("[Save] HBM model (save not yet implemented)")
+        else:
+            # Save classifier
+            outfile = model_dir / "assign_preference_classifier.pkl"
+            with open(outfile, "wb") as f:
+                pkl.dump(self._classifier, f)
     
     def load(self, model_dir: Path) -> None:
-        outfile = model_dir / "assign_preference_classifier.pkl"
-        with open(outfile, "rb") as f:
-            self._classifier = pkl.load(f)
+        if self._use_hbm and self._hbm is not None:
+            # Load HBM state (would need to implement save/load in HBM)
+            if self._verbose:
+                logging.info("[Load] HBM model (load not yet implemented)")
+        else:
+            # Load classifier
+            outfile = model_dir / "assign_preference_classifier.pkl"
+            with open(outfile, "rb") as f:
+                self._classifier = pkl.load(f)
 
     def generate(self, obs: SpiceState, variables: list[CSPVariable], name: str) -> CSPConstraint:
         (actor_vars, ) = variables
         current = obs.current_spice
 
         def _logprob(actor: str) -> float:
-            if self._classifier is None:
-                return np.log(0.5)
-            x = self._featurize(current, actor)
-            p = self._safe_predict_proba(x)
-            return np.log(p)
+            if self._use_hbm and self._hbm is not None and self._current_recipe_name:
+                # Use HBM's log probability
+                return self._hbm.log_prob_prefer(self._current_recipe_name, current, actor)
+            elif hasattr(self, '_classifier') and self._classifier is not None:
+                # Fallback to classifier
+                x = self._featurize(current, actor)
+                p = self._safe_predict_proba(x)
+                return np.log(p)
+            else:
+                return np.log(0.5)  # Uniform prior
 
         return LogProbCSPConstraint(name, [actor_vars], _logprob, threshold=np.log(1e-6))
 
     def visualize_classifier(self) -> None:
+        if self._use_hbm and self._hbm is not None:
+            if self._verbose:
+                logging.info("[Visualize] HBM visualization not yet implemented")
+            return
+        
+        if self._classifier is None or len(self._training_inputs) == 0:
+            if self._verbose:
+                logging.info("[Visualize] No classifier or training data to visualize")
+            return
+            
         X = np.array(self._training_inputs)
         y = np.array(self._training_outputs)
 
@@ -115,7 +322,7 @@ class _AssignPreferenceGenerator(CSPConstraintGenerator[SpiceState, SpiceAction]
         Z = np.zeros(len(grid))
         for i, g in enumerate(grid):
             probs = self._safe_predict_proba(g)
-            Z[i] = probs[1]  # probability of positive label (True)
+            Z[i] = probs  # probability of positive label (True)
         Z = Z.reshape(xx.shape)
 
         # Plot
@@ -126,23 +333,64 @@ class _AssignPreferenceGenerator(CSPConstraintGenerator[SpiceState, SpiceAction]
                     c=y, cmap="bwr", edgecolor="k", s=120, marker="o", label="Training points")
         plt.xlabel("Spice index")
         plt.ylabel("Actor index (0=human, 1=robot)")
-        plt.title(f"RadiusNeighborsClassifier (radius={self._classifier.radius})")
+        radius_str = f"{self._classifier.radius}" if self._classifier is not None else "N/A"
+        plt.title(f"RadiusNeighborsClassifier (radius={radius_str})")
         plt.legend()
         plt.show()
 
-    def learn_from_transition(self, obs: SpiceState, act: SpiceAction, next_obs: SpiceState, done: bool, info: dict[str, Any]) -> None:
-        # Learn after each step (not after episode completion)
-        if info.get("last_spice") is not None and info.get("last_actor") is not None:
-            self._training_inputs.append(
-                self._featurize(str(info["last_spice"]), str(info["last_actor"]))
-            )
-            self._training_outputs.append(info["satisfaction"] > 0.0)
+    def learn_from_transition(
+        self, obs: SpiceState, act: SpiceAction, next_obs: SpiceState, done: bool, info: dict[str, Any]
+    ) -> None:
+        """Learn from transition, updating mood posterior per-step.
         
-        if done:
-            self._update_constraint_parameters()
+        With HBM: continuously updates preferences weighted by mood posterior.
+        Without HBM: buffers observations for all-or-nothing learning at episode end.
+        """
+        if info.get("last_spice") is None or info.get("last_actor") is None:
+            return
+        
+        # Get recipe name from info if available
+        recipe_name = info.get("recipe_name") or self._current_recipe_name
+        if recipe_name and recipe_name not in self._recipe_list:
+            # Add new recipe to HBM if using HBM
+            if self._use_hbm and self._hbm is not None:
+                self._recipe_list.append(recipe_name)
+                self._hbm.recipes = list(self._recipe_list)
+        self._current_recipe_name = recipe_name
+        
+        # Collect observation
+        actor = str(info["last_actor"])
+        spice = str(info["last_spice"])
+        satisfaction = float(info["satisfaction"])
+        
+        # Buffer for mood inference
+        self._episode_observations.append((actor, spice, satisfaction))
+        
+        # Update mood posterior (per-step inference for online replanning)
+        self._update_mood_posterior()
+        
+        # HBM: continuously update preferences when confident in neutral mood
+        if self._use_hbm and self._hbm is not None and recipe_name:
+            # Only learn from observations when we're confident mood is neutral
+            # This prevents learning from mood-biased episodes
+            MOODS = ("all_self", "neutral", "none_self")
+            neutral_idx = MOODS.index("neutral")
+            neutral_conf = self._mood_posterior[neutral_idx]
             
-    def get_metrics(self) -> dict[str, float]:
-        return {}
+            # Only update if neutral confidence is above threshold
+            if neutral_conf >= self._neutral_confidence_threshold:
+                # Sync mood posterior to HBM
+                self._hbm.mood_posterior = self._mood_posterior.copy()
+                # HBM handles continuous updates (with its own threshold check)
+                self._hbm.observe(recipe_name, spice, actor, satisfaction, self._neutral_confidence_threshold)
+            elif self._verbose:
+                logging.debug(
+                    f"[HBM] Skipping update: neutral_conf={neutral_conf:.3f} < threshold={self._neutral_confidence_threshold:.2f}"
+                )
+        
+        # Finalize episode at end
+        if done:
+            self._finalize_episode()
     
     def _featurize(self, spice: str, actor: str) -> NDArray:
         return np.array([self._spice_to_index[spice], self._actor_to_index[actor]], dtype=float)
@@ -158,29 +406,140 @@ class _AssignPreferenceGenerator(CSPConstraintGenerator[SpiceState, SpiceAction]
         except (ValueError, IndexError):
             return 0.5
 
-    def _update_constraint_parameters(self) -> None:
-        # Wait until we've seen both positive and negative examples to learn.
-        if len(set(self._training_outputs)) < 2:
-            return
+    def _finalize_episode(self) -> None:
+        """Finalize episode: update hierarchical preferences (HBM) or train classifier (legacy mode)."""
+        if self._use_hbm and self._hbm is not None:
+            # HBM: update hierarchical preferences (θ and μ) at episode end
+            self._hbm.end_episode()
+            if self._verbose:
+                logging.info(f"[Episode] HBM updated hierarchical preferences (θ, μ)")
+        else:
+            # Legacy classifier mode: all-or-nothing learning from neutral episodes
+            MOODS = ("all_self", "neutral", "none_self")
+            neutral_idx = MOODS.index("neutral")
+            neutral_conf = self._mood_posterior[neutral_idx]
+            
+            most_likely_mood, most_likely_conf = self.get_most_likely_mood()
+            is_neutral_most_likely = (most_likely_mood == "neutral")
+            is_above_threshold = (neutral_conf >= self._neutral_confidence_threshold)
+            should_learn = (is_neutral_most_likely or is_above_threshold) and neutral_conf >= 0.3
+            
+            if should_learn and hasattr(self, '_episode_features') and hasattr(self, '_episode_labels'):
+                self._neutral_training_inputs.extend(self._episode_features)
+                self._neutral_training_outputs.extend(self._episode_labels)
+                self._update_constraint_parameters()
+                if self._verbose:
+                    logging.info(f"[Episode] Learning from neutral episode: {len(self._episode_features)} samples")
+        
+        # Reset episode buffers
+        self._episode_observations.clear()
+        if not self._use_hbm and hasattr(self, '_episode_features'):
+            self._episode_features.clear()
+        if not self._use_hbm and hasattr(self, '_episode_labels'):
+            self._episode_labels.clear()
+        self._mood_posterior = self._mood_prior.copy()
+        if self._use_hbm and self._hbm is not None:
+            self._hbm.mood_posterior = self._mood_prior.copy()
 
-        # Train a classifier.
+    def _update_constraint_parameters(self) -> None:
+        """Train classifier only on neutral-confident episodes."""
+        # Check if we have both positive and negative examples
+        unique_labels = set(self._neutral_training_outputs)
+        if len(unique_labels) < 2:
+            if self._verbose:
+                logging.info(
+                    f"[Learning] Not enough label diversity to train "
+                    f"(only {unique_labels}). Need both positive and negative examples."
+                )
+            return
+        
+        # Check minimum data requirement
+        if len(self._neutral_training_inputs) < 4:
+            if self._verbose:
+                logging.info(
+                    f"[Learning] Not enough examples to train ({len(self._neutral_training_inputs)}). "
+                    f"Need at least 4 examples."
+                )
+            return
+        
+        # Train on all neutral-confident episodes
         self._classifier = RadiusNeighborsClassifier(
-            radius=1.5, 
+            radius=1.5,
             weights="distance",
             algorithm="auto",
-            p=2, 
+            p=2,
             metric="minkowski",
         )
-
-        self._classifier.fit(self._training_inputs, self._training_outputs)
+        
+        self._classifier.fit(self._neutral_training_inputs, self._neutral_training_outputs)
+        
+        # Compute training accuracy for debugging
+        if len(self._neutral_training_inputs) > 0:
+            predictions = self._classifier.predict(self._neutral_training_inputs)
+            train_accuracy = np.mean(predictions == self._neutral_training_outputs)
+            pos_examples = sum(self._neutral_training_outputs)
+            neg_examples = len(self._neutral_training_outputs) - pos_examples
+        else:
+            train_accuracy = 0.0
+            pos_examples = 0
+            neg_examples = 0
+        
+        if self._verbose:
+            logging.info(
+                f"[Learning] Trained on {len(self._neutral_training_inputs)} samples "
+                f"({pos_examples} positive, {neg_examples} negative). "
+                f"Training accuracy: {train_accuracy:.3f}"
+            )
+    
+    def get_metrics(self) -> dict[str, float]:
+        """Return metrics including mood posterior."""
+        MOODS = ("all_self", "neutral", "none_self")
+        metrics = {
+            "expected_mood": self.get_expected_mood(),
+            "neutral_confidence": self._mood_posterior[MOODS.index("neutral")],
+        }
+        
+        # Add preference learning diagnostics
+        if self._use_hbm and self._hbm is not None:
+            metrics["preference_model"] = "HBM"
+            metrics["hbm_trained"] = 1.0
+            # Count recipes seen
+            metrics["recipes_seen"] = len(self._recipe_list)
+            # For HBM, we don't track neutral_confident_examples the same way,
+            # but we can track total observations processed
+            metrics["neutral_confident_examples"] = len(self._episode_observations) if hasattr(self, '_episode_observations') else 0
+        else:
+            metrics["preference_model"] = "Classifier"
+            metrics["neutral_confident_examples"] = len(self._neutral_training_inputs)
+            if self._classifier is not None:
+                metrics["classifier_trained"] = 1.0
+                if len(self._neutral_training_inputs) > 0:
+                    predictions = self._classifier.predict(self._neutral_training_inputs)
+                    train_accuracy = float(np.mean(predictions == self._neutral_training_outputs))
+                    metrics["classifier_train_accuracy"] = train_accuracy
+                else:
+                    metrics["classifier_train_accuracy"] = 0.0
+            else:
+                metrics["classifier_trained"] = 0.0
+                metrics["classifier_train_accuracy"] = 0.0
+        
+        return metrics
 
 class SpicesAssignCSPGenerator(CSPGenerator[SpiceState, SpiceAction]):
     """CSP: choose the actor for the environment's current spice; learn the preferences"""
 
-    def __init__(self, spice_list: list[str], verbose: bool = False, **kwargs) -> None:
+    def __init__(self, spice_list: list[str], recipe_list: list[str] | None = None, base_satisfaction_bias: float = 3.0, neutral_confidence_threshold: float = 0.75, use_hbm: bool = True, verbose: bool = False, **kwargs) -> None:
         super().__init__(**kwargs)
         self._spices = list(spice_list)
-        self._pref_gen = _AssignPreferenceGenerator(self._spices, self._seed, verbose)
+        self._pref_gen = _AssignPreferenceGenerator(
+            self._spices, 
+            recipe_list=recipe_list,
+            base_satisfaction_bias=base_satisfaction_bias, 
+            neutral_confidence_threshold=neutral_confidence_threshold,
+            use_hbm=use_hbm,
+            seed=self._seed, 
+            verbose=verbose
+        )
 
         # Separate RNG that won't be reset
         self._init_rng = np.random.default_rng(self._seed)
@@ -194,15 +553,23 @@ class SpicesAssignCSPGenerator(CSPGenerator[SpiceState, SpiceAction]):
     def get_pref_snapshot(self) -> dict[str, dict[str, float]]:
         """Return current P(prefer=True) for each spice/actor."""
         probs = {}
+        recipe_name = self._pref_gen._current_recipe_name or (self._pref_gen._recipe_list[-1] if self._pref_gen._recipe_list else None)
+        
         for spice in self._pref_gen._spice_to_index.keys():
             spice_probs = {}
             for actor in ["human", "robot"]:
-                if self._pref_gen._classifier is None:
-                    spice_probs[actor] = 0.5
-                else:
+                if self._pref_gen._use_hbm and self._pref_gen._hbm is not None and recipe_name:
+                    # Use HBM probability
+                    logp = self._pref_gen._hbm.log_prob_prefer(recipe_name, spice, actor)
+                    p = np.exp(logp)
+                    spice_probs[actor] = float(np.clip(p, 1e-6, 1.0 - 1e-6))
+                elif hasattr(self._pref_gen, '_classifier') and self._pref_gen._classifier is not None:
+                    # Fallback to classifier
                     x = self._pref_gen._featurize(spice, actor)
                     p = self._pref_gen._classifier.predict_proba([x])[0][1]
                     spice_probs[actor] = float(np.clip(p, 1e-6, 1.0 - 1e-6))
+                else:
+                    spice_probs[actor] = 0.5
             total = sum(spice_probs.values())
             spice_probs = {k: round(v / total, 3) for k, v in spice_probs.items()}
             probs[spice] = spice_probs
@@ -212,15 +579,58 @@ class SpicesAssignCSPGenerator(CSPGenerator[SpiceState, SpiceAction]):
         actor = CSPVariable("actor", EnumSpace(["human", "robot"]))
         variables = [actor]
 
-        # Randomize the initial assignment
-        initialization = {actor: self._init_rng.choice(["human", "robot"])}
-        state = self._init_rng.__getstate__() if hasattr(self._init_rng, '__getstate__') else "unknown"
+        # Check if mood forces a specific actor
+        mood, conf = self._pref_gen.get_most_likely_mood()
+        if mood == "all_self" and conf >= self._pref_gen._neutral_confidence_threshold:
+            # Force human actor
+            initialization = {actor: "human"}
+        elif mood == "none_self" and conf >= self._pref_gen._neutral_confidence_threshold:
+            # Force robot actor
+            initialization = {actor: "robot"}
+        else:
+            # Randomize the initial assignment
+            initialization = {actor: self._init_rng.choice(["human", "robot"])}
    
         return variables, initialization
 
     def _generate_personal_constraints(self, obs: SpiceState, variables: list[CSPVariable]) -> list[CSPConstraint]:
+        """Generate constraints that respect mood: force actor assignment if mood is confident."""
+        actor_var = variables[0]
+        constraints: list[CSPConstraint] = []
+        
+        # Check current mood belief
+        mood, conf = self._pref_gen.get_most_likely_mood()
+        
+        # If confident in all_self mood, force human actor
+        if mood == "all_self" and conf >= self._pref_gen._neutral_confidence_threshold:
+            constraints.append(
+                FunctionalCSPConstraint(
+                    "respect_all_self_mood",
+                    [actor_var],
+                    lambda actor: actor == "human",
+                )
+            )
+            if self._pref_gen._verbose:
+                logging.info(f"[CSP] Confident in all_self mood (P={conf:.3f}), forcing human actor")
+            return constraints
+        
+        # If confident in none_self mood, force robot actor
+        if mood == "none_self" and conf >= self._pref_gen._neutral_confidence_threshold:
+            constraints.append(
+                FunctionalCSPConstraint(
+                    "respect_none_self_mood",
+                    [actor_var],
+                    lambda actor: actor == "robot",
+                )
+            )
+            if self._pref_gen._verbose:
+                logging.info(f"[CSP] Confident in none_self mood (P={conf:.3f}), forcing robot actor")
+            return constraints
+        
+        # Otherwise, use learned preferences (neutral mood or uncertain)
         user_preference_constraint = self._pref_gen.generate(obs, variables, "user_preference")
-        return [user_preference_constraint]
+        constraints.append(user_preference_constraint)
+        return constraints
     
     def _generate_nonpersonal_constraints(self, obs: SpiceState, variables: list[CSPVariable]) -> list[CSPConstraint]:
         # Feasibility of spice enforced in the environment
@@ -231,15 +641,27 @@ class SpicesAssignCSPGenerator(CSPGenerator[SpiceState, SpiceAction]):
         actor = variables[0]
         current = obs.current_spice
 
-        if self._pref_gen._classifier is None:
+        # Check if we have preferences (HBM or classifier)
+        has_preferences = False
+        if self._pref_gen._use_hbm and self._pref_gen._hbm is not None:
+            has_preferences = True
+        elif hasattr(self._pref_gen, '_classifier') and self._pref_gen._classifier is not None:
+            has_preferences = True
+
+        if not has_preferences:
             return None
 
         # Get the constraint's log-prob function
-        def _cost_fn(actor_val: str) -> float:    
-            # Calculate log-probability for this actor
-            x = self._pref_gen._featurize(current, actor_val)
-            p = self._pref_gen._safe_predict_proba(x)
-            return -np.log(p)
+        def _cost_fn(actor_val: str) -> float:
+            if self._pref_gen._use_hbm and self._pref_gen._hbm is not None and self._pref_gen._current_recipe_name:
+                # Use HBM log probability
+                logp = self._pref_gen._hbm.log_prob_prefer(self._pref_gen._current_recipe_name, current, actor_val)
+                return -logp
+            else:
+                # Fallback to classifier
+                x = self._pref_gen._featurize(current, actor_val)
+                p = self._pref_gen._safe_predict_proba(x)
+                return -np.log(p)
         
         return CSPCost("maximize_preference", [actor], _cost_fn)
     
@@ -247,18 +669,34 @@ class SpicesAssignCSPGenerator(CSPGenerator[SpiceState, SpiceAction]):
         actor = csp.variables[0]
         current_spice = obs.current_spice
 
-        def _sample_actor(sol: dict[CSPVariable, Any], rng: np.random.Generator) -> dict[CSPVariable, Any]:
-            # Fall back to random choice 
-            if self._pref_gen._classifier is None:
-                chosen = rng.choice(["human", "robot"])
-                return {actor: chosen}
+        # Check if mood forces a specific actor
+        mood, conf = self._pref_gen.get_most_likely_mood()
+        forced_actor = None
+        if mood == "all_self" and conf >= self._pref_gen._neutral_confidence_threshold:
+            forced_actor = "human"
+        elif mood == "none_self" and conf >= self._pref_gen._neutral_confidence_threshold:
+            forced_actor = "robot"
 
+        def _sample_actor(sol: dict[CSPVariable, Any], rng: np.random.Generator) -> dict[CSPVariable, Any]:
+            # If mood forces a specific actor, always return that
+            if forced_actor is not None:
+                return {actor: forced_actor}
+            
             # Compute preference probabilities for both actors
             probs = []
             for a in ["human", "robot"]:
-                x = self._pref_gen._featurize(current_spice, a)
-                p = self._pref_gen._safe_predict_proba(x)
-                probs.append(p)  # avoid zero probabilities
+                if self._pref_gen._use_hbm and self._pref_gen._hbm is not None and self._pref_gen._current_recipe_name:
+                    # Use HBM probability
+                    logp = self._pref_gen._hbm.log_prob_prefer(self._pref_gen._current_recipe_name, current_spice, a)
+                    p = np.exp(logp)
+                elif hasattr(self._pref_gen, '_classifier') and self._pref_gen._classifier is not None:
+                    # Fallback to classifier
+                    x = self._pref_gen._featurize(current_spice, a)
+                    p = self._pref_gen._safe_predict_proba(x)
+                else:
+                    # No preferences, uniform
+                    p = 0.5
+                probs.append(max(p, 1e-6))  # avoid zero probabilities
 
             # Normalize to sum to 1
             probs = np.array(probs)
@@ -276,6 +714,16 @@ class SpicesAssignCSPGenerator(CSPGenerator[SpiceState, SpiceAction]):
     def observe_transition(self, obs: SpiceState, act: SpiceAction, next_obs: SpiceState, done: bool, info: dict[str, Any]) -> None:
         if not self._disable_learning:
             self._pref_gen.learn_from_transition(obs, act, next_obs, done, info)
+        
+        # Add mood information to info dict (after updating mood posterior)
+        mood_metrics = self._pref_gen.get_metrics()
+        mood_breakdown = self._pref_gen.get_mood_posterior_breakdown()
+        
+        info["expected_mood"] = mood_metrics["expected_mood"]
+        info["neutral_confidence"] = mood_metrics["neutral_confidence"]
+        info["mood_posterior"] = mood_breakdown  # dict with "all_self", "neutral", "none_self" probabilities
+        info["is_confident_neutral"] = self._pref_gen.is_confident_neutral()
+        info["neutral_confident_examples"] = mood_metrics.get("neutral_confident_examples", 0)
 
     def get_metrics(self) -> dict[str, float]:
         return self._pref_gen.get_metrics()

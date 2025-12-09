@@ -14,7 +14,6 @@ MOOD_BIAS = {
     "none_self":  {"human": -6.0, "robot": +6.0},
 }
 
-
 class HierarchicalPreferenceModel:
     """
     Hierarchical Bayesian model of human preferences:
@@ -36,6 +35,7 @@ class HierarchicalPreferenceModel:
         self,
         spices: List[str],
         recipes: List[str],
+        base_satisfaction_bias: float = 3.0, # pull from SpiceEnv
         mu0: float = 0.0,
         sigma0: float = 1.0,
         sigma_h: float = 1.0,
@@ -69,26 +69,40 @@ class HierarchicalPreferenceModel:
         self.phi_var: Dict[str, Dict[str, float]] = defaultdict(
             lambda: {s: sigma_r**2 for s in self.spices}
         )
+        
+        # Exponential moving average for smoothing updates
+        self.phi_ema: Dict[str, Dict[str, float]] = defaultdict(
+            lambda: {s: 0.0 for s in self.spices}
+        )
+        self.ema_alpha = 0.1
 
         # Per-step data for mood inference (actor, spice, satisfaction)
         self.episode_data: List[Tuple[str, str, float]] = []
 
         # Prior over mood
-        self.mood_prior = np.array([1/3, 1/3, 1/3], dtype=float)
+        self.mood_prior = np.array([0.05, 0.9, 0.05], dtype=float) # bias towards neutral mood
         self.mood_posterior = self.mood_prior.copy()
+
+        self.base_satisfaction_bias = base_satisfaction_bias
+        self.mood_bias_strength = base_satisfaction_bias * 2.0
+        self.mood_bias = {
+            "all_self":   {"human": +self.mood_bias_strength, "robot": -self.mood_bias_strength},
+            "neutral":    {"human": 0.0,  "robot": 0.0},
+            "none_self":  {"human": -self.mood_bias_strength, "robot": +self.mood_bias_strength},
+        }
 
     # --- Mood inference ---
     def _loglik_feedback_given_mood(
         self, actor: str, spice: str, satisfaction: float, m: str, recipe_name: str
     ) -> float:
         """
-        Compute log P(y | actor, spice, φ, m)
-        using the generative model logit = sign(actor)*phi + mood_bias
+        Compute log-probability of satisfaction given mood, actor, and spice using the 
+        generative model logit = sign(actor)*phi + mood_bias
         """
         phi = self.phi_mean[recipe_name][spice]
         sign_actor = +1.0 if actor == "human" else -1.0
 
-        logit = sign_actor * phi + MOOD_BIAS[m][actor]
+        logit = sign_actor * phi + self.mood_bias[m][actor]
         p = 1.0 / (1.0 + np.exp(-logit))
 
         if satisfaction > 0:
@@ -98,7 +112,7 @@ class HierarchicalPreferenceModel:
 
     def _update_mood_posterior(self, recipe_name: str):
         """
-        Update P(m | all feedback so far in the episode)
+        Update mood posterior from all observations in current episode.
         """
         logps = []
         for m in MOODS:
@@ -116,29 +130,26 @@ class HierarchicalPreferenceModel:
         self.mood_posterior = ps
 
     # Recipe level updates ----------------------------------------------------
-    def _pseudo_obs_weighted(self, actor: str, satisfaction: float) -> float:
+    def _pseudo_obs_weighted(self, actor: str, satisfaction: float, neutral_threshold: float = 0.5) -> float:
         """
-        Convert (actor, satisfaction) to a signal g
-        weighted by mood posterior.
+        Convert (actor, satisfaction) to a preference signal weighted by mood posterior.
+        Weighted by neutral confident to reduce noise from mood-biased episodes.
         """
-        g_m = []
+        neutral_idx = MOODS.index("neutral")
+        neutral_conf = self.mood_posterior[neutral_idx]
+        
+        sign_actor = +1.0 if actor == "human" else -1.0
+        sign_sat = +1.0 if satisfaction > 0 else -1.0
+        g_neutral = sign_actor * sign_sat  # Preference signal if mood is neutral
+        
+        # Use full signal (neutral mood)
+        if neutral_conf >= neutral_threshold:
+            return float(g_neutral)
+        # Weight by neutral confident to reduce noise 
+        else:
+            return float(neutral_conf * g_neutral)
 
-        # Compute expected g under each mood
-        for m in MOODS:
-            b = MOOD_BIAS[m][actor]
-            if m == "neutral":
-                sign_actor = +1.0 if actor == "human" else -1.0
-                sign_sat = +1.0 if satisfaction > 0 else -1.0
-                g = sign_actor * sign_sat
-            else:
-                g = 0.0
-
-            g_m.append(g)
-
-        g_expectation = float(np.dot(self.mood_posterior, g_m))
-        return g_expectation
-
-    def _update_phi(self, recipe_name: str, spice: str, g: float):
+    def _update_phi(self, recipe_name: str, spice: str, g: float, learning_rate: float = 1.0):
         """
         Normal-Normal update:
             g ~ N(φ, σ_obs^2)
@@ -147,7 +158,7 @@ class HierarchicalPreferenceModel:
 
         theta_mean = self.theta_mean[spice]
         sigma_r2 = self.sigma_r**2
-        sigma_obs2 = self.sigma_obs**2
+        sigma_obs2 = self.sigma_obs**2 / learning_rate
 
         # Prior
         prior_mean = theta_mean
@@ -157,7 +168,15 @@ class HierarchicalPreferenceModel:
         post_var = 1.0 / (1.0/prior_var + 1.0/sigma_obs2)
         post_mean = post_var * (prior_mean/prior_var + g/sigma_obs2)
 
-        self.phi_mean[recipe_name][spice] = post_mean
+        # Smoothing update
+        current_ema = self.phi_ema[recipe_name][spice]
+        if current_ema == 0.0 and self.phi_mean[recipe_name][spice] == 0.0:
+            smoothed_mean = post_mean
+        else:
+            smoothed_mean = self.ema_alpha * post_mean + (1 - self.ema_alpha) * current_ema
+        
+        self.phi_mean[recipe_name][spice] = smoothed_mean
+        self.phi_ema[recipe_name][spice] = smoothed_mean
         self.phi_var[recipe_name][spice] = post_var
 
     # --- θ and μ updates (hierarchical pooling) ---
@@ -168,7 +187,6 @@ class HierarchicalPreferenceModel:
             μ_s from all θ_s
         using Gaussian pooling.
         """
-
         # Update θ_s
         for s in self.spices:
             # gather φ_mean(r,s) over all recipes
@@ -204,21 +222,25 @@ class HierarchicalPreferenceModel:
             self.mu_mean[s] = post_mean
             self.mu_var[s] = post_var
 
-    def observe(self, recipe_name: str, spice: str, actor: str, satisfaction: float) -> None:
+    def observe(self, recipe_name: str, spice: str, actor: str, satisfaction: float, neutral_threshold: float = 0.5) -> None:
         """
         Process a transition (s, a, y) from the environment.
-        Mood is hidden; we infer it internally.
-
-        Steps:
-          1. Add (actor, spice, sat) to episode_data
-          2. Update mood posterior
-          3. Compute expected preference signal E[g]
-          4. Update φ
+        (Update mood, compute preference signal, update φ)
         """
         self.episode_data.append((actor, spice, satisfaction))
         self._update_mood_posterior(recipe_name)
-        g = self._pseudo_obs_weighted(actor, satisfaction)
-        self._update_phi(recipe_name, spice, g)
+        
+        # Only compute signal if confident in neutral mood
+        neutral_idx = MOODS.index("neutral")
+        neutral_conf = self.mood_posterior[neutral_idx]
+        
+        if neutral_conf >= neutral_threshold:
+            g = self._pseudo_obs_weighted(actor, satisfaction, neutral_threshold)
+            
+            base_lr = 0.05  
+            confidence_boost = (neutral_conf - neutral_threshold) / (1.0 - neutral_threshold) 
+            learning_rate = base_lr + (0.1 - base_lr) * confidence_boost 
+            self._update_phi(recipe_name, spice, g, learning_rate=learning_rate)
 
     def end_episode(self):
         """Clear episode buffers and update θ, μ."""

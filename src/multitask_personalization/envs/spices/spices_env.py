@@ -14,6 +14,7 @@ import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 from multitask_personalization.structs import PublicSceneSpec
 
+# --- PROFILE / RECIPE SPECIFICATIONS ---
 @dataclass(frozen=True)
 class ProfileSpec:
     name: str
@@ -76,9 +77,8 @@ class RecipeSpec:
         Each layer corresponds to a topological level.
         """
         G = self.build_dag()
-        layers = self.layers()  # list of lists of nodes
+        layers = self.layers() 
 
-        # Build layer index
         layer_index = {}
         for i, layer in enumerate(layers):
             for s in layer:
@@ -93,14 +93,14 @@ class RecipeSpec:
         # Layout
         pos = nx.multipartite_layout(G, subset_key="layer", align="horizontal")
 
-        plt.figure(figsize=(10, 4))
+        plt.figure(figsize=(4, 10))
         nx.draw(
             G,
             pos,
             with_labels=True,
             node_size=2000,
             node_color=colors,
-            font_size=10,
+            font_size=8,
             font_weight="bold",
             arrowsize=20,
             font_color="white"
@@ -111,17 +111,29 @@ class RecipeSpec:
         plt.tight_layout()
         plt.show()
 
-    
-@dataclass(frozen=True)
-class MoodSpec:
-    import numpy as np
-
+# --- MOOD SPECIFICATIONS ---
 @dataclass(frozen=True)
 class MoodSpec:
     """Defines the mood categories."""
+    # TODO: extend to more moods / non-categorical moods
     moods: tuple[str, ...] = ("all_self", "neutral", "none_self")
-    priors: tuple[float, ...] = (0.33, 0.34, 0.33)
+    # Skewed priors to favor neutral mood (60% neutral, 20% each for all_self/none_self)
+    # This ensures more episodes contribute to preference learning
+    priors: tuple[float, ...] = (0.2, 0.6, 0.2)  # (all_self, neutral, none_self)
 
+class MoodModel:
+    """Handles sampling and updating the current day's mood."""
+    def __init__(self, spec: MoodSpec, rng: np.random.Generator, mood_bias: dict[str, dict[str, float]] = None):
+        self.spec = spec
+        self.rng = rng
+        self.current_mood: str | None = None
+
+    def sample_mood(self) -> str:
+        """Sample a mood from the mood specification."""
+        self.current_mood = self.rng.choice(self.spec.moods, p=self.spec.priors)
+        return self.current_mood
+    
+# --- SPICES ENVIRONMENT SPECIFICATIONS ---
 @dataclass(frozen=True)
 class SpiceSceneSpec(PublicSceneSpec):
     """A scene specification for the spices environment."""
@@ -129,43 +141,35 @@ class SpiceSceneSpec(PublicSceneSpec):
 
 @dataclass(frozen=True)
 class SpiceHiddenSpec:
-    """Hidden Human preference over WHO should add each spice."""
+    """Hidden Human preference over who should add each spice."""
     preferred_actor: dict[str, str] # {"Spice":  "Actor"}
 
 @dataclass(frozen=True)
 class SpiceState:
     """The current state of the spices environment."""
     time: int
-    added_spices: tuple[str, ...] # spices already added to the pot (sequence)
-    remaining_spices: tuple[str, ...] # spices not yet added to the pot
+    added_spices: tuple[str, ...] # spices already added 
+    remaining_spices: tuple[str, ...] # spices not yet added 
     feasible_next: tuple[str, ...] # spices that can be added next
     current_spice: str | None # the current spice to add
 
-# Action: (flag, payload)
+# --- ACTION SPECIFICATIONS ---
 """
-The actions are defined as (flag, payload) where flag = 0 / 1 indicates whether the action is an "add" or "done".
-If flag = 0, then payload is the name of the actor that is assigned to SpiceState.feasible_next (next spice to add)
+Action: (flag, payload)
+flag = 0: add, flag = 1: done
+payload: the name of the actor that is assigned to add the next spice (only if flag = 0)
 """
-SpiceAction: TypeAlias = tuple[int, str | None] # (flag: 0=add, 1=done, 2=wait, payload: "Add <spice>" or None)
+SpiceAction: TypeAlias = tuple[int, str | None] # (flag: 0=add, 1=done, payload: "Add <spice>" or None)
 
-class MoodModel:
-    """Handles sampling and updating the current day's mood."""
-    def __init__(self, spec: MoodSpec, rng: np.random.Generator):
-        self.spec = spec
-        self.rng = rng
-        self.current_mood = None
-
-    def sample_mood(self) -> str:
-        self.current_mood = self.rng.choice(self.spec.moods, p=self.spec.priors)
-        return self.current_mood
-
+# --- SPICES ENVIRONMENT ---
 class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
-    """A simple spices symbolic environment for rapid testing of co-planning.
-    
-    The environment is a simple symbolic environment where the user can add spices to a pot.
-    The human has a hidden preference about which spices they prefer to add to the pot. 
-
-    Actions are adding a spice to the pot.
+    """
+    A symbolic environment where actors can follow a recipe to add spices to a pot.
+    The human actor:
+        - has a hideen preference about which spices they prefer to add to the pot.
+        - has a mood that affects their preferences on a given episode
+    The robot actor:
+        - is a perfect planner that can add spices to the pot in the optimal order
     """
 
     def __init__(
@@ -191,6 +195,7 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
         self._dag = self.scene_spec.recipe.build_dag()
         self._topo_order = self.scene_spec.recipe.get_topological_sort()
         self._layers = self.scene_spec.recipe.layers()
+        self._base_satisfaction_bias = 3.0
 
         self._t = 0
         self._added: list[str] = []
@@ -199,10 +204,11 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
         self._satisfaction_history: list[float] = []
         self._action_history: list[SpiceAction] = []
 
-
         self.eval_mode = eval_mode
         self.verbose = verbose
 
+        if verbose:
+            self._log_recipe()
 
     def reset(
         self,
@@ -215,22 +221,23 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
         if seed is not None:
             self._rng = np.random.default_rng(seed)
 
-        # Create stationary randomized preferences if none provided
+        # Create randomized hidden preferences if none provided
         if self.eval_mode or self._hidden_spec is None:
             self.__randomize_hidden_preferences()
 
+        # Reset state
         self._t = 0
         self._added: list[str] = []
         self._last_actor: str | None = None
         self._satisfaction_history: list[float] = []
-        self._current_spice = self._pick_current_spice()
+        self._current_spice: str | None = self._pick_current_spice()
         self._action_history: list[SpiceAction] = []
-        self._current_mood = self._mood_model.sample_mood()
+        self._current_mood: str | None = self._mood_model.sample_mood()
 
         if self.verbose:
             logging.info("[SpiceEnv] Resetting environment")
             logging.info(f"[Mood] Current mood: {self._current_mood}")
-            self._log_recipe_and_prefs()
+            self._log_hidden_prefs()
             #self.scene_spec.recipe.visualize_dag()
 
         return self._get_state(), self._get_info()
@@ -242,14 +249,10 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
 
         self._action_history.append(action)
 
-        # Done with all spices
+        # Done with all spices (only raises on repeated calls to step after the recipe is complete)
         if np.isclose(status, 1):
             info = self._get_info(robot_indicated_done=True)
-            terminated = True
-
-            if self.verbose:
-                logging.info(f"[RECIPE COMPLETED] Average Satisfaction={info['average_satisfaction']:+.2f}")
-            
+            terminated = True            
             return self._get_state(), 0.0, terminated, False, info
         
         # Add spice and advance forward
@@ -267,19 +270,15 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
             terminated = True
 
             if self.verbose:
-                #self.visualize_current_frontier()
-                logging.info(f"[STEP {self._t - 1}] Assign {info['last_spice']} → {info['last_actor']} "
-                  f"(pref={info['preferred_actor']})  sat={info['satisfaction']:+}")
-                logging.info(f"[RECIPE COMPLETED] Average Satisfaction={info['average_satisfaction']:+.2f}")
+                logging.info(f"[Step {self._t - 1}] Assign {info['last_spice']} → {info['last_actor']} ")
 
             return self._get_state(), 0.0, terminated, False, info
 
-        # Get info
+        # Recipe is still ongoing
         info = self._get_info(robot_indicated_done=False)
 
         if self.verbose:
-            logging.info(f"[STEP {self._t - 1}] Assign {info['last_spice']} → {info['last_actor']} "
-                  f"(pref={info['preferred_actor']})  sat={info['satisfaction']:+}")
+            logging.info(f"[Step {self._t - 1}] Assign {info['last_spice']} → {info['last_actor']} ")
 
         return self._get_state(), 0.0, False, False, info
     
@@ -287,24 +286,27 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
         raise NotImplementedError
 
     # ---------------- UTIILTY FUNCTIONS ----------------
-    def _log_recipe_and_prefs(self) -> None:
+    def _log_recipe(self) -> None:
         recipe = self.scene_spec.recipe
-        logging.info("\n === RECIPE ===\n"
-                     f"Name: {recipe.name}\n"
-                     "Spices: {tuple(recipe.spices)}\n"
-                     "Predecessors (must come before -> spice):\n")
+        logging.info(f"\n{'=' * 30} RECIPE {'=' * 30}\n")
+        logging.info(f"Name: {recipe.name}\n"
+                     f"Spices: {', '.join(spice for spice in recipe.spices)}\n")
+        logging.info(f"Predecessors (must come before -> spice):\n")
         for s in recipe.spices:
             preds = recipe.predecessors.get(s, ())
             if preds:
-                for p in preds:
-                    logging.info(f"  {p} -> {s}")
+                logging.info(f"  {', '.join(preds)} → {s}")
             else:
-                logging.info(f"  (start) -> {s}" if s == self._current_spice else f"  (no preds) -> {s}")
-        logging.info("\n=== HIDDEN PREFERENCES (actor per spice) ===")
-        for s in recipe.spices:
-            who = self._hidden_spec.preferred_actor.get(s, "?")
-            logging.info(f"  {s:>15}: {who}")
-        logging.info("=====================")
+                logging.info(f"  (None) → {s}")
+
+    def _log_hidden_prefs(self) -> None:
+        logging.info(f"\n{'=' * 30} HIDDEN PREFERENCES {'=' * 30}")
+        actors = {}
+        for spice, actor in self._hidden_spec.preferred_actor.items():
+            actors[actor] = actors.get(actor, []) + [spice]
+        for actor, spices in actors.items():
+            logging.info(f"  {actor}: {', '.join(spices)}")
+        logging.info(f"{'=' * 60}\n")
 
     def _get_state(self) -> SpiceState:
         feasible_list = list(self.__feasible_next())
@@ -316,12 +318,77 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
             current_spice=self._current_spice or (feasible_list[0] if feasible_list else ""),
         )
 
+    def _compute_mood_bias(self, mood: str | float, actor: str) -> float:
+        """
+        Compute mood bias that OVERRIDES base preferences.
+        
+        Mood semantics:
+        - "all_self" (or +1.0): Human wants to do everything (satisfaction ONLY when human acts)
+        - "none_self" (or -1.0): Human doesn't want to do anything (satisfaction ONLY when robot acts)
+        - "neutral" (or 0.0): No mood override, base preferences apply
+        
+        Args:
+            mood: Categorical mood string or continuous value in [-1.0, +1.0]
+            actor: "human" or "robot"
+        
+        Returns:
+            Mood bias value. With phi = ±base_satisfaction_bias, bias_strength = base_satisfaction_bias * 2.0 ensures mood overrides.
+        """
+        bias_strength = self._base_satisfaction_bias * 2.0
+        
+        # Handle continuous mood values
+        if isinstance(mood, (int, float)):
+            mood_value = float(mood)
+            mood_value = np.clip(mood_value, -1.0, 1.0)
+            
+            # Map continuous mood to bias:
+            if actor == "human":
+                return mood_value * bias_strength
+            else:  # robot
+                return -mood_value * bias_strength
+        
+        # Handle categorical moods
+        if mood == "all_self":
+            return +bias_strength if actor == "human" else -bias_strength
+        elif mood == "none_self":
+            return -bias_strength if actor == "human" else +bias_strength
+        elif mood == "neutral":
+            return 0.0
+        else:
+            return 0.0
+
+    def _compute_satisfaction(self, last_spice: str, preferred: str) -> int:
+        """Compute satisfaction based on preference and mood.
+        
+        Mood overrides base preferences:
+        - "all_self": satisfaction ONLY when human acts
+        - "none_self": satisfaction ONLY when robot acts
+        """        
+        # Base preference signal (can be overridden by mood)
+        phi = +self._base_satisfaction_bias if preferred == self._last_actor else -self._base_satisfaction_bias
+        
+        # Mood bias
+        mood_adj = self._compute_mood_bias(self._current_mood, self._last_actor)
+        
+        # Combine
+        logit = phi + mood_adj
+        
+        # Probabilistic satisfaction
+        p = 1 / (1 + np.exp(-logit))
+        satisfaction = self._rng.choice([+1, -1], p=[p, 1-p])
+
+        # if self.verbose:
+        #     logging.info(f"[Satisfaction] Base preference: {phi}, Mood bias: {mood_adj}, p: {p:.6f}, Satisfaction: {satisfaction}")
+        
+        return satisfaction
+
     def _get_info(self, robot_indicated_done: bool = False) -> dict[str, Any]:
         # Empty case
         if not self._added:
             return {
                 "robot_indicated_done": robot_indicated_done,
                 "satisfaction": 0.0,
+                "expected_mood": self._mood_model.get_expected_mood() if hasattr(self._mood_model, "get_expected_mood") else None,
                 "preferred_actor": None,
                 "current_spice": self._current_spice,
                 "last_spice": None,
@@ -330,37 +397,14 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
                 "average_satisfaction": 0.0,
                 "action_history": self._action_history,
                 "mood": self._current_mood,
+                "recipe_name": self.scene_spec.recipe.name,  # Add recipe name for HBM
             }
 
-        # Mood table (shift in preferences)
-        MOOD_BIAS = {
-            "all_self":   {"human": +6.0, "robot": -6.0},
-            "neutral":    {"human": 0.0,  "robot": 0.0},
-            "none_self":  {"human": -6.0, "robot": +6.0},
-        }
-        
-        # Non-empty case
+        # Compute satisfaction
         last_spice = self._added[-1]
         preferred = self._hidden_spec.preferred_actor[last_spice]
 
-        # φ component: long-term preference signal
-        phi = +2.0 if preferred == self._last_actor else -2.0
-
-        # mood component
-        mood_adj = MOOD_BIAS[self._current_mood][self._last_actor]
-
-        # Combine additively into a logit
-        logit = phi + mood_adj
-
-        # Probabilistic satisfaction
-        p = 1 / (1 + np.exp(-logit))
-        satisfaction = self._rng.choice([+1, -1], p=[p, 1-p])
-
-
-        logging.info(f"[Mood] Mood bias: {mood_adj}")
-        logging.info(f"[Mood] Base satisfaction: {phi}")
-        logging.info(f"[Mood] Satisfaction: {satisfaction}")
-
+        satisfaction = self._compute_satisfaction(last_spice, preferred)
         self._satisfaction_history.append(satisfaction)
 
         return {
@@ -369,6 +413,7 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
             "preferred_actor": preferred,
             "current_spice": self._current_spice,
             "last_spice": last_spice,
+            "recipe_name": self.scene_spec.recipe.name,  # Add recipe name for HBM
             "last_actor": self._last_actor,
             "satisfaction_history": self._satisfaction_history,
             "average_satisfaction": np.mean(self._satisfaction_history),
@@ -379,23 +424,33 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
         }
 
     def __feasible_next(self) -> Iterable[str]:
-        """The spices that can be added next."""
+        """Return feasible spices ordered by layer (then topological order)."""
         dag = self._dag
-
         added = set(self._added)
 
-        feasible = []
-
+        feasible: list[str] = []
         for node in dag.nodes:
             if node in added:
                 continue
-
             preds = set(dag.predecessors(node))
             if preds.issubset(added):
                 feasible.append(node)
 
-        return feasible
+        # Build layer index: spice -> layer number
+        layer_index: dict[str, int] = {}
+        for idx, layer in enumerate(self._layers):
+            for spice in layer:
+                layer_index[spice] = idx
 
+        # Sort feasible nodes by (layer, topo order) so earlier layers come first
+        feasible.sort(
+            key=lambda s: (
+                layer_index.get(s, float("inf")),
+                self._topo_order.index(s),
+            )
+        )
+
+        return feasible
 
     def _pick_current_spice(self) -> str | None:
         """Deterministically pick among the feasible spices to add next."""
@@ -412,40 +467,4 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
         """Randomize the hidden preferences."""
         preferences = {spice: self._rng.choice(["human", "robot"]) for spice in self.scene_spec.recipe.spices}
         self._hidden_spec = SpiceHiddenSpec(preferred_actor=preferences)
-        
-    
-    # def visualize_current_frontier(self):
-    #     """
-    #     Visualize only the current DAG frontier (feasible next spices).
-    #     """
-    #     import matplotlib.pyplot as plt
-    #     import networkx as nx
-
-    #     frontier = list(self.__feasible_next())
-
-    #     # Build a tiny graph that only contains frontier nodes
-    #     G = nx.DiGraph()
-    #     for s in frontier:
-    #         G.add_node(s)
-
-    #     # Layout: simple horizontal placement
-    #     pos = {s: (i, 0) for i, s in enumerate(frontier)}
-
-    #     plt.figure(figsize=(8, 2))
-
-    #     nx.draw(
-    #         G,
-    #         pos,
-    #         with_labels=True,
-    #         node_color="#ffd700",  # gold for frontier
-    #         node_size=1800,
-    #         font_size=10,
-    #         font_weight="bold"
-    #     )
-
-    #     plt.title(f"Current Frontier at t={self._t}")
-    #     plt.axis("off")
-    #     plt.tight_layout()
-    #     plt.show()
-
 

@@ -118,11 +118,171 @@ ULTRA_COMPLEX_FEAST = RecipeSpec(
     },
 )
 
+# Additional complex recipes similar to UltraComplexFeast
+ASIAN_FUSION_BOWL = RecipeSpec(
+    name="AsianFusionBowl",
+    spices=(
+        "salt", "pepper", "soy_sauce", "ginger", "garlic", "sesame_oil",
+        "turmeric", "cumin", "coriander", "chili", "paprika", "onion",
+        "cinnamon", "star_anise", "cardamom", "rice_vinegar", "honey", "cilantro"
+    ),
+    predecessors={
+        # base
+        "salt": (),
+        "pepper": ("salt",),
+        "soy_sauce": ("salt",),
+        
+        # aromatics
+        "sesame_oil": ("soy_sauce",),
+        "onion": ("sesame_oil",),
+        "garlic": ("onion",),
+        "ginger": ("onion",),
+        
+        # spice layers
+        "turmeric": ("garlic", "ginger"),
+        "cumin": ("turmeric",),
+        "coriander": ("turmeric", "cumin"),
+        "chili": ("coriander", "pepper"),
+        "paprika": ("chili", "coriander"),
+        
+        # warm spices
+        "cinnamon": ("turmeric",),
+        "star_anise": ("cinnamon",),
+        "cardamom": ("star_anise", "cumin"),
+        
+        # integration
+        "rice_vinegar": ("coriander", "soy_sauce"),
+        "honey": ("rice_vinegar", "cardamom"),
+        
+        # finishing
+        "cilantro": ("honey", "pepper", "rice_vinegar"),
+    },
+)
+
+MEDITERRANEAN_COMPLEX = RecipeSpec(
+    name="MediterraneanComplex",
+    spices=(
+        "salt", "pepper", "olive_oil", "garlic", "onion", "lemon",
+        "basil", "oregano", "thyme", "rosemary", "paprika", "cumin",
+        "coriander", "bay_leaf", "fennel_seed", "tomato", "capers", "parsley"
+    ),
+    predecessors={
+        # base
+        "salt": (),
+        "pepper": ("salt",),
+        "olive_oil": ("salt",),
+        
+        # aromatics
+        "onion": ("olive_oil",),
+        "garlic": ("onion",),
+        "lemon": ("onion",),
+        
+        # herb layers
+        "basil": ("garlic",),
+        "oregano": ("basil",),
+        "thyme": ("basil", "garlic"),
+        "rosemary": ("thyme", "oregano"),
+        
+        # spice integration
+        "paprika": ("rosemary",),
+        "cumin": ("paprika",),
+        "coriander": ("cumin", "thyme"),
+        "bay_leaf": ("coriander", "rosemary"),
+        "fennel_seed": ("bay_leaf", "cumin"),
+        
+        # base integration
+        "tomato": ("coriander", "onion"),
+        "capers": ("tomato", "lemon"),
+        
+        # finishing
+        "parsley": ("capers", "pepper", "fennel_seed"),
+    },
+)
+
+INDIAN_FEAST_COMPLEX = RecipeSpec(
+    name="IndianFeastComplex",
+    spices=(
+        "salt", "pepper", "ghee", "onion", "garlic", "ginger",
+        "turmeric", "cumin", "coriander", "chili", "garam_masala", "cardamom",
+        "cinnamon", "clove", "mustard_seed", "fenugreek", "yogurt", "tamarind"
+    ),
+    predecessors={
+        # base
+        "salt": (),
+        "pepper": ("salt",),
+        "ghee": ("salt",),
+        
+        # aromatics
+        "onion": ("ghee",),
+        "garlic": ("onion",),
+        "ginger": ("onion",),
+        
+        # spice foundation
+        "turmeric": ("garlic", "ginger"),
+        "cumin": ("turmeric",),
+        "coriander": ("turmeric", "cumin"),
+        "chili": ("coriander", "pepper"),
+        "mustard_seed": ("chili", "cumin"),
+        
+        # garam masala components
+        "cardamom": ("turmeric",),
+        "cinnamon": ("cardamom",),
+        "clove": ("cinnamon",),
+        "garam_masala": ("clove", "cardamom", "cinnamon"),
+        
+        # integration
+        "fenugreek": ("garam_masala", "mustard_seed"),
+        "yogurt": ("coriander", "onion"),
+        "tamarind": ("yogurt", "fenugreek"),
+    },
+)
+
+MEXICAN_FIESTA_COMPLEX = RecipeSpec(
+    name="MexicanFiestaComplex",
+    spices=(
+        "salt", "pepper", "lime", "garlic", "onion", "cilantro",
+        "cumin", "coriander", "chili", "paprika", "oregano", "cinnamon",
+        "cocoa", "chipotle", "tomato", "avocado", "jalapeno", "cumin_seed"
+    ),
+    predecessors={
+        # base
+        "salt": (),
+        "pepper": ("salt",),
+        "lime": ("salt",),
+        
+        # aromatics
+        "onion": ("lime",),
+        "garlic": ("onion",),
+        "cilantro": ("onion",),
+        
+        # spice layers
+        "cumin": ("garlic",),
+        "coriander": ("cumin",),
+        "chili": ("coriander", "pepper"),
+        "paprika": ("chili", "coriander"),
+        "oregano": ("paprika", "cilantro"),
+        
+        # complex flavors
+        "cinnamon": ("cumin",),
+        "cocoa": ("cinnamon",),
+        "chipotle": ("cocoa", "chili"),
+        "cumin_seed": ("chipotle", "cumin"),
+        
+        # integration
+        "tomato": ("coriander", "onion"),
+        "jalapeno": ("tomato", "chipotle"),
+        "avocado": ("jalapeno", "lime"),
+    },
+)
+
 # Profiles
 
 CHEF_A = ProfileSpec(
     name="ChefA",
-    recipes=("SimpleDal", "BreakingBread", "SpicySalsa", "SweetCurry", "GrandmasSoup", "MediterraneanFeast"),
+    recipes=(
+        "SimpleDal", "BreakingBread", "SpicySalsa", "SweetCurry", "GrandmasSoup", "MediterraneanFeast",
+        "UltraComplexFeast", "AsianFusionBowl", "MediterraneanComplex", "IndianFeastComplex", "MexicanFiestaComplex"
+    ),
 )
 
 CHEF_B = ProfileSpec(
@@ -141,6 +301,10 @@ ALL_RECIPES = {
     "GrandmasSoup": GRANDMAS_SOUP,
     "MediterraneanFeast": MEDITERRANEAN_FEAST,
     "UltraComplexFeast": ULTRA_COMPLEX_FEAST,
+    "AsianFusionBowl": ASIAN_FUSION_BOWL,
+    "MediterraneanComplex": MEDITERRANEAN_COMPLEX,
+    "IndianFeastComplex": INDIAN_FEAST_COMPLEX,
+    "MexicanFiestaComplex": MEXICAN_FIESTA_COMPLEX,
 }
 
 def get_recipe(name: str) -> RecipeSpec:
