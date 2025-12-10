@@ -70,7 +70,6 @@ class RecipeSpec:
 
         return layers
 
-    
     def visualize_dag(self) -> None:
         """
         Visualize the recipe DAG using a multipartite layout based on its layers.
@@ -87,7 +86,7 @@ class RecipeSpec:
 
         # Build a color map for layers
         num_layers = len(layers)
-        cmap = cm.get_cmap("viridis", num_layers)
+        cmap = cm.get_cmap("cividis", num_layers)
         colors = [cmap(layer_index[n]) for n in G.nodes]
 
         # Layout: place layers from left to right for clearer reading
@@ -95,25 +94,30 @@ class RecipeSpec:
             G,
             subset_key="layer",
             align="vertical",  # vertical alignment => layers spread on the x-axis (left→right)
-            scale=2.0,
+            scale=3.0,
         )
+
+        # Human-friendly labels for poster-quality visuals
+        label_map = {node: node.replace("_", " ").title() for node in G.nodes}
 
         plt.figure(figsize=(10, 4), dpi=150)
         nx.draw(
             G,
             pos,
+            labels=label_map,
             with_labels=True,
-            node_size=2200,
+            node_size=2750,
             node_color=colors,
             edgecolors="black",
-            linewidths=1.0,
-            font_size=10,
+            linewidths=0.5,
+            font_size=9,
             font_weight="bold",
             arrowsize=18,
             arrowstyle="-|>",
-            width=1.4,
+            width=1,
             connectionstyle="arc3,rad=0.05",
             font_color="white",
+            font_family="Helvetica",
         )
 
         plt.title(f"Recipe DAG: {self.name}", fontsize=12, pad=10, fontweight="bold")

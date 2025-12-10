@@ -85,7 +85,7 @@ class _AssignPreferenceGenerator(CSPConstraintGenerator[SpiceState, SpiceAction]
         self._use_hbm = use_hbm
         self._recipe_list = recipe_list if recipe_list is not None else []
         
-        # Initialize classifier attributes (only used if use_hbm=False)
+        # Always initialize classifier attributes (for backward compatibility)
         self._classifier: RadiusNeighborsClassifier | None = None
         self._training_inputs: list[NDArray] = []
         self._training_outputs: list[bool] = []
@@ -101,7 +101,7 @@ class _AssignPreferenceGenerator(CSPConstraintGenerator[SpiceState, SpiceAction]
                 sigma0=1.0,
                 sigma_h=1.0,
                 sigma_r=1.0,
-                sigma_obs=0.3,  # Further reduced observation noise for more stable learning
+                sigma_obs=1.0,
             )
             # Sync HBM mood posterior with our mood inference
             self._hbm.mood_posterior = np.array([0.05, 0.9, 0.05], dtype=float)
@@ -297,47 +297,6 @@ class _AssignPreferenceGenerator(CSPConstraintGenerator[SpiceState, SpiceAction]
 
         return LogProbCSPConstraint(name, [actor_vars], _logprob, threshold=np.log(1e-6))
 
-    def visualize_classifier(self) -> None:
-        if self._use_hbm and self._hbm is not None:
-            if self._verbose:
-                logging.info("[Visualize] HBM visualization not yet implemented")
-            return
-        
-        if self._classifier is None or len(self._training_inputs) == 0:
-            if self._verbose:
-                logging.info("[Visualize] No classifier or training data to visualize")
-            return
-            
-        X = np.array(self._training_inputs)
-        y = np.array(self._training_outputs)
-
-        # Define the grid
-        x_min, x_max = X[:, 0].min() - 0.5, X[:, 0].max() + 0.5
-        y_min, y_max = -0.5, 1.5  # actor index range: 0=human, 1=robot
-        xx, yy = np.meshgrid(np.arange(x_min, x_max, 0.1),
-                            np.arange(y_min, y_max, 0.05))
-        grid = np.c_[xx.ravel(), yy.ravel()]
-
-        # Predict probabilities over the grid
-        Z = np.zeros(len(grid))
-        for i, g in enumerate(grid):
-            probs = self._safe_predict_proba(g)
-            Z[i] = probs  # probability of positive label (True)
-        Z = Z.reshape(xx.shape)
-
-        # Plot
-        plt.figure(figsize=(7, 5))
-        plt.contourf(xx, yy, Z, levels=20, cmap="coolwarm", alpha=0.6)
-        plt.colorbar(label="P(label=True)")
-        plt.scatter(X[:, 0], X[:, 1],
-                    c=y, cmap="bwr", edgecolor="k", s=120, marker="o", label="Training points")
-        plt.xlabel("Spice index")
-        plt.ylabel("Actor index (0=human, 1=robot)")
-        radius_str = f"{self._classifier.radius}" if self._classifier is not None else "N/A"
-        plt.title(f"RadiusNeighborsClassifier (radius={radius_str})")
-        plt.legend()
-        plt.show()
-
     def learn_from_transition(
         self, obs: SpiceState, act: SpiceAction, next_obs: SpiceState, done: bool, info: dict[str, Any]
     ) -> None:
@@ -369,24 +328,12 @@ class _AssignPreferenceGenerator(CSPConstraintGenerator[SpiceState, SpiceAction]
         # Update mood posterior (per-step inference for online replanning)
         self._update_mood_posterior()
         
-        # HBM: continuously update preferences when confident in neutral mood
+        # With HBM: continuously update preferences weighted by mood
         if self._use_hbm and self._hbm is not None and recipe_name:
-            # Only learn from observations when we're confident mood is neutral
-            # This prevents learning from mood-biased episodes
-            MOODS = ("all_self", "neutral", "none_self")
-            neutral_idx = MOODS.index("neutral")
-            neutral_conf = self._mood_posterior[neutral_idx]
-            
-            # Only update if neutral confidence is above threshold
-            if neutral_conf >= self._neutral_confidence_threshold:
-                # Sync mood posterior to HBM
-                self._hbm.mood_posterior = self._mood_posterior.copy()
-                # HBM handles continuous updates (with its own threshold check)
-                self._hbm.observe(recipe_name, spice, actor, satisfaction, self._neutral_confidence_threshold)
-            elif self._verbose:
-                logging.debug(
-                    f"[HBM] Skipping update: neutral_conf={neutral_conf:.3f} < threshold={self._neutral_confidence_threshold:.2f}"
-                )
+            # Sync mood posterior to HBM (HBM uses its own, but we keep ours for CSP logic)
+            self._hbm.mood_posterior = self._mood_posterior.copy()
+            # HBM handles continuous updates weighted by mood
+            self._hbm.observe(recipe_name, spice, actor, satisfaction)
         
         # Finalize episode at end
         if done:
@@ -407,14 +354,14 @@ class _AssignPreferenceGenerator(CSPConstraintGenerator[SpiceState, SpiceAction]
             return 0.5
 
     def _finalize_episode(self) -> None:
-        """Finalize episode: update hierarchical preferences (HBM) or train classifier (legacy mode)."""
+        """Finalize episode: with HBM, update hierarchical preferences. Without HBM, all-or-nothing learning."""
         if self._use_hbm and self._hbm is not None:
-            # HBM: update hierarchical preferences (θ and μ) at episode end
+            # HBM handles continuous updates, but we call end_episode to update θ and μ
             self._hbm.end_episode()
             if self._verbose:
                 logging.info(f"[Episode] HBM updated hierarchical preferences (θ, μ)")
         else:
-            # Legacy classifier mode: all-or-nothing learning from neutral episodes
+            # Legacy all-or-nothing learning (only if not using HBM)
             MOODS = ("all_self", "neutral", "none_self")
             neutral_idx = MOODS.index("neutral")
             neutral_conf = self._mood_posterior[neutral_idx]
@@ -424,18 +371,19 @@ class _AssignPreferenceGenerator(CSPConstraintGenerator[SpiceState, SpiceAction]
             is_above_threshold = (neutral_conf >= self._neutral_confidence_threshold)
             should_learn = (is_neutral_most_likely or is_above_threshold) and neutral_conf >= 0.3
             
-            if should_learn and hasattr(self, '_episode_features') and hasattr(self, '_episode_labels'):
-                self._neutral_training_inputs.extend(self._episode_features)
-                self._neutral_training_outputs.extend(self._episode_labels)
-                self._update_constraint_parameters()
-                if self._verbose:
-                    logging.info(f"[Episode] Learning from neutral episode: {len(self._episode_features)} samples")
+            if should_learn:
+                if hasattr(self, '_episode_features') and hasattr(self, '_episode_labels'):
+                    self._neutral_training_inputs.extend(self._episode_features)
+                    self._neutral_training_outputs.extend(self._episode_labels)
+                    self._update_constraint_parameters()
+                    if self._verbose:
+                        logging.info(f"[Episode] Learning from neutral episode: {len(self._episode_features)} samples")
         
         # Reset episode buffers
         self._episode_observations.clear()
-        if not self._use_hbm and hasattr(self, '_episode_features'):
+        if hasattr(self, '_episode_features'):
             self._episode_features.clear()
-        if not self._use_hbm and hasattr(self, '_episode_labels'):
+        if hasattr(self, '_episode_labels'):
             self._episode_labels.clear()
         self._mood_posterior = self._mood_prior.copy()
         if self._use_hbm and self._hbm is not None:
@@ -497,31 +445,21 @@ class _AssignPreferenceGenerator(CSPConstraintGenerator[SpiceState, SpiceAction]
         metrics = {
             "expected_mood": self.get_expected_mood(),
             "neutral_confidence": self._mood_posterior[MOODS.index("neutral")],
+            "neutral_confident_examples": len(self._neutral_training_inputs),
         }
         
-        # Add preference learning diagnostics
-        if self._use_hbm and self._hbm is not None:
-            metrics["preference_model"] = "HBM"
-            metrics["hbm_trained"] = 1.0
-            # Count recipes seen
-            metrics["recipes_seen"] = len(self._recipe_list)
-            # For HBM, we don't track neutral_confident_examples the same way,
-            # but we can track total observations processed
-            metrics["neutral_confident_examples"] = len(self._episode_observations) if hasattr(self, '_episode_observations') else 0
-        else:
-            metrics["preference_model"] = "Classifier"
-            metrics["neutral_confident_examples"] = len(self._neutral_training_inputs)
-            if self._classifier is not None:
-                metrics["classifier_trained"] = 1.0
-                if len(self._neutral_training_inputs) > 0:
-                    predictions = self._classifier.predict(self._neutral_training_inputs)
-                    train_accuracy = float(np.mean(predictions == self._neutral_training_outputs))
-                    metrics["classifier_train_accuracy"] = train_accuracy
-                else:
-                    metrics["classifier_train_accuracy"] = 0.0
+        # Add classifier diagnostics
+        if self._classifier is not None:
+            metrics["classifier_trained"] = 1.0
+            if len(self._neutral_training_inputs) > 0:
+                predictions = self._classifier.predict(self._neutral_training_inputs)
+                train_accuracy = float(np.mean(predictions == self._neutral_training_outputs))
+                metrics["classifier_train_accuracy"] = train_accuracy
             else:
-                metrics["classifier_trained"] = 0.0
                 metrics["classifier_train_accuracy"] = 0.0
+        else:
+            metrics["classifier_trained"] = 0.0
+            metrics["classifier_train_accuracy"] = 0.0
         
         return metrics
 
@@ -647,7 +585,7 @@ class SpicesAssignCSPGenerator(CSPGenerator[SpiceState, SpiceAction]):
             has_preferences = True
         elif hasattr(self._pref_gen, '_classifier') and self._pref_gen._classifier is not None:
             has_preferences = True
-
+        
         if not has_preferences:
             return None
 
@@ -723,7 +661,7 @@ class SpicesAssignCSPGenerator(CSPGenerator[SpiceState, SpiceAction]):
         info["neutral_confidence"] = mood_metrics["neutral_confidence"]
         info["mood_posterior"] = mood_breakdown  # dict with "all_self", "neutral", "none_self" probabilities
         info["is_confident_neutral"] = self._pref_gen.is_confident_neutral()
-        info["neutral_confident_examples"] = mood_metrics.get("neutral_confident_examples", 0)
+        info["neutral_confident_examples"] = mood_metrics["neutral_confident_examples"]
 
     def get_metrics(self) -> dict[str, float]:
         return self._pref_gen.get_metrics()

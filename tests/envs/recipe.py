@@ -50,6 +50,7 @@ SWEET_CURRY = RecipeSpec(
         "sugar": ("pepper",),
         "turmeric": ("pepper",),
         "cinnamon": ("sugar",),
+        "onion": ("pepper",),
     },
 )
 
@@ -275,6 +276,1548 @@ MEXICAN_FIESTA_COMPLEX = RecipeSpec(
     },
 )
 
+# Additional complex recipes - Middle Eastern & North African
+MIDDLE_EASTERN_FEAST = RecipeSpec(
+    name="MiddleEasternFeast",
+    spices=(
+        "salt", "pepper", "olive_oil", "garlic", "onion", "lemon",
+        "cumin", "coriander", "paprika", "turmeric", "cinnamon", "allspice",
+        "sumac", "thyme", "zaatar", "mint", "parsley", "tomato", "yogurt", "tahini"
+    ),
+    predecessors={
+        "salt": (),
+        "pepper": ("salt",),
+        "olive_oil": ("salt",),
+        "onion": ("olive_oil",),
+        "garlic": ("onion",),
+        "lemon": ("onion",),
+        "cumin": ("garlic",),
+        "coriander": ("cumin",),
+        "paprika": ("coriander",),
+        "turmeric": ("cumin",),
+        "cinnamon": ("turmeric",),
+        "allspice": ("cinnamon",),
+        "sumac": ("paprika", "lemon"),
+        "thyme": ("sumac",),
+        "zaatar": ("sumac", "thyme"),
+        "mint": ("zaatar", "lemon"),
+        "parsley": ("mint", "garlic"),
+        "tomato": ("coriander", "onion"),
+        "yogurt": ("tomato", "mint"),
+        "tahini": ("yogurt", "lemon"),
+    },
+)
+
+MOROCCAN_TAGINE = RecipeSpec(
+    name="MoroccanTagine",
+    spices=(
+        "salt", "pepper", "olive_oil", "onion", "garlic", "ginger",
+        "turmeric", "cumin", "coriander", "cinnamon", "paprika", "saffron",
+        "lemon", "preserved_lemon", "honey", "almonds", "apricot", "raisins", "cilantro"
+    ),
+    predecessors={
+        "salt": (),
+        "pepper": ("salt",),
+        "olive_oil": ("salt",),
+        "onion": ("olive_oil",),
+        "garlic": ("onion",),
+        "ginger": ("onion",),
+        "turmeric": ("garlic", "ginger"),
+        "cumin": ("turmeric",),
+        "coriander": ("turmeric", "cumin"),
+        "cinnamon": ("turmeric",),
+        "paprika": ("coriander",),
+        "saffron": ("cinnamon", "paprika"),
+        "lemon": ("saffron",),
+        "preserved_lemon": ("saffron", "lemon"),
+        "honey": ("preserved_lemon", "cinnamon"),
+        "almonds": ("honey", "saffron"),
+        "apricot": ("almonds", "honey"),
+        "raisins": ("apricot", "cinnamon"),
+        "cilantro": ("raisins", "pepper", "preserved_lemon"),
+    },
+)
+
+PERSIAN_STEW = RecipeSpec(
+    name="PersianStew",
+    spices=(
+        "salt", "pepper", "ghee", "onion", "garlic", "turmeric",
+        "cumin", "coriander", "cardamom", "cinnamon", "saffron", "lime",
+        "tomato", "fenugreek", "advieh", "barberries", "mint", "basil"
+    ),
+    predecessors={
+        "salt": (),
+        "pepper": ("salt",),
+        "ghee": ("salt",),
+        "onion": ("ghee",),
+        "garlic": ("onion",),
+        "turmeric": ("garlic",),
+        "cumin": ("turmeric",),
+        "coriander": ("turmeric", "cumin"),
+        "cardamom": ("turmeric",),
+        "cinnamon": ("cardamom",),
+        "saffron": ("cinnamon", "turmeric"),
+        "lime": ("saffron", "onion"),
+        "tomato": ("coriander", "onion"),
+        "fenugreek": ("tomato", "cumin"),
+        "advieh": ("fenugreek", "cardamom", "cinnamon"),
+        "barberries": ("advieh", "lime"),
+        "mint": ("barberries", "saffron"),
+        "basil": ("mint", "tomato"),
+    },
+)
+
+# Thai & Southeast Asian
+THAI_CURRY_COMPLEX = RecipeSpec(
+    name="ThaiCurryComplex",
+    spices=(
+        "salt", "pepper", "coconut_oil", "garlic", "ginger", "lemongrass",
+        "turmeric", "cumin", "coriander", "chili", "galangal", "kaffir_lime",
+        "fish_sauce", "palm_sugar", "basil", "cilantro", "lime", "shallot"
+    ),
+    predecessors={
+        "salt": (),
+        "pepper": ("salt",),
+        "coconut_oil": ("salt",),
+        "garlic": ("coconut_oil",),
+        "ginger": ("coconut_oil",),
+        "lemongrass": ("ginger", "garlic"),
+        "turmeric": ("lemongrass",),
+        "cumin": ("turmeric",),
+        "coriander": ("turmeric", "cumin"),
+        "chili": ("coriander", "pepper"),
+        "galangal": ("lemongrass", "ginger"),
+        "kaffir_lime": ("galangal", "lemongrass"),
+        "fish_sauce": ("chili", "coconut_oil"),
+        "palm_sugar": ("fish_sauce", "kaffir_lime"),
+        "basil": ("palm_sugar", "chili"),
+        "cilantro": ("basil", "coriander"),
+        "lime": ("cilantro", "kaffir_lime"),
+        "shallot": ("lime", "garlic"),
+    },
+)
+
+VIETNAMESE_PHO = RecipeSpec(
+    name="VietnamesePho",
+    spices=(
+        "salt", "pepper", "onion", "ginger", "garlic", "star_anise",
+        "cinnamon", "clove", "cardamom", "coriander_seed", "fennel_seed", "black_cardamom",
+        "rock_sugar", "fish_sauce", "lime", "cilantro", "basil", "mint"
+    ),
+    predecessors={
+        "salt": (),
+        "pepper": ("salt",),
+        "onion": ("salt",),
+        "ginger": ("onion",),
+        "garlic": ("onion",),
+        "star_anise": ("ginger",),
+        "cinnamon": ("star_anise",),
+        "clove": ("cinnamon",),
+        "cardamom": ("star_anise",),
+        "coriander_seed": ("cardamom", "clove"),
+        "fennel_seed": ("coriander_seed",),
+        "black_cardamom": ("fennel_seed", "cardamom"),
+        "rock_sugar": ("black_cardamom", "cinnamon"),
+        "fish_sauce": ("rock_sugar", "garlic"),
+        "lime": ("fish_sauce", "star_anise"),
+        "cilantro": ("lime", "coriander_seed"),
+        "basil": ("cilantro", "fish_sauce"),
+        "mint": ("basil", "lime"),
+    },
+)
+
+# European & Fusion
+FRENCH_PROVENCAL = RecipeSpec(
+    name="FrenchProvencal",
+    spices=(
+        "salt", "pepper", "olive_oil", "garlic", "onion", "tomato",
+        "basil", "oregano", "thyme", "rosemary", "marjoram", "lavender",
+        "fennel_seed", "saffron", "orange_zest", "black_olives", "capers", "parsley"
+    ),
+    predecessors={
+        "salt": (),
+        "pepper": ("salt",),
+        "olive_oil": ("salt",),
+        "onion": ("olive_oil",),
+        "garlic": ("onion",),
+        "tomato": ("onion",),
+        "basil": ("garlic",),
+        "oregano": ("basil",),
+        "thyme": ("basil", "garlic"),
+        "rosemary": ("thyme", "oregano"),
+        "marjoram": ("oregano", "basil"),
+        "lavender": ("rosemary", "marjoram"),
+        "fennel_seed": ("lavender", "thyme"),
+        "saffron": ("fennel_seed", "tomato"),
+        "orange_zest": ("saffron", "lavender"),
+        "black_olives": ("orange_zest", "tomato"),
+        "capers": ("black_olives", "orange_zest"),
+        "parsley": ("capers", "pepper", "basil"),
+    },
+)
+
+ITALIAN_RAGU = RecipeSpec(
+    name="ItalianRagu",
+    spices=(
+        "salt", "pepper", "olive_oil", "onion", "garlic", "carrot", "celery",
+        "basil", "oregano", "thyme", "bay_leaf", "nutmeg", "red_wine",
+        "tomato", "parmesan", "mushroom", "rosemary", "sage", "parsley"
+    ),
+    predecessors={
+        "salt": (),
+        "pepper": ("salt",),
+        "olive_oil": ("salt",),
+        "onion": ("olive_oil",),
+        "garlic": ("onion",),
+        "carrot": ("onion",),
+        "celery": ("carrot",),
+        "basil": ("garlic",),
+        "oregano": ("basil",),
+        "thyme": ("basil", "celery"),
+        "bay_leaf": ("thyme", "oregano"),
+        "nutmeg": ("bay_leaf",),
+        "red_wine": ("nutmeg", "onion"),
+        "tomato": ("red_wine", "celery"),
+        "parmesan": ("tomato", "nutmeg"),
+        "mushroom": ("parmesan", "red_wine"),
+        "rosemary": ("mushroom", "thyme"),
+        "sage": ("rosemary", "bay_leaf"),
+        "parsley": ("sage", "pepper", "basil"),
+    },
+)
+
+# African & Caribbean
+ETHIOPIAN_WAT = RecipeSpec(
+    name="EthiopianWat",
+    spices=(
+        "salt", "pepper", "onion", "garlic", "ginger", "berbere",
+        "turmeric", "cumin", "coriander", "cardamom", "fenugreek", "clove",
+        "cinnamon", "allspice", "niter_kibbeh", "tomato", "lime", "cilantro"
+    ),
+    predecessors={
+        "salt": (),
+        "pepper": ("salt",),
+        "onion": ("salt",),
+        "garlic": ("onion",),
+        "ginger": ("onion",),
+        "berbere": ("garlic", "ginger"),
+        "turmeric": ("berbere",),
+        "cumin": ("turmeric",),
+        "coriander": ("turmeric", "cumin"),
+        "cardamom": ("turmeric",),
+        "fenugreek": ("cardamom", "cumin"),
+        "clove": ("cardamom",),
+        "cinnamon": ("clove",),
+        "allspice": ("cinnamon", "clove"),
+        "niter_kibbeh": ("allspice", "berbere"),
+        "tomato": ("niter_kibbeh", "coriander"),
+        "lime": ("tomato", "berbere"),
+        "cilantro": ("lime", "pepper", "fenugreek"),
+    },
+)
+
+JAMAICAN_JERK = RecipeSpec(
+    name="JamaicanJerk",
+    spices=(
+        "salt", "pepper", "allspice", "thyme", "scotch_bonnet", "garlic",
+        "onion", "ginger", "cinnamon", "nutmeg", "clove", "brown_sugar",
+        "soy_sauce", "lime", "orange_juice", "scallion", "cilantro", "rum"
+    ),
+    predecessors={
+        "salt": (),
+        "pepper": ("salt",),
+        "allspice": ("salt",),
+        "thyme": ("allspice",),
+        "scotch_bonnet": ("thyme", "pepper"),
+        "garlic": ("scotch_bonnet",),
+        "onion": ("garlic",),
+        "ginger": ("onion",),
+        "cinnamon": ("allspice",),
+        "nutmeg": ("cinnamon",),
+        "clove": ("nutmeg",),
+        "brown_sugar": ("clove", "allspice"),
+        "soy_sauce": ("brown_sugar", "ginger"),
+        "lime": ("soy_sauce", "scotch_bonnet"),
+        "orange_juice": ("lime", "brown_sugar"),
+        "scallion": ("orange_juice", "onion"),
+        "cilantro": ("scallion", "thyme"),
+        "rum": ("cilantro", "orange_juice", "brown_sugar"),
+    },
+)
+
+# More Indian variations
+SOUTH_INDIAN_CURRY = RecipeSpec(
+    name="SouthIndianCurry",
+    spices=(
+        "salt", "pepper", "coconut_oil", "mustard_seed", "curry_leaves", "onion",
+        "garlic", "ginger", "turmeric", "cumin", "coriander", "chili",
+        "fenugreek", "asafoetida", "tamarind", "coconut", "jaggery", "cilantro"
+    ),
+    predecessors={
+        "salt": (),
+        "pepper": ("salt",),
+        "coconut_oil": ("salt",),
+        "mustard_seed": ("coconut_oil",),
+        "curry_leaves": ("mustard_seed",),
+        "onion": ("curry_leaves",),
+        "garlic": ("onion",),
+        "ginger": ("onion",),
+        "turmeric": ("garlic", "ginger"),
+        "cumin": ("turmeric",),
+        "coriander": ("turmeric", "cumin"),
+        "chili": ("coriander", "pepper"),
+        "fenugreek": ("chili", "cumin"),
+        "asafoetida": ("fenugreek", "mustard_seed"),
+        "tamarind": ("asafoetida", "coriander"),
+        "coconut": ("tamarind", "coconut_oil"),
+        "jaggery": ("coconut", "tamarind"),
+        "cilantro": ("jaggery", "pepper", "curry_leaves"),
+    },
+)
+
+BENGALI_FISH_CURRY = RecipeSpec(
+    name="BengaliFishCurry",
+    spices=(
+        "salt", "pepper", "mustard_oil", "onion", "garlic", "ginger",
+        "turmeric", "cumin", "coriander", "chili", "fenugreek", "nigella",
+        "fennel_seed", "panch_phoron", "tomato", "yogurt", "lime", "cilantro", "green_chili"
+    ),
+    predecessors={
+        "salt": (),
+        "pepper": ("salt",),
+        "mustard_oil": ("salt",),
+        "onion": ("mustard_oil",),
+        "garlic": ("onion",),
+        "ginger": ("onion",),
+        "turmeric": ("garlic", "ginger"),
+        "cumin": ("turmeric",),
+        "coriander": ("turmeric", "cumin"),
+        "chili": ("coriander", "pepper"),
+        "fenugreek": ("chili", "cumin"),
+        "nigella": ("fenugreek", "mustard_oil"),
+        "fennel_seed": ("nigella",),
+        "panch_phoron": ("nigella", "fenugreek", "cumin", "coriander", "fennel_seed"),
+        "tomato": ("panch_phoron", "onion"),
+        "yogurt": ("tomato", "turmeric"),
+        "lime": ("yogurt", "chili"),
+        "cilantro": ("lime", "panch_phoron"),
+        "green_chili": ("cilantro", "chili"),
+    },
+)
+
+# More Asian variations
+KOREAN_BBQ = RecipeSpec(
+    name="KoreanBBQ",
+    spices=(
+        "salt", "pepper", "soy_sauce", "sesame_oil", "garlic", "ginger",
+        "gochujang", "gochugaru", "rice_vinegar", "brown_sugar", "scallion",
+        "sesame_seeds", "pear", "onion", "black_pepper", "mirin", "cilantro"
+    ),
+    predecessors={
+        "salt": (),
+        "pepper": ("salt",),
+        "soy_sauce": ("salt",),
+        "sesame_oil": ("soy_sauce",),
+        "garlic": ("sesame_oil",),
+        "ginger": ("sesame_oil",),
+        "gochujang": ("garlic", "ginger"),
+        "gochugaru": ("gochujang",),
+        "rice_vinegar": ("gochujang", "soy_sauce"),
+        "brown_sugar": ("rice_vinegar", "gochujang"),
+        "scallion": ("brown_sugar", "garlic"),
+        "sesame_seeds": ("scallion", "sesame_oil"),
+        "pear": ("sesame_seeds", "brown_sugar"),
+        "onion": ("pear", "scallion"),
+        "black_pepper": ("onion", "pepper"),
+        "mirin": ("black_pepper", "rice_vinegar"),
+        "cilantro": ("mirin", "scallion", "gochujang"),
+    },
+)
+
+JAPANESE_TERIYAKI = RecipeSpec(
+    name="JapaneseTeriyaki",
+    spices=(
+        "salt", "pepper", "soy_sauce", "mirin", "sake", "brown_sugar",
+        "ginger", "garlic", "sesame_oil", "scallion", "rice_vinegar",
+        "honey", "cornstarch", "orange_zest", "black_pepper", "sesame_seeds", "cilantro"
+    ),
+    predecessors={
+        "salt": (),
+        "pepper": ("salt",),
+        "soy_sauce": ("salt",),
+        "mirin": ("soy_sauce",),
+        "sake": ("mirin",),
+        "brown_sugar": ("sake", "mirin"),
+        "ginger": ("brown_sugar",),
+        "garlic": ("ginger",),
+        "sesame_oil": ("garlic", "soy_sauce"),
+        "scallion": ("sesame_oil", "ginger"),
+        "rice_vinegar": ("scallion", "mirin"),
+        "honey": ("rice_vinegar", "brown_sugar"),
+        "cornstarch": ("honey", "sake"),
+        "orange_zest": ("cornstarch", "honey"),
+        "black_pepper": ("orange_zest", "pepper"),
+        "sesame_seeds": ("black_pepper", "sesame_oil"),
+        "cilantro": ("sesame_seeds", "scallion", "orange_zest"),
+    },
+)
+
+# More Mediterranean variations
+GREEK_MOUSSAKA = RecipeSpec(
+    name="GreekMoussaka",
+    spices=(
+        "salt", "pepper", "olive_oil", "onion", "garlic", "cinnamon",
+        "allspice", "nutmeg", "oregano", "thyme", "bay_leaf", "tomato",
+        "red_wine", "parsley", "mint", "feta", "eggplant", "parmesan"
+    ),
+    predecessors={
+        "salt": (),
+        "pepper": ("salt",),
+        "olive_oil": ("salt",),
+        "onion": ("olive_oil",),
+        "garlic": ("onion",),
+        "cinnamon": ("garlic",),
+        "allspice": ("cinnamon",),
+        "nutmeg": ("allspice",),
+        "oregano": ("garlic",),
+        "thyme": ("oregano",),
+        "bay_leaf": ("thyme", "allspice"),
+        "tomato": ("bay_leaf", "onion"),
+        "red_wine": ("tomato", "cinnamon"),
+        "parsley": ("red_wine", "thyme"),
+        "mint": ("parsley", "oregano"),
+        "feta": ("mint", "tomato"),
+        "eggplant": ("feta", "olive_oil"),
+        "parmesan": ("eggplant", "nutmeg"),
+    },
+)
+
+SPANISH_PAELLA = RecipeSpec(
+    name="SpanishPaella",
+    spices=(
+        "salt", "pepper", "olive_oil", "onion", "garlic", "tomato",
+        "saffron", "paprika", "rosemary", "thyme", "bay_leaf", "lemon",
+        "white_wine", "parsley", "pimenton", "cumin", "coriander", "oregano"
+    ),
+    predecessors={
+        "salt": (),
+        "pepper": ("salt",),
+        "olive_oil": ("salt",),
+        "onion": ("olive_oil",),
+        "garlic": ("onion",),
+        "tomato": ("onion",),
+        "saffron": ("tomato",),
+        "paprika": ("saffron",),
+        "rosemary": ("paprika",),
+        "thyme": ("rosemary",),
+        "bay_leaf": ("thyme", "saffron"),
+        "lemon": ("bay_leaf", "onion"),
+        "white_wine": ("lemon", "saffron"),
+        "parsley": ("white_wine", "thyme"),
+        "pimenton": ("parsley", "paprika"),
+        "cumin": ("pimenton",),
+        "coriander": ("cumin", "thyme"),
+        "oregano": ("coriander", "rosemary"),
+    },
+)
+
+# More Middle Eastern
+LEBANESE_KAFTA = RecipeSpec(
+    name="LebaneseKafta",
+    spices=(
+        "salt", "pepper", "onion", "garlic", "parsley", "mint",
+        "cumin", "coriander", "allspice", "cinnamon", "sumac", "paprika",
+        "thyme", "olive_oil", "lemon", "pine_nuts", "tomato", "yogurt", "zaatar"
+    ),
+    predecessors={
+        "salt": (),
+        "pepper": ("salt",),
+        "onion": ("salt",),
+        "garlic": ("onion",),
+        "parsley": ("garlic",),
+        "mint": ("parsley",),
+        "cumin": ("mint",),
+        "coriander": ("cumin",),
+        "allspice": ("coriander",),
+        "cinnamon": ("allspice",),
+        "sumac": ("cinnamon", "mint"),
+        "paprika": ("sumac",),
+        "thyme": ("paprika",),
+        "olive_oil": ("paprika",),
+        "lemon": ("olive_oil", "sumac"),
+        "pine_nuts": ("lemon", "allspice"),
+        "tomato": ("pine_nuts", "onion"),
+        "yogurt": ("tomato", "mint"),
+        "zaatar": ("yogurt", "sumac", "thyme"),
+    },
+)
+
+TURKISH_KEBAB = RecipeSpec(
+    name="TurkishKebab",
+    spices=(
+        "salt", "pepper", "onion", "garlic", "cumin", "coriander",
+        "paprika", "sumac", "oregano", "thyme", "red_pepper_flakes", "allspice",
+        "yogurt", "lemon", "olive_oil", "tomato", "parsley", "mint"
+    ),
+    predecessors={
+        "salt": (),
+        "pepper": ("salt",),
+        "onion": ("salt",),
+        "garlic": ("onion",),
+        "cumin": ("garlic",),
+        "coriander": ("cumin",),
+        "paprika": ("coriander",),
+        "sumac": ("paprika",),
+        "oregano": ("sumac",),
+        "thyme": ("oregano",),
+        "red_pepper_flakes": ("thyme", "pepper"),
+        "allspice": ("red_pepper_flakes",),
+        "yogurt": ("allspice", "onion"),
+        "lemon": ("yogurt", "sumac"),
+        "olive_oil": ("lemon",),
+        "tomato": ("olive_oil", "coriander"),
+        "parsley": ("tomato", "thyme"),
+        "mint": ("parsley", "yogurt"),
+    },
+)
+
+# More Mexican/Latin American
+PERUVIAN_CEVICHE = RecipeSpec(
+    name="PeruvianCeviche",
+    spices=(
+        "salt", "pepper", "lime", "lemon", "onion", "garlic",
+        "aji_amarillo", "cilantro", "cumin", "coriander", "ginger",
+        "sweet_potato", "corn", "red_onion", "jalapeno", "orange", "mint"
+    ),
+    predecessors={
+        "salt": (),
+        "pepper": ("salt",),
+        "lime": ("salt",),
+        "lemon": ("lime",),
+        "onion": ("lemon",),
+        "garlic": ("onion",),
+        "aji_amarillo": ("garlic", "pepper"),
+        "cilantro": ("aji_amarillo",),
+        "cumin": ("cilantro",),
+        "coriander": ("cumin",),
+        "ginger": ("coriander",),
+        "sweet_potato": ("ginger", "onion"),
+        "corn": ("sweet_potato",),
+        "red_onion": ("corn", "onion"),
+        "jalapeno": ("red_onion", "aji_amarillo"),
+        "orange": ("jalapeno", "lemon"),
+        "mint": ("orange", "cilantro", "lime"),
+    },
+)
+
+BRAZILIAN_MOQUECA = RecipeSpec(
+    name="BrazilianMoqueca",
+    spices=(
+        "salt", "pepper", "coconut_oil", "onion", "garlic", "tomato",
+        "paprika", "cumin", "coriander", "turmeric", "coconut_milk",
+        "palm_oil", "cilantro", "lime", "bell_pepper", "scallion", "ginger"
+    ),
+    predecessors={
+        "salt": (),
+        "pepper": ("salt",),
+        "coconut_oil": ("salt",),
+        "onion": ("coconut_oil",),
+        "garlic": ("onion",),
+        "tomato": ("onion",),
+        "paprika": ("tomato",),
+        "cumin": ("paprika",),
+        "coriander": ("cumin",),
+        "turmeric": ("coriander",),
+        "coconut_milk": ("turmeric", "coconut_oil"),
+        "palm_oil": ("coconut_milk",),
+        "cilantro": ("palm_oil", "coriander"),
+        "lime": ("cilantro", "coconut_milk"),
+        "bell_pepper": ("lime", "tomato"),
+        "scallion": ("bell_pepper", "onion"),
+        "ginger": ("scallion", "garlic"),
+    },
+)
+
+# More fusion and complex recipes
+FUSION_TACO_BOWL = RecipeSpec(
+    name="FusionTacoBowl",
+    spices=(
+        "salt", "pepper", "lime", "garlic", "onion", "cilantro",
+        "cumin", "coriander", "chili", "paprika", "oregano", "chipotle",
+        "avocado", "tomato", "black_beans", "corn", "scallion", "jalapeno"
+    ),
+    predecessors={
+        "salt": (),
+        "pepper": ("salt",),
+        "lime": ("salt",),
+        "garlic": ("lime",),
+        "onion": ("garlic",),
+        "cilantro": ("onion",),
+        "cumin": ("cilantro",),
+        "coriander": ("cumin",),
+        "chili": ("coriander", "pepper"),
+        "paprika": ("chili",),
+        "oregano": ("paprika", "cilantro"),
+        "chipotle": ("oregano", "chili"),
+        "avocado": ("chipotle", "lime"),
+        "tomato": ("avocado", "onion"),
+        "black_beans": ("tomato", "cumin"),
+        "corn": ("black_beans",),
+        "scallion": ("corn", "onion"),
+        "jalapeno": ("scallion", "chipotle"),
+    },
+)
+
+KOREAN_MEXICAN_FUSION = RecipeSpec(
+    name="KoreanMexicanFusion",
+    spices=(
+        "salt", "pepper", "gochujang", "soy_sauce", "sesame_oil", "lime",
+        "onion", "garlic", "ginger", "scallion", "cilantro", "cumin", "coriander",
+        "gochugaru", "brown_sugar", "rice_vinegar", "avocado", "tomato", "jalapeno"
+    ),
+    predecessors={
+        "salt": (),
+        "pepper": ("salt",),
+        "gochujang": ("salt",),
+        "soy_sauce": ("gochujang",),
+        "sesame_oil": ("soy_sauce",),
+        "lime": ("sesame_oil",),
+        "garlic": ("lime",),
+        "ginger": ("garlic",),
+        "scallion": ("ginger",),
+        "cilantro": ("scallion",),
+        "cumin": ("cilantro",),
+        "coriander": ("cumin",),
+        "gochugaru": ("coriander", "gochujang"),
+        "brown_sugar": ("gochugaru", "soy_sauce"),
+        "rice_vinegar": ("brown_sugar", "lime"),
+        "onion": ("rice_vinegar",),
+        "avocado": ("rice_vinegar", "sesame_oil"),
+        "tomato": ("avocado", "onion"),
+        "jalapeno": ("tomato", "gochugaru"),
+    },
+)
+
+# More complex Indian variations
+KASHMIRI_WAZWAN = RecipeSpec(
+    name="KashmiriWazwan",
+    spices=(
+        "salt", "pepper", "ghee", "onion", "garlic", "ginger",
+        "turmeric", "cumin", "coriander", "fennel_seed", "cardamom", "cinnamon",
+        "clove", "star_anise", "saffron", "yogurt", "milk", "almonds"
+    ),
+    predecessors={
+        "salt": (),
+        "pepper": ("salt",),
+        "ghee": ("salt",),
+        "onion": ("ghee",),
+        "garlic": ("onion",),
+        "ginger": ("onion",),
+        "turmeric": ("garlic", "ginger"),
+        "cumin": ("turmeric",),
+        "coriander": ("turmeric", "cumin"),
+        "fennel_seed": ("coriander",),
+        "cardamom": ("fennel_seed",),
+        "cinnamon": ("cardamom",),
+        "clove": ("cinnamon",),
+        "star_anise": ("clove",),
+        "saffron": ("star_anise", "cardamom"),
+        "yogurt": ("saffron", "coriander"),
+        "milk": ("yogurt", "saffron"),
+        "almonds": ("milk", "ghee"),
+    },
+)
+
+HYDERABADI_BIRYANI = RecipeSpec(
+    name="HyderabadiBiryani",
+    spices=(
+        "salt", "pepper", "ghee", "onion", "garlic", "ginger",
+        "turmeric", "cumin", "coriander", "chili", "garam_masala", "cardamom",
+        "cinnamon", "clove", "bay_leaf", "saffron", "mint", "cilantro", "yogurt"
+    ),
+    predecessors={
+        "salt": (),
+        "pepper": ("salt",),
+        "ghee": ("salt",),
+        "onion": ("ghee",),
+        "garlic": ("onion",),
+        "ginger": ("onion",),
+        "turmeric": ("garlic", "ginger"),
+        "cumin": ("turmeric",),
+        "coriander": ("turmeric", "cumin"),
+        "chili": ("coriander", "pepper"),
+        "garam_masala": ("chili", "cumin"),
+        "cardamom": ("garam_masala",),
+        "cinnamon": ("cardamom",),
+        "clove": ("cinnamon",),
+        "bay_leaf": ("clove", "garam_masala"),
+        "saffron": ("bay_leaf", "cardamom"),
+        "mint": ("saffron", "onion"),
+        "cilantro": ("mint", "coriander"),
+        "yogurt": ("cilantro", "turmeric"),
+    },
+)
+
+# More Southeast Asian
+INDONESIAN_RENDANG = RecipeSpec(
+    name="IndonesianRendang",
+    spices=(
+        "salt", "pepper", "coconut_oil", "onion", "garlic", "ginger",
+        "turmeric", "cumin", "coriander", "galangal", "lemongrass", "chili",
+        "coconut_milk", "tamarind", "palm_sugar", "kaffir_lime", "basil", "cilantro"
+    ),
+    predecessors={
+        "salt": (),
+        "pepper": ("salt",),
+        "coconut_oil": ("salt",),
+        "onion": ("coconut_oil",),
+        "garlic": ("onion",),
+        "ginger": ("onion",),
+        "turmeric": ("garlic", "ginger"),
+        "cumin": ("turmeric",),
+        "coriander": ("turmeric", "cumin"),
+        "lemongrass": ("ginger",),
+        "galangal": ("lemongrass", "ginger"),
+        "chili": ("coriander", "pepper"),
+        "coconut_milk": ("chili", "coconut_oil"),
+        "tamarind": ("coconut_milk", "coriander"),
+        "palm_sugar": ("tamarind", "coconut_milk"),
+        "kaffir_lime": ("palm_sugar", "lemongrass"),
+        "basil": ("kaffir_lime", "chili"),
+        "cilantro": ("basil", "galangal"),
+    },
+)
+
+MALAYSIAN_LAKSA = RecipeSpec(
+    name="MalaysianLaksa",
+    spices=(
+        "salt", "pepper", "coconut_oil", "onion", "garlic", "ginger",
+        "turmeric", "cumin", "coriander", "lemongrass", "galangal", "chili",
+        "shrimp_paste", "coconut_milk", "tamarind", "palm_sugar", "mint", "cilantro"
+    ),
+    predecessors={
+        "salt": (),
+        "pepper": ("salt",),
+        "coconut_oil": ("salt",),
+        "onion": ("coconut_oil",),
+        "garlic": ("onion",),
+        "ginger": ("onion",),
+        "turmeric": ("garlic", "ginger"),
+        "cumin": ("turmeric",),
+        "coriander": ("turmeric", "cumin"),
+        "lemongrass": ("coriander",),
+        "galangal": ("lemongrass", "ginger"),
+        "chili": ("coriander", "pepper"),
+        "shrimp_paste": ("chili", "garlic"),
+        "coconut_milk": ("shrimp_paste", "coconut_oil"),
+        "tamarind": ("coconut_milk", "shrimp_paste"),
+        "palm_sugar": ("tamarind", "coconut_milk"),
+        "mint": ("palm_sugar", "lemongrass"),
+        "cilantro": ("mint", "galangal"),
+    },
+)
+
+# More European
+HUNGARIAN_GULASH = RecipeSpec(
+    name="HungarianGulash",
+    spices=(
+        "salt", "pepper", "onion", "garlic", "paprika", "caraway_seed",
+        "cumin", "marjoram", "thyme", "bay_leaf", "tomato", "red_wine",
+        "bell_pepper", "potato", "carrot", "celery", "parsley", "sour_cream"
+    ),
+    predecessors={
+        "salt": (),
+        "pepper": ("salt",),
+        "onion": ("salt",),
+        "garlic": ("onion",),
+        "paprika": ("garlic",),
+        "caraway_seed": ("paprika",),
+        "cumin": ("caraway_seed",),
+        "marjoram": ("cumin",),
+        "thyme": ("marjoram",),
+        "bay_leaf": ("thyme", "paprika"),
+        "tomato": ("bay_leaf", "onion"),
+        "red_wine": ("tomato", "paprika"),
+        "bell_pepper": ("red_wine", "onion"),
+        "potato": ("bell_pepper",),
+        "carrot": ("potato",),
+        "celery": ("carrot",),
+        "parsley": ("celery", "thyme"),
+        "sour_cream": ("parsley", "red_wine"),
+    },
+)
+
+RUSSIAN_BORSCHT = RecipeSpec(
+    name="RussianBorscht",
+    spices=(
+        "salt", "pepper", "onion", "garlic", "carrot", "celery",
+        "beet", "cabbage", "potato", "dill", "bay_leaf", "allspice",
+        "tomato", "vinegar", "sour_cream", "parsley", "thyme", "paprika"
+    ),
+    predecessors={
+        "salt": (),
+        "pepper": ("salt",),
+        "onion": ("salt",),
+        "garlic": ("onion",),
+        "carrot": ("onion",),
+        "celery": ("carrot",),
+        "beet": ("celery",),
+        "cabbage": ("beet",),
+        "potato": ("cabbage",),
+        "dill": ("potato",),
+        "bay_leaf": ("dill",),
+        "allspice": ("bay_leaf",),
+        "tomato": ("allspice", "onion"),
+        "vinegar": ("tomato", "beet"),
+        "sour_cream": ("vinegar", "dill"),
+        "thyme": ("sour_cream", "bay_leaf"),
+        "parsley": ("thyme", "sour_cream"),
+        "paprika": ("thyme", "allspice"),
+    },
+)
+
+# More African
+WEST_AFRICAN_PEANUT_STEW = RecipeSpec(
+    name="WestAfricanPeanutStew",
+    spices=(
+        "salt", "pepper", "onion", "garlic", "ginger", "tomato",
+        "cumin", "coriander", "turmeric", "cayenne", "peanut_butter",
+        "sweet_potato", "bell_pepper", "scallion", "cilantro", "lime", "coconut_milk"
+    ),
+    predecessors={
+        "salt": (),
+        "pepper": ("salt",),
+        "onion": ("salt",),
+        "garlic": ("onion",),
+        "ginger": ("onion",),
+        "tomato": ("onion",),
+        "cumin": ("tomato",),
+        "coriander": ("cumin",),
+        "turmeric": ("coriander",),
+        "cayenne": ("turmeric", "pepper"),
+        "peanut_butter": ("cayenne", "tomato"),
+        "sweet_potato": ("peanut_butter",),
+        "bell_pepper": ("sweet_potato", "onion"),
+        "scallion": ("bell_pepper",),
+        "cilantro": ("scallion", "coriander"),
+        "lime": ("cilantro", "ginger"),
+        "coconut_milk": ("lime", "peanut_butter"),
+    },
+)
+
+SOUTH_AFRICAN_BOBBOTIE = RecipeSpec(
+    name="SouthAfricanBobotie",
+    spices=(
+        "salt", "pepper", "onion", "garlic", "ginger", "turmeric",
+        "cumin", "coriander", "curry_powder", "cinnamon", "allspice", "bay_leaf",
+        "apricot", "almonds", "raisins", "vinegar", "milk", "egg"
+    ),
+    predecessors={
+        "salt": (),
+        "pepper": ("salt",),
+        "onion": ("salt",),
+        "garlic": ("onion",),
+        "ginger": ("onion",),
+        "turmeric": ("garlic", "ginger"),
+        "cumin": ("turmeric",),
+        "coriander": ("turmeric", "cumin"),
+        "curry_powder": ("coriander", "turmeric"),
+        "cinnamon": ("curry_powder",),
+        "allspice": ("cinnamon",),
+        "bay_leaf": ("allspice", "curry_powder"),
+        "apricot": ("bay_leaf", "cinnamon"),
+        "almonds": ("apricot",),
+        "raisins": ("almonds", "apricot"),
+        "vinegar": ("raisins", "curry_powder"),
+        "milk": ("vinegar", "bay_leaf"),
+        "egg": ("milk", "almonds"),
+    },
+)
+
+# More fusion recipes
+INDIAN_CHINESE_FUSION = RecipeSpec(
+    name="IndianChineseFusion",
+    spices=(
+        "salt", "pepper", "soy_sauce", "ginger", "garlic", "onion",
+        "turmeric", "cumin", "coriander", "chili", "vinegar", "sugar",
+        "scallion", "cilantro", "bell_pepper", "tomato", "sesame_oil", "green_chili"
+    ),
+    predecessors={
+        "salt": (),
+        "pepper": ("salt",),
+        "soy_sauce": ("salt",),
+        "ginger": ("soy_sauce",),
+        "garlic": ("ginger",),
+        "onion": ("garlic",),
+        "turmeric": ("onion",),
+        "cumin": ("turmeric",),
+        "coriander": ("turmeric", "cumin"),
+        "chili": ("coriander", "pepper"),
+        "vinegar": ("chili", "soy_sauce"),
+        "sugar": ("vinegar", "chili"),
+        "scallion": ("sugar", "onion"),
+        "cilantro": ("scallion", "coriander"),
+        "bell_pepper": ("cilantro", "onion"),
+        "tomato": ("bell_pepper", "coriander"),
+        "sesame_oil": ("tomato", "soy_sauce"),
+        "green_chili": ("sesame_oil", "chili"),
+    },
+)
+
+MEDITERRANEAN_ASIAN_FUSION = RecipeSpec(
+    name="MediterraneanAsianFusion",
+    spices=(
+        "salt", "pepper", "olive_oil", "soy_sauce", "onion", "garlic", "ginger",
+        "basil", "oregano", "cumin", "coriander", "sesame_oil", "rice_vinegar",
+        "lemon", "honey", "scallion", "cilantro", "tomato", "bell_pepper"
+    ),
+    predecessors={
+        "salt": (),
+        "pepper": ("salt",),
+        "olive_oil": ("salt",),
+        "soy_sauce": ("salt",),
+        "garlic": ("olive_oil",),
+        "ginger": ("soy_sauce",),
+        "basil": ("garlic",),
+        "oregano": ("basil",),
+        "cumin": ("oregano",),
+        "coriander": ("cumin",),
+        "sesame_oil": ("coriander", "soy_sauce"),
+        "rice_vinegar": ("sesame_oil", "olive_oil"),
+        "lemon": ("rice_vinegar", "basil"),
+        "honey": ("lemon", "rice_vinegar"),
+        "scallion": ("honey", "ginger"),
+        "cilantro": ("scallion", "coriander"),
+        "onion": ("cilantro",),
+        "tomato": ("cilantro", "onion"),
+        "bell_pepper": ("tomato", "oregano"),
+    },
+)
+
+# More complex variations
+NORTH_INDIAN_BUTTER_CHICKEN = RecipeSpec(
+    name="NorthIndianButterChicken",
+    spices=(
+        "salt", "pepper", "butter", "onion", "garlic", "ginger",
+        "turmeric", "cumin", "coriander", "chili", "garam_masala", "cardamom",
+        "cinnamon", "clove", "fenugreek", "tomato", "cream", "honey", "cilantro"
+    ),
+    predecessors={
+        "salt": (),
+        "pepper": ("salt",),
+        "butter": ("salt",),
+        "onion": ("butter",),
+        "garlic": ("onion",),
+        "ginger": ("onion",),
+        "turmeric": ("garlic", "ginger"),
+        "cumin": ("turmeric",),
+        "coriander": ("turmeric", "cumin"),
+        "chili": ("coriander", "pepper"),
+        "garam_masala": ("chili", "cumin"),
+        "cardamom": ("garam_masala",),
+        "cinnamon": ("cardamom",),
+        "clove": ("cinnamon",),
+        "fenugreek": ("clove", "garam_masala"),
+        "tomato": ("fenugreek", "onion"),
+        "cream": ("tomato", "butter"),
+        "honey": ("cream", "garam_masala"),
+        "cilantro": ("honey", "pepper", "coriander"),
+    },
+)
+
+BENGALI_MUSTARD_FISH = RecipeSpec(
+    name="BengaliMustardFish",
+    spices=(
+        "salt", "pepper", "mustard_oil", "mustard_seed", "onion", "garlic",
+        "turmeric", "cumin", "coriander", "chili", "fenugreek", "nigella",
+        "curry_leaves", "tomato", "yogurt", "lime", "green_chili", "cilantro"
+    ),
+    predecessors={
+        "salt": (),
+        "pepper": ("salt",),
+        "mustard_oil": ("salt",),
+        "mustard_seed": ("mustard_oil",),
+        "onion": ("mustard_seed",),
+        "garlic": ("onion",),
+        "turmeric": ("garlic",),
+        "cumin": ("turmeric",),
+        "coriander": ("turmeric", "cumin"),
+        "chili": ("coriander", "pepper"),
+        "fenugreek": ("chili", "mustard_seed"),
+        "nigella": ("fenugreek", "mustard_oil"),
+        "curry_leaves": ("nigella",),
+        "tomato": ("curry_leaves", "onion"),
+        "yogurt": ("tomato", "turmeric"),
+        "lime": ("yogurt", "chili"),
+        "green_chili": ("lime", "chili"),
+        "cilantro": ("green_chili", "curry_leaves"),
+    },
+)
+
+# More Thai variations
+THAI_BASIL_STIRFRY = RecipeSpec(
+    name="ThaiBasilStirfry",
+    spices=(
+        "salt", "pepper", "soy_sauce", "fish_sauce", "garlic", "ginger",
+        "chili", "basil", "cilantro", "lime", "palm_sugar", "oyster_sauce",
+        "scallion", "bell_pepper", "onion", "mint", "lemongrass", "galangal"
+    ),
+    predecessors={
+        "salt": (),
+        "pepper": ("salt",),
+        "soy_sauce": ("salt",),
+        "fish_sauce": ("soy_sauce",),
+        "garlic": ("fish_sauce",),
+        "ginger": ("garlic",),
+        "chili": ("ginger", "pepper"),
+        "basil": ("chili",),
+        "cilantro": ("basil",),
+        "lime": ("cilantro", "fish_sauce"),
+        "palm_sugar": ("lime", "soy_sauce"),
+        "oyster_sauce": ("palm_sugar", "fish_sauce"),
+        "scallion": ("oyster_sauce", "garlic"),
+        "onion": ("scallion",),
+        "bell_pepper": ("onion", "scallion"),
+        "mint": ("bell_pepper", "basil"),
+        "lemongrass": ("mint", "ginger"),
+        "galangal": ("lemongrass", "ginger"),
+    },
+)
+
+# More Korean variations
+KOREAN_KIMCHI_STEW = RecipeSpec(
+    name="KoreanKimchiStew",
+    spices=(
+        "salt", "pepper", "gochujang", "gochugaru", "soy_sauce", "sesame_oil",
+        "garlic", "ginger", "scallion", "onion", "kimchi", "tofu",
+        "rice_vinegar", "sugar", "anchovy", "kelp", "mushroom", "cilantro"
+    ),
+    predecessors={
+        "salt": (),
+        "pepper": ("salt",),
+        "gochujang": ("salt",),
+        "gochugaru": ("gochujang",),
+        "soy_sauce": ("gochugaru",),
+        "sesame_oil": ("soy_sauce",),
+        "garlic": ("sesame_oil",),
+        "ginger": ("garlic",),
+        "scallion": ("ginger",),
+        "onion": ("scallion",),
+        "kimchi": ("onion", "gochujang"),
+        "tofu": ("kimchi",),
+        "rice_vinegar": ("tofu", "soy_sauce"),
+        "sugar": ("rice_vinegar", "gochujang"),
+        "anchovy": ("sugar", "sesame_oil"),
+        "kelp": ("anchovy",),
+        "mushroom": ("kelp", "onion"),
+        "cilantro": ("mushroom", "scallion", "gochugaru"),
+    },
+)
+
+# More Japanese variations
+JAPANESE_MISO_RAMEN = RecipeSpec(
+    name="JapaneseMisoRamen",
+    spices=(
+        "salt", "pepper", "miso", "soy_sauce", "sesame_oil", "garlic",
+        "ginger", "scallion", "chili_oil", "rice_vinegar", "mirin", "sake",
+        "kombu", "bonito", "nori", "butter", "corn", "cilantro"
+    ),
+    predecessors={
+        "salt": (),
+        "pepper": ("salt",),
+        "miso": ("salt",),
+        "soy_sauce": ("miso",),
+        "sesame_oil": ("soy_sauce",),
+        "garlic": ("sesame_oil",),
+        "ginger": ("garlic",),
+        "scallion": ("ginger",),
+        "chili_oil": ("scallion", "pepper"),
+        "rice_vinegar": ("chili_oil", "soy_sauce"),
+        "mirin": ("rice_vinegar",),
+        "sake": ("mirin",),
+        "kombu": ("sake",),
+        "bonito": ("kombu",),
+        "nori": ("bonito", "kombu"),
+        "butter": ("nori", "miso"),
+        "corn": ("butter",),
+        "cilantro": ("corn", "scallion", "chili_oil"),
+    },
+)
+
+# More Middle Eastern
+ISRAELI_SHAKSHUKA = RecipeSpec(
+    name="IsraeliShakshuka",
+    spices=(
+        "salt", "pepper", "olive_oil", "onion", "garlic", "tomato",
+        "cumin", "coriander", "paprika", "cayenne", "bell_pepper",
+        "harissa", "feta", "parsley", "cilantro", "mint", "thyme", "sumac", "zaatar"
+    ),
+    predecessors={
+        "salt": (),
+        "pepper": ("salt",),
+        "olive_oil": ("salt",),
+        "onion": ("olive_oil",),
+        "garlic": ("onion",),
+        "tomato": ("onion",),
+        "cumin": ("tomato",),
+        "coriander": ("cumin",),
+        "paprika": ("coriander",),
+        "cayenne": ("paprika", "pepper"),
+        "bell_pepper": ("cayenne", "onion"),
+        "harissa": ("bell_pepper", "cayenne"),
+        "feta": ("harissa", "tomato"),
+        "parsley": ("feta", "cumin"),
+        "cilantro": ("parsley", "coriander"),
+        "mint": ("cilantro", "harissa"),
+        "thyme": ("mint",),
+        "sumac": ("thyme",),
+        "zaatar": ("mint", "thyme", "sumac"),
+    },
+)
+
+TURKISH_DONER = RecipeSpec(
+    name="TurkishDoner",
+    spices=(
+        "salt", "pepper", "onion", "garlic", "cumin", "coriander",
+        "paprika", "sumac", "oregano", "thyme", "allspice", "cinnamon",
+        "yogurt", "lemon", "olive_oil", "tomato", "cucumber", "parsley"
+    ),
+    predecessors={
+        "salt": (),
+        "pepper": ("salt",),
+        "onion": ("salt",),
+        "garlic": ("onion",),
+        "cumin": ("garlic",),
+        "coriander": ("cumin",),
+        "paprika": ("coriander",),
+        "sumac": ("paprika",),
+        "oregano": ("sumac",),
+        "thyme": ("oregano",),
+        "allspice": ("thyme",),
+        "cinnamon": ("allspice",),
+        "yogurt": ("cinnamon", "onion"),
+        "lemon": ("yogurt", "sumac"),
+        "olive_oil": ("lemon",),
+        "tomato": ("olive_oil", "coriander"),
+        "cucumber": ("tomato", "yogurt"),
+        "parsley": ("cucumber", "thyme", "lemon"),
+    },
+)
+
+# More Latin American
+ARGENTINIAN_CHIMICHURRI = RecipeSpec(
+    name="ArgentinianChimichurri",
+    spices=(
+        "salt", "pepper", "olive_oil", "garlic", "parsley", "oregano",
+        "red_wine_vinegar", "red_pepper_flakes", "cumin", "paprika",
+        "lemon", "onion", "cilantro", "thyme", "bay_leaf", "chili"
+    ),
+    predecessors={
+        "salt": (),
+        "pepper": ("salt",),
+        "olive_oil": ("salt",),
+        "garlic": ("olive_oil",),
+        "parsley": ("garlic",),
+        "oregano": ("parsley",),
+        "red_wine_vinegar": ("oregano",),
+        "red_pepper_flakes": ("red_wine_vinegar", "pepper"),
+        "cumin": ("red_pepper_flakes",),
+        "paprika": ("cumin",),
+        "lemon": ("paprika", "red_wine_vinegar"),
+        "onion": ("lemon",),
+        "cilantro": ("onion", "parsley"),
+        "thyme": ("cilantro", "oregano"),
+        "bay_leaf": ("thyme",),
+        "chili": ("bay_leaf", "red_pepper_flakes"),
+    },
+)
+
+COLOMBIAN_AJIACO = RecipeSpec(
+    name="ColombianAjiaco",
+    spices=(
+        "salt", "pepper", "onion", "garlic", "cilantro", "guascas",
+        "potato", "corn", "chicken", "avocado", "capers", "sour_cream",
+        "cumin", "paprika", "thyme", "bay_leaf", "oregano", "parsley"
+    ),
+    predecessors={
+        "salt": (),
+        "pepper": ("salt",),
+        "onion": ("salt",),
+        "garlic": ("onion",),
+        "cilantro": ("garlic",),
+        "guascas": ("cilantro",),
+        "potato": ("guascas",),
+        "corn": ("potato",),
+        "chicken": ("corn",),
+        "avocado": ("chicken",),
+        "capers": ("avocado",),
+        "sour_cream": ("capers",),
+        "cumin": ("sour_cream",),
+        "paprika": ("cumin",),
+        "thyme": ("paprika",),
+        "bay_leaf": ("thyme",),
+        "oregano": ("bay_leaf", "guascas"),
+        "parsley": ("oregano", "cilantro", "pepper"),
+    },
+)
+
+# More fusion
+THAI_INDIAN_FUSION = RecipeSpec(
+    name="ThaiIndianFusion",
+    spices=(
+        "salt", "pepper", "coconut_oil", "garlic", "ginger", "lemongrass",
+        "turmeric", "cumin", "coriander", "chili", "curry_leaves", "kaffir_lime",
+        "coconut_milk", "fish_sauce", "palm_sugar", "tamarind", "basil", "cilantro"
+    ),
+    predecessors={
+        "salt": (),
+        "pepper": ("salt",),
+        "coconut_oil": ("salt",),
+        "garlic": ("coconut_oil",),
+        "ginger": ("coconut_oil",),
+        "lemongrass": ("ginger", "garlic"),
+        "turmeric": ("lemongrass",),
+        "cumin": ("turmeric",),
+        "coriander": ("turmeric", "cumin"),
+        "chili": ("coriander", "pepper"),
+        "curry_leaves": ("chili", "lemongrass"),
+        "kaffir_lime": ("curry_leaves", "lemongrass"),
+        "coconut_milk": ("kaffir_lime", "coconut_oil"),
+        "fish_sauce": ("coconut_milk", "chili"),
+        "palm_sugar": ("fish_sauce", "coconut_milk"),
+        "tamarind": ("palm_sugar", "coriander"),
+        "basil": ("tamarind", "chili"),
+        "cilantro": ("basil", "curry_leaves"),
+    },
+)
+
+MOROCCAN_INDIAN_FUSION = RecipeSpec(
+    name="MoroccanIndianFusion",
+    spices=(
+        "salt", "pepper", "olive_oil", "ghee", "onion", "garlic", "ginger",
+        "turmeric", "cumin", "coriander", "cinnamon", "paprika", "saffron",
+        "harissa", "lemon", "preserved_lemon", "honey", "almonds", "mint", "cilantro"
+    ),
+    predecessors={
+        "salt": (),
+        "pepper": ("salt",),
+        "olive_oil": ("salt",),
+        "ghee": ("salt",),
+        "onion": ("olive_oil",),
+        "garlic": ("onion",),
+        "ginger": ("ghee",),
+        "turmeric": ("garlic", "ginger"),
+        "cumin": ("turmeric",),
+        "coriander": ("turmeric", "cumin"),
+        "cinnamon": ("coriander",),
+        "paprika": ("cinnamon",),
+        "saffron": ("paprika", "cinnamon"),
+        "harissa": ("saffron", "paprika"),
+        "lemon": ("harissa",),
+        "preserved_lemon": ("harissa", "lemon"),
+        "honey": ("preserved_lemon", "saffron"),
+        "almonds": ("honey", "cinnamon"),
+        "mint": ("almonds", "harissa"),
+        "cilantro": ("mint", "coriander"),
+    },
+)
+
+# More complex variations
+PERSIAN_TAHDIG = RecipeSpec(
+    name="PersianTahdig",
+    spices=(
+        "salt", "pepper", "ghee", "butter", "onion", "garlic",
+        "turmeric", "cumin", "saffron", "cardamom", "cinnamon", "advieh",
+        "barberries", "pistachio", "almonds", "orange_zest", "lime", "mint"
+    ),
+    predecessors={
+        "salt": (),
+        "pepper": ("salt",),
+        "ghee": ("salt",),
+        "butter": ("ghee",),
+        "onion": ("butter",),
+        "garlic": ("onion",),
+        "turmeric": ("garlic",),
+        "cumin": ("turmeric",),
+        "saffron": ("cumin",),
+        "cardamom": ("saffron",),
+        "cinnamon": ("cardamom",),
+        "advieh": ("cinnamon", "cardamom", "cumin"),
+        "barberries": ("advieh", "saffron"),
+        "pistachio": ("barberries",),
+        "almonds": ("pistachio",),
+        "orange_zest": ("almonds", "advieh"),
+        "lime": ("orange_zest", "saffron"),
+        "mint": ("lime", "barberries"),
+    },
+)
+
+LEBANESE_FATTOUSH = RecipeSpec(
+    name="LebaneseFattoush",
+    spices=(
+        "salt", "pepper", "olive_oil", "lemon", "garlic", "onion",
+        "sumac", "thyme", "zaatar", "mint", "parsley", "cilantro", "cumin",
+        "paprika", "pomegranate", "tomato", "cucumber", "bell_pepper", "scallion"
+    ),
+    predecessors={
+        "salt": (),
+        "pepper": ("salt",),
+        "olive_oil": ("salt",),
+        "lemon": ("olive_oil",),
+        "garlic": ("lemon",),
+        "onion": ("garlic",),
+        "sumac": ("onion", "lemon"),
+        "thyme": ("sumac",),
+        "zaatar": ("sumac", "thyme"),
+        "mint": ("zaatar",),
+        "parsley": ("mint",),
+        "cilantro": ("parsley",),
+        "cumin": ("cilantro",),
+        "paprika": ("cumin",),
+        "pomegranate": ("paprika", "sumac"),
+        "tomato": ("pomegranate", "onion"),
+        "cucumber": ("tomato",),
+        "bell_pepper": ("cucumber", "onion"),
+        "scallion": ("bell_pepper", "garlic"),
+    },
+)
+
+# More complex Indian
+RAJASTHANI_LAAL_MAAS = RecipeSpec(
+    name="RajasthaniLaalMaas",
+    spices=(
+        "salt", "pepper", "ghee", "onion", "garlic", "ginger",
+        "red_chili", "kashmiri_red_chili", "turmeric", "cumin", "coriander", "garam_masala",
+        "yogurt", "curry_leaves", "fenugreek", "mustard_seed", "asafoetida", "cilantro"
+    ),
+    predecessors={
+        "salt": (),
+        "pepper": ("salt",),
+        "ghee": ("salt",),
+        "onion": ("ghee",),
+        "garlic": ("onion",),
+        "ginger": ("onion",),
+        "red_chili": ("ginger", "pepper"),
+        "kashmiri_red_chili": ("red_chili",),
+        "turmeric": ("kashmiri_red_chili",),
+        "cumin": ("turmeric",),
+        "coriander": ("turmeric", "cumin"),
+        "garam_masala": ("coriander", "cumin"),
+        "yogurt": ("garam_masala", "onion"),
+        "curry_leaves": ("yogurt",),
+        "fenugreek": ("curry_leaves", "cumin"),
+        "mustard_seed": ("fenugreek", "ghee"),
+        "asafoetida": ("mustard_seed", "fenugreek"),
+        "cilantro": ("asafoetida", "pepper", "coriander"),
+    },
+)
+
+GOAN_VINDALOO = RecipeSpec(
+    name="GoanVindaloo",
+    spices=(
+        "salt", "pepper", "coconut_oil", "onion", "garlic", "ginger",
+        "turmeric", "cumin", "coriander", "chili", "vinegar", "sugar",
+        "cinnamon", "clove", "cardamom", "mustard_seed", "curry_leaves", "cilantro"
+    ),
+    predecessors={
+        "salt": (),
+        "pepper": ("salt",),
+        "coconut_oil": ("salt",),
+        "onion": ("coconut_oil",),
+        "garlic": ("onion",),
+        "ginger": ("onion",),
+        "turmeric": ("garlic", "ginger"),
+        "cumin": ("turmeric",),
+        "coriander": ("turmeric", "cumin"),
+        "chili": ("coriander", "pepper"),
+        "vinegar": ("chili", "coconut_oil"),
+        "sugar": ("vinegar", "chili"),
+        "cinnamon": ("sugar",),
+        "clove": ("cinnamon",),
+        "cardamom": ("clove",),
+        "mustard_seed": ("cardamom", "coconut_oil"),
+        "curry_leaves": ("mustard_seed",),
+        "cilantro": ("curry_leaves", "pepper", "coriander"),
+    },
+)
+
+# More Southeast Asian
+SINGAPORE_CHILI_CRAB = RecipeSpec(
+    name="SingaporeChiliCrab",
+    spices=(
+        "salt", "pepper", "soy_sauce", "garlic", "ginger", "chili",
+        "tomato", "sugar", "vinegar", "egg", "scallion", "cilantro",
+        "rice_vinegar", "sesame_oil", "cornstarch", "lime", "onion", "bell_pepper"
+    ),
+    predecessors={
+        "salt": (),
+        "pepper": ("salt",),
+        "soy_sauce": ("salt",),
+        "garlic": ("soy_sauce",),
+        "ginger": ("garlic",),
+        "chili": ("ginger", "pepper"),
+        "tomato": ("chili",),
+        "sugar": ("tomato", "soy_sauce"),
+        "vinegar": ("sugar", "chili"),
+        "egg": ("vinegar",),
+        "scallion": ("egg", "garlic"),
+        "cilantro": ("scallion",),
+        "rice_vinegar": ("cilantro", "vinegar"),
+        "sesame_oil": ("rice_vinegar", "soy_sauce"),
+        "cornstarch": ("sesame_oil", "egg"),
+        "lime": ("cornstarch", "rice_vinegar"),
+        "onion": ("lime",),
+        "bell_pepper": ("onion", "tomato"),
+    },
+)
+
+FILIPINO_ADOBO = RecipeSpec(
+    name="FilipinoAdobo",
+    spices=(
+        "salt", "pepper", "soy_sauce", "vinegar", "garlic", "onion",
+        "bay_leaf", "black_pepper", "sugar", "ginger", "scallion",
+        "cilantro", "lime", "chili", "paprika", "cumin", "coriander"
+    ),
+    predecessors={
+        "salt": (),
+        "pepper": ("salt",),
+        "soy_sauce": ("salt",),
+        "vinegar": ("soy_sauce",),
+        "garlic": ("vinegar",),
+        "onion": ("garlic",),
+        "bay_leaf": ("onion",),
+        "black_pepper": ("bay_leaf", "pepper"),
+        "sugar": ("black_pepper", "vinegar"),
+        "ginger": ("sugar",),
+        "scallion": ("ginger", "onion"),
+        "cilantro": ("scallion",),
+        "lime": ("cilantro", "vinegar"),
+        "chili": ("lime", "pepper"),
+        "paprika": ("chili",),
+        "cumin": ("paprika",),
+        "coriander": ("cumin", "bay_leaf"),
+    },
+)
+
+# More European variations
+FRENCH_COQ_AU_VIN = RecipeSpec(
+    name="FrenchCoqAuVin",
+    spices=(
+        "salt", "pepper", "butter", "onion", "garlic", "carrot", "celery",
+        "thyme", "rosemary", "bay_leaf", "parsley", "red_wine",
+        "brandy", "tomato", "mushroom", "bacon", "flour", "chicken_stock"
+    ),
+    predecessors={
+        "salt": (),
+        "pepper": ("salt",),
+        "butter": ("salt",),
+        "onion": ("butter",),
+        "garlic": ("onion",),
+        "carrot": ("onion",),
+        "celery": ("carrot",),
+        "thyme": ("celery",),
+        "rosemary": ("thyme",),
+        "bay_leaf": ("rosemary",),
+        "parsley": ("bay_leaf",),
+        "red_wine": ("parsley", "onion"),
+        "brandy": ("red_wine",),
+        "tomato": ("brandy", "celery"),
+        "mushroom": ("tomato", "butter"),
+        "bacon": ("mushroom",),
+        "flour": ("bacon", "butter"),
+        "chicken_stock": ("flour", "red_wine"),
+    },
+)
+
+GERMAN_SAUERBRATEN = RecipeSpec(
+    name="GermanSauerbraten",
+    spices=(
+        "salt", "pepper", "onion", "carrot", "celery", "vinegar",
+        "red_wine", "bay_leaf", "juniper", "allspice", "clove", "peppercorn",
+        "ginger", "sugar", "flour", "sour_cream", "parsley", "thyme"
+    ),
+    predecessors={
+        "salt": (),
+        "pepper": ("salt",),
+        "onion": ("salt",),
+        "carrot": ("onion",),
+        "celery": ("carrot",),
+        "vinegar": ("celery",),
+        "red_wine": ("vinegar",),
+        "bay_leaf": ("red_wine",),
+        "juniper": ("bay_leaf",),
+        "allspice": ("juniper",),
+        "clove": ("allspice",),
+        "peppercorn": ("clove", "pepper"),
+        "ginger": ("peppercorn",),
+        "sugar": ("ginger", "vinegar"),
+        "flour": ("sugar",),
+        "sour_cream": ("flour", "red_wine"),
+        "parsley": ("sour_cream", "bay_leaf"),
+        "thyme": ("parsley", "juniper"),
+    },
+)
+
+# More African
+NIGERIAN_Jollof = RecipeSpec(
+    name="NigerianJollof",
+    spices=(
+        "salt", "pepper", "onion", "garlic", "ginger", "tomato",
+        "curry_powder", "thyme", "bay_leaf", "nutmeg", "cinnamon", "allspice",
+        "scotch_bonnet", "bell_pepper", "scallion", "cilantro", "butter", "stock"
+    ),
+    predecessors={
+        "salt": (),
+        "pepper": ("salt",),
+        "onion": ("salt",),
+        "garlic": ("onion",),
+        "ginger": ("onion",),
+        "tomato": ("onion",),
+        "curry_powder": ("tomato",),
+        "thyme": ("curry_powder",),
+        "bay_leaf": ("thyme",),
+        "nutmeg": ("bay_leaf",),
+        "cinnamon": ("nutmeg",),
+        "allspice": ("cinnamon",),
+        "scotch_bonnet": ("allspice", "pepper"),
+        "bell_pepper": ("scotch_bonnet", "onion"),
+        "scallion": ("bell_pepper",),
+        "cilantro": ("scallion", "thyme"),
+        "butter": ("cilantro",),
+        "stock": ("butter", "tomato"),
+    },
+)
+
+# More fusion recipes
+PERUVIAN_JAPANESE_FUSION = RecipeSpec(
+    name="PeruvianJapaneseFusion",
+    spices=(
+        "salt", "pepper", "soy_sauce", "lime", "onion", "garlic", "ginger",
+        "aji_amarillo", "mirin", "sesame_oil", "rice_vinegar", "scallion",
+        "cilantro", "corn", "sweet_potato", "quinoa", "red_onion", "mint"
+    ),
+    predecessors={
+        "salt": (),
+        "pepper": ("salt",),
+        "soy_sauce": ("salt",),
+        "lime": ("soy_sauce",),
+        "garlic": ("lime",),
+        "ginger": ("garlic",),
+        "aji_amarillo": ("ginger", "pepper"),
+        "mirin": ("aji_amarillo", "soy_sauce"),
+        "sesame_oil": ("mirin",),
+        "rice_vinegar": ("sesame_oil", "lime"),
+        "scallion": ("rice_vinegar", "garlic"),
+        "cilantro": ("scallion",),
+        "onion": ("cilantro",),
+        "corn": ("cilantro",),
+        "sweet_potato": ("corn",),
+        "quinoa": ("sweet_potato",),
+        "red_onion": ("quinoa", "onion"),
+        "mint": ("red_onion", "cilantro", "lime"),
+    },
+)
+
 # Profiles
 
 CHEF_A = ProfileSpec(
@@ -282,6 +1825,33 @@ CHEF_A = ProfileSpec(
     recipes=(
         "SimpleDal", "BreakingBread", "SpicySalsa", "SweetCurry", "GrandmasSoup", "MediterraneanFeast",
         "UltraComplexFeast", "AsianFusionBowl", "MediterraneanComplex", "IndianFeastComplex", "MexicanFiestaComplex"
+    ),
+)
+
+# Expanded profile with 50 recipes for larger train/test sets
+CHEF_A_EXPANDED = ProfileSpec(
+    name="ChefAExpanded",
+    recipes=(
+        # Original complex recipes (5)
+        "UltraComplexFeast", "AsianFusionBowl", "MediterraneanComplex", "IndianFeastComplex", "MexicanFiestaComplex",
+        # Simple recipes (6)
+        "SimpleDal", "BreakingBread", "SpicySalsa", "SweetCurry", "GrandmasSoup", "MediterraneanFeast",
+        # Middle Eastern & North African (7)
+        "MiddleEasternFeast", "MoroccanTagine", "PersianStew", "LebaneseKafta", "TurkishKebab", "IsraeliShakshuka", "PersianTahdig",
+        # Thai & Southeast Asian (6)
+        "ThaiCurryComplex", "VietnamesePho", "IndonesianRendang", "MalaysianLaksa", "ThaiBasilStirfry", "SingaporeChiliCrab",
+        # Indian variations (7)
+        "SouthIndianCurry", "BengaliFishCurry", "KashmiriWazwan", "HyderabadiBiryani", "NorthIndianButterChicken", "RajasthaniLaalMaas", "GoanVindaloo",
+        # Korean & Japanese (4)
+        "KoreanBBQ", "JapaneseTeriyaki", "KoreanKimchiStew", "JapaneseMisoRamen",
+        # European (6)
+        "FrenchProvencal", "ItalianRagu", "GreekMoussaka", "SpanishPaella", "HungarianGulash", "FrenchCoqAuVin",
+        # African & Caribbean (4)
+        "EthiopianWat", "JamaicanJerk", "WestAfricanPeanutStew", "NigerianJollof",
+        # Latin American (4)
+        "PeruvianCeviche", "BrazilianMoqueca", "ArgentinianChimichurri", "ColombianAjiaco",
+        # Fusion recipes (1)
+        "KoreanMexicanFusion",
     ),
 )
 
@@ -305,6 +1875,58 @@ ALL_RECIPES = {
     "MediterraneanComplex": MEDITERRANEAN_COMPLEX,
     "IndianFeastComplex": INDIAN_FEAST_COMPLEX,
     "MexicanFiestaComplex": MEXICAN_FIESTA_COMPLEX,
+    "MiddleEasternFeast": MIDDLE_EASTERN_FEAST,
+    "MoroccanTagine": MOROCCAN_TAGINE,
+    "PersianStew": PERSIAN_STEW,
+    "ThaiCurryComplex": THAI_CURRY_COMPLEX,
+    "VietnamesePho": VIETNAMESE_PHO,
+    "FrenchProvencal": FRENCH_PROVENCAL,
+    "ItalianRagu": ITALIAN_RAGU,
+    "EthiopianWat": ETHIOPIAN_WAT,
+    "JamaicanJerk": JAMAICAN_JERK,
+    "SouthIndianCurry": SOUTH_INDIAN_CURRY,
+    "BengaliFishCurry": BENGALI_FISH_CURRY,
+    "KoreanBBQ": KOREAN_BBQ,
+    "JapaneseTeriyaki": JAPANESE_TERIYAKI,
+    "GreekMoussaka": GREEK_MOUSSAKA,
+    "SpanishPaella": SPANISH_PAELLA,
+    "LebaneseKafta": LEBANESE_KAFTA,
+    "TurkishKebab": TURKISH_KEBAB,
+    "PeruvianCeviche": PERUVIAN_CEVICHE,
+    "BrazilianMoqueca": BRAZILIAN_MOQUECA,
+    "FusionTacoBowl": FUSION_TACO_BOWL,
+    "KoreanMexicanFusion": KOREAN_MEXICAN_FUSION,
+    "KashmiriWazwan": KASHMIRI_WAZWAN,
+    "HyderabadiBiryani": HYDERABADI_BIRYANI,
+    "IndonesianRendang": INDONESIAN_RENDANG,
+    "MalaysianLaksa": MALAYSIAN_LAKSA,
+    "HungarianGulash": HUNGARIAN_GULASH,
+    "RussianBorscht": RUSSIAN_BORSCHT,
+    "WestAfricanPeanutStew": WEST_AFRICAN_PEANUT_STEW,
+    "SouthAfricanBobotie": SOUTH_AFRICAN_BOBBOTIE,
+    "IndianChineseFusion": INDIAN_CHINESE_FUSION,
+    "MediterraneanAsianFusion": MEDITERRANEAN_ASIAN_FUSION,
+    "NorthIndianButterChicken": NORTH_INDIAN_BUTTER_CHICKEN,
+    "BengaliMustardFish": BENGALI_MUSTARD_FISH,
+    "ThaiBasilStirfry": THAI_BASIL_STIRFRY,
+    "KoreanKimchiStew": KOREAN_KIMCHI_STEW,
+    "JapaneseMisoRamen": JAPANESE_MISO_RAMEN,
+    "IsraeliShakshuka": ISRAELI_SHAKSHUKA,
+    "TurkishDoner": TURKISH_DONER,
+    "ArgentinianChimichurri": ARGENTINIAN_CHIMICHURRI,
+    "ColombianAjiaco": COLOMBIAN_AJIACO,
+    "ThaiIndianFusion": THAI_INDIAN_FUSION,
+    "MoroccanIndianFusion": MOROCCAN_INDIAN_FUSION,
+    "PersianTahdig": PERSIAN_TAHDIG,
+    "LebaneseFattoush": LEBANESE_FATTOUSH,
+    "RajasthaniLaalMaas": RAJASTHANI_LAAL_MAAS,
+    "GoanVindaloo": GOAN_VINDALOO,
+    "SingaporeChiliCrab": SINGAPORE_CHILI_CRAB,
+    "FilipinoAdobo": FILIPINO_ADOBO,
+    "FrenchCoqAuVin": FRENCH_COQ_AU_VIN,
+    "GermanSauerbraten": GERMAN_SAUERBRATEN,
+    "NigerianJollof": NIGERIAN_Jollof,
+    "PeruvianJapaneseFusion": PERUVIAN_JAPANESE_FUSION,
 }
 
 def get_recipe(name: str) -> RecipeSpec:
@@ -322,6 +1944,7 @@ def list_recipes():
 
 ALL_PROFILES = {
     "ChefA": CHEF_A,
+    "ChefAExpanded": CHEF_A_EXPANDED,
     "ChefB": CHEF_B,
 }
 
