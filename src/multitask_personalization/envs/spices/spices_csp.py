@@ -121,7 +121,8 @@ class _AssignPreferenceGenerator(CSPConstraintGenerator[SpiceState, SpiceAction]
 
         # Mood inference state (per episode)
         # Stronger prior for neutral to require more evidence to switch
-        self._mood_prior = np.array([0.05, 0.9, 0.05], dtype=float) # strong bias towards neutral mood
+        # STRONGER bias towards neutral to prevent wild swings
+        self._mood_prior = np.array([0.05, 0.90, 0.05], dtype=float) # strong bias towards neutral mood
         self._mood_posterior = self._mood_prior.copy()
 
         # Per-episode buffers for mood inference (still needed for our mood inference)
@@ -137,6 +138,11 @@ class _AssignPreferenceGenerator(CSPConstraintGenerator[SpiceState, SpiceAction]
         Uses HBM if available, otherwise falls back to classifier or returns 0.
         """
         if self._use_hbm and self._hbm is not None:
+            # In _get_preference_phi(), add fallback:
+            if spice not in self._hbm.theta_mean:
+                # Spice not seen in training, use global average or 0
+                return 0.0
+                
             # Use HBM's recipe-specific preference
             if recipe_name is None:
                 # If no recipe specified, use the most recent recipe or first available
@@ -146,6 +152,10 @@ class _AssignPreferenceGenerator(CSPConstraintGenerator[SpiceState, SpiceAction]
             
             # Get phi from HBM (recipe-specific preference)
             phi = self._hbm.get_phi(recipe_name, spice)
+
+            # If phi is 0 (uninitialized), use theta as fallback
+            if abs(phi) < 1e-6 and spice in self._hbm.theta_mean:
+                phi = self._hbm.theta_mean[spice]  # Use human-level preference
             
             # Convert to actor-specific preference signal
             # phi > 0 means prefer human, phi < 0 means prefer robot
@@ -182,7 +192,9 @@ class _AssignPreferenceGenerator(CSPConstraintGenerator[SpiceState, SpiceAction]
         logps = []
         
         for m in MOODS:
-            lp = np.log(self._mood_prior[MOODS.index(m)])
+            # Use stronger prior to prevent wild swings
+            prior_weight = 2.0  # Weight prior more heavily
+            lp = np.log(self._mood_prior[MOODS.index(m)]) * prior_weight
             
             # Compute likelihood under this mood hypothesis
             for (actor, spice, sat) in self._episode_observations:
@@ -203,6 +215,7 @@ class _AssignPreferenceGenerator(CSPConstraintGenerator[SpiceState, SpiceAction]
                     mood_bias = self._mood_bias[m][actor]
                     
                     # Check if satisfaction matches preference expectation
+                    # CONTINUOUS SATISFACTION: Use magnitude, not just sign
                     pref_logit = sign_actor * phi_pref
                     pref_expectation = pref_logit > 0  # positive if preference suggests satisfaction
                     sat_positive = sat > 0
@@ -219,10 +232,18 @@ class _AssignPreferenceGenerator(CSPConstraintGenerator[SpiceState, SpiceAction]
                 
                 p = 1.0 / (1.0 + np.exp(-logit))
                 
-                if sat > 0:
-                    lp += np.log(max(p, 1e-9))
-                else:
-                    lp += np.log(max(1 - p, 1e-9))
+                # CONTINUOUS SATISFACTION: Use Beta likelihood similar to HBM
+                # Map satisfaction from [-1, +1] to [0, 1] probability space
+                p_obs = (sat + 1.0) / 2.0  # Map [-1, +1] → [0, 1]
+                p_obs = np.clip(p_obs, 1e-6, 1.0 - 1e-6)  # Avoid log(0)
+                
+                # CRITICAL FIX: Use Gaussian likelihood instead of Beta for stability
+                # Map expected probability p to expected satisfaction
+                sat_expected = 2.0 * p - 1.0
+                sigma_sat = 0.3  # Reasonable variance for satisfaction
+                log_lik = -0.5 * ((sat - sat_expected) / sigma_sat)**2
+                log_lik = np.clip(log_lik, -10.0, 0.0)  # Prevent extreme values
+                lp += log_lik
             
             logps.append(lp)
         
@@ -231,6 +252,12 @@ class _AssignPreferenceGenerator(CSPConstraintGenerator[SpiceState, SpiceAction]
         logps -= np.max(logps)
         ps = np.exp(logps)
         ps /= ps.sum()
+        
+        # CRITICAL FIX: Smooth with previous posterior to prevent rapid swings
+        # Use exponential moving average with high retention (0.7 = keep 70% of old, 30% new)
+        smoothing_alpha = 0.3  # Only 30% new info per update
+        ps = smoothing_alpha * ps + (1 - smoothing_alpha) * self._mood_posterior
+        ps /= ps.sum()  # Renormalize
         
         self._mood_posterior = ps
     
@@ -356,8 +383,8 @@ class _AssignPreferenceGenerator(CSPConstraintGenerator[SpiceState, SpiceAction]
     def _finalize_episode(self) -> None:
         """Finalize episode: with HBM, update hierarchical preferences. Without HBM, all-or-nothing learning."""
         if self._use_hbm and self._hbm is not None:
-            # HBM handles continuous updates, but we call end_episode to update θ and μ
-            self._hbm.end_episode()
+            # HBM handles batch updates at end of episode (processes all observations if confident in neutral mood)
+            self._hbm.end_episode(neutral_threshold=self._neutral_confidence_threshold)
             if self._verbose:
                 logging.info(f"[Episode] HBM updated hierarchical preferences (θ, μ)")
         else:

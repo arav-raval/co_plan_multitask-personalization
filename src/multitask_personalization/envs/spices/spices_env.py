@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, TypeAlias, Iterable
+from typing import Any, TypeAlias, Iterable, TYPE_CHECKING
 import logging
 import gymnasium as gym
 import numpy as np
@@ -13,6 +13,9 @@ import networkx as nx
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 from multitask_personalization.structs import PublicSceneSpec
+
+if TYPE_CHECKING:
+    from multitask_personalization.envs.spices.spices_hbm import HierarchicalPreferenceModel
 
 # --- PROFILE / RECIPE SPECIFICATIONS ---
 @dataclass(frozen=True)
@@ -153,10 +156,11 @@ class SpiceSceneSpec(PublicSceneSpec):
     """A scene specification for the spices environment."""
     recipe: RecipeSpec
 
-@dataclass(frozen=True)
+@dataclass(frozen=False)  # Changed to mutable to allow setting preferences from HBM
 class SpiceHiddenSpec:
     """Hidden Human preference over who should add each spice."""
     preferred_actor: dict[str, str] # {"Spice":  "Actor"}
+    hidden_hbm: "HierarchicalPreferenceModel | None" = None  # Optional hidden HBM for generating preferences
 
 @dataclass(frozen=True)
 class SpiceState:
@@ -235,9 +239,12 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
         if seed is not None:
             self._rng = np.random.default_rng(seed)
 
-        # Create randomized hidden preferences if none provided
+        # Create hidden preferences if none provided
         if self.eval_mode or self._hidden_spec is None:
             self.__randomize_hidden_preferences()
+        elif self._hidden_spec.hidden_hbm is not None:
+            # Use hidden HBM to sample preferences for this recipe
+            self.__sample_preferences_from_hbm()
 
         # Reset state
         self._t = 0
@@ -371,8 +378,13 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
         else:
             return 0.0
 
-    def _compute_satisfaction(self, last_spice: str, preferred: str) -> int:
+    def _compute_satisfaction(self, last_spice: str, preferred: str) -> float:
         """Compute satisfaction based on preference and mood.
+        
+        Returns continuous satisfaction in range [-1, +1]:
+        - +1.0: Maximum positive satisfaction
+        - 0.0: Neutral satisfaction
+        - -1.0: Maximum negative satisfaction
         
         Mood overrides base preferences:
         - "all_self": satisfaction ONLY when human acts
@@ -387,14 +399,28 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
         # Combine
         logit = phi + mood_adj
         
-        # Probabilistic satisfaction
+        # Probabilistic satisfaction: p ∈ [0, 1]
         p = 1 / (1 + np.exp(-logit))
-        satisfaction = self._rng.choice([+1, -1], p=[p, 1-p])
+        
+        # Map probability to continuous satisfaction in [-1, +1]
+        # p = 0.0 → satisfaction = -1.0
+        # p = 0.5 → satisfaction = 0.0
+        # p = 1.0 → satisfaction = +1.0
+        # Add some noise to make it realistic (not just deterministic mapping)
+        # Sample from a Beta distribution centered at p, scaled to [-1, +1]
+        # Use concentration parameters that give reasonable variance
+        alpha = p * 10.0 + 1.0  # Scale by 10 for reasonable variance
+        beta = (1.0 - p) * 10.0 + 1.0
+        p_sampled = self._rng.beta(alpha, beta)
+        satisfaction = 2.0 * p_sampled - 1.0  # Map [0, 1] → [-1, +1]
+        
+        # Clamp to ensure we stay in [-1, +1] range
+        satisfaction = np.clip(satisfaction, -1.0, 1.0)
 
         # if self.verbose:
-        #     logging.info(f"[Satisfaction] Base preference: {phi}, Mood bias: {mood_adj}, p: {p:.6f}, Satisfaction: {satisfaction}")
+        #     logging.info(f"[Satisfaction] Base preference: {phi}, Mood bias: {mood_adj}, p: {p:.6f}, Satisfaction: {satisfaction:.3f}")
         
-        return satisfaction
+        return float(satisfaction)
 
     def _get_info(self, robot_indicated_done: bool = False) -> dict[str, Any]:
         # Empty case
@@ -481,4 +507,36 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
         """Randomize the hidden preferences."""
         preferences = {spice: self._rng.choice(["human", "robot"]) for spice in self.scene_spec.recipe.spices}
         self._hidden_spec = SpiceHiddenSpec(preferred_actor=preferences)
+    
+    def __sample_preferences_from_hbm(self) -> None:
+        """Sample preferences from the hidden HBM for this recipe."""
+        if self._hidden_spec is None or self._hidden_spec.hidden_hbm is None:
+            return
+        
+        hidden_hbm = self._hidden_spec.hidden_hbm
+        recipe_name = self.scene_spec.recipe.name
+        preferences = {}
+        
+        for spice in self.scene_spec.recipe.spices:
+            # Sample phi from the hidden HBM's theta (human-level preference) for this spice
+            # phi ~ N(theta_s, sigma_r^2)
+            if spice in hidden_hbm.theta_mean:
+                theta_mean = hidden_hbm.theta_mean[spice]
+                theta_var = hidden_hbm.theta_var.get(spice, hidden_hbm.sigma_h**2 + hidden_hbm.sigma_r**2)
+                # Sample phi from N(theta, sigma_r^2)
+                phi = self._rng.normal(theta_mean, hidden_hbm.sigma_r)
+                
+                # Convert phi to actor preference: positive phi -> prefer human, negative -> prefer robot
+                # Use sigmoid to convert to probability, then sample
+                p_human = 1.0 / (1.0 + np.exp(-phi))
+                preferred_actor = "human" if self._rng.random() < p_human else "robot"
+            else:
+                # Spice not in hidden HBM, default to random
+                preferred_actor = self._rng.choice(["human", "robot"])
+            
+            preferences[spice] = preferred_actor
+        
+        # Update the hidden spec with sampled preferences
+        if self._hidden_spec is not None:
+            self._hidden_spec.preferred_actor = preferences
 
