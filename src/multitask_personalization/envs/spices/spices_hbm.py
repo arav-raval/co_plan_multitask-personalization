@@ -52,12 +52,12 @@ class HierarchicalPreferenceModel:
 
         # ---------------- Level 1: μ_s ----------------
         self.mu_mean: Dict[str, float] = {s: mu0 for s in self.spices}
-        self.mu_var: Dict[str, float] = {s: sigma0**2 for s in self.spices}
+        self.mu_var: Dict[str, float] = {s: self.sigma0**2 for s in self.spices}
 
         # ---------------- Level 2: θ_s ----------------
         self.theta_mean: Dict[str, float] = {s: mu0 for s in self.spices}
         self.theta_var: Dict[str, float] = {
-            s: sigma0**2 + sigma_h**2 for s in self.spices
+            s: self.sigma0**2 + self.sigma_h**2 for s in self.spices
         }
 
         # ---------------- Level 3: φ_{r,s} ----------------
@@ -65,7 +65,7 @@ class HierarchicalPreferenceModel:
             lambda: {s: 0.0 for s in self.spices}
         )
         self.phi_var: Dict[str, Dict[str, float]] = defaultdict(
-            lambda: {s: sigma_r**2 for s in self.spices}
+            lambda: {s: self.sigma_r**2 for s in self.spices}
         )
         
         # Exponential moving average for smoothing updates
