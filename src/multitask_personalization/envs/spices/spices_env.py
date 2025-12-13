@@ -134,9 +134,10 @@ class MoodSpec:
     """Defines the mood categories."""
     # TODO: extend to more moods / non-categorical moods
     moods: tuple[str, ...] = ("all_self", "neutral", "none_self")
-    # Skewed priors to favor neutral mood (60% neutral, 20% each for all_self/none_self)
+    # Skewed priors to favor neutral mood (80% neutral, 10% each for all_self/none_self)
     # This ensures more episodes contribute to preference learning
-    priors: tuple[float, ...] = (0.2, 0.6, 0.2)  # (all_self, neutral, none_self)
+    # Increased from 60% to 80% to allow faster convergence
+    priors: tuple[float, ...] = (0.1, 0.8, 0.1)  # (all_self, neutral, none_self)
 
 class MoodModel:
     """Handles sampling and updating the current day's mood."""
@@ -409,8 +410,11 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
         # Add some noise to make it realistic (not just deterministic mapping)
         # Sample from a Beta distribution centered at p, scaled to [-1, +1]
         # Use concentration parameters that give reasonable variance
-        alpha = p * 10.0 + 1.0  # Scale by 10 for reasonable variance
-        beta = (1.0 - p) * 10.0 + 1.0
+        # Import config here to avoid circular import
+        from .spices_config import DEFAULT_CONFIG
+        kappa = DEFAULT_CONFIG.satisfaction.satisfaction_beta_kappa
+        alpha = p * kappa + 1.0
+        beta = (1.0 - p) * kappa + 1.0
         p_sampled = self._rng.beta(alpha, beta)
         satisfaction = 2.0 * p_sampled - 1.0  # Map [0, 1] → [-1, +1]
         

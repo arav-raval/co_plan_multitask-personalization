@@ -3,16 +3,10 @@ import numpy as np
 from typing import Dict, List, Tuple
 from collections import defaultdict
 
+from .spices_config import DEFAULT_CONFIG, SpicesConfig
 
 # Moods
 MOODS = ("all_self", "neutral", "none_self")
-
-# Mood biases
-MOOD_BIAS = {
-    "all_self":   {"human": +6.0, "robot": -6.0},
-    "neutral":    {"human":  0.0, "robot":  0.0},
-    "none_self":  {"human": -6.0, "robot": +6.0},
-}
 
 class HierarchicalPreferenceModel:
     """
@@ -41,16 +35,20 @@ class HierarchicalPreferenceModel:
         sigma_h: float = 1.0,
         sigma_r: float = 1.0,
         sigma_obs: float = 1.0,
+        config: SpicesConfig | None = None,
     ) -> None:
 
         self.spices = list(spices)
         self.recipes = list(recipes)
+        
+        # Load configuration
+        self.config = config if config is not None else DEFAULT_CONFIG
 
-        # Variances
-        self.sigma0 = sigma0
-        self.sigma_h = sigma_h
-        self.sigma_r = sigma_r
-        self.sigma_obs = sigma_obs
+        # Variances (use config if not explicitly provided, otherwise use provided values)
+        self.sigma0 = sigma0 if sigma0 != 1.0 else self.config.hbm.sigma0
+        self.sigma_h = sigma_h if sigma_h != 1.0 else self.config.hbm.sigma_h
+        self.sigma_r = sigma_r if sigma_r != 1.0 else self.config.hbm.sigma_r
+        self.sigma_obs = sigma_obs if sigma_obs != 1.0 else self.config.hbm.sigma_obs
 
         # ---------------- Level 1: μ_s ----------------
         self.mu_mean: Dict[str, float] = {s: mu0 for s in self.spices}
@@ -74,7 +72,7 @@ class HierarchicalPreferenceModel:
         self.phi_ema: Dict[str, Dict[str, float]] = defaultdict(
             lambda: {s: 0.0 for s in self.spices}
         )
-        self.ema_alpha = 0.4  # Increased from 0.1 to 0.4 for faster convergence (40% of new info per update)
+        self.ema_alpha = self.config.hbm.ema_alpha
 
         # Per-step data for mood inference (actor, spice, satisfaction)
         self.episode_data: List[Tuple[str, str, float]] = []
@@ -85,8 +83,8 @@ class HierarchicalPreferenceModel:
         # Track whether phi was updated this episode (to avoid unnecessary hierarchical updates)
         self._phi_updated_this_episode = False
 
-        # Prior over mood - STRONGER bias towards neutral to prevent wild swings
-        self.mood_prior = np.array([0.02, 0.96, 0.02], dtype=float) # Much stronger bias towards neutral mood
+        # Prior over mood (from config)
+        self.mood_prior = np.array(self.config.mood_prior_array, dtype=float)
         self.mood_posterior = self.mood_prior.copy()
         
         # Track mood posterior history for smoothing (prevent rapid swings)
@@ -94,14 +92,13 @@ class HierarchicalPreferenceModel:
         
         # Track number of observations for adaptive EMA
         self._total_observations = 0
+        
+        # Track observation count per spice for early initialization
+        self._spice_observation_count: Dict[str, int] = defaultdict(int)
 
         self.base_satisfaction_bias = base_satisfaction_bias
-        self.mood_bias_strength = base_satisfaction_bias * 2.0
-        self.mood_bias = {
-            "all_self":   {"human": +self.mood_bias_strength, "robot": -self.mood_bias_strength},
-            "neutral":    {"human": 0.0,  "robot": 0.0},
-            "none_self":  {"human": -self.mood_bias_strength, "robot": +self.mood_bias_strength},
-        }
+        self.mood_bias_strength = self.config.mood_bias_strength
+        self.mood_bias = self.config.get_mood_bias()
 
     # --- Mood inference ---
     def _loglik_feedback_given_mood(
@@ -135,11 +132,12 @@ class HierarchicalPreferenceModel:
         
         # Use Gaussian likelihood: satisfaction ~ N(sat_expected, sigma_sat^2)
         # This is more stable than Beta and prevents extreme log-likelihoods
-        sigma_sat = 0.3  # Reasonable variance for satisfaction
+        sigma_sat = self.config.mood.satisfaction_sigma
         log_lik = -0.5 * ((satisfaction - sat_expected) / sigma_sat)**2
         
         # Add small constant to prevent extreme values
-        log_lik = np.clip(log_lik, -10.0, 0.0)
+        log_lik = np.clip(log_lik, self.config.mood.satisfaction_loglik_min, 
+                         self.config.mood.satisfaction_loglik_max)
         
         return float(log_lik)
 
@@ -152,7 +150,7 @@ class HierarchicalPreferenceModel:
         logps = []
         for m in MOODS:
             # Use stronger prior to prevent wild swings
-            prior_weight = 2.0  # Weight prior more heavily
+            prior_weight = self.config.mood.mood_prior_weight
             lp = np.log(self.mood_prior[MOODS.index(m)]) * prior_weight
             
             for (actor, spice, sat) in self.episode_data:
@@ -166,9 +164,9 @@ class HierarchicalPreferenceModel:
         ps /= ps.sum()
         
         # CRITICAL FIX: Smooth with previous posterior to prevent rapid swings
-        # Use exponential moving average with high retention (0.7 = keep 70% of old, 30% new)
+        # Use exponential moving average with high retention
         if len(self._mood_posterior_history) > 0:
-            smoothing_alpha = 0.3  # Only 30% new info per update
+            smoothing_alpha = self.config.mood.mood_smoothing_alpha
             ps = smoothing_alpha * ps + (1 - smoothing_alpha) * self.mood_posterior
             ps /= ps.sum()  # Renormalize
         
@@ -207,17 +205,16 @@ class HierarchicalPreferenceModel:
             # Only de-mood if we're uncertain about neutral mood
             # If we're confident in a non-neutral mood, subtract expected mood contribution
             expected_mood_contribution = 0.0
-            if all_self_conf > 0.3:  # Confident in all_self
+            demood_threshold = self.config.mood.demood_confidence_threshold
+            if all_self_conf > demood_threshold:  # Confident in all_self
                 mood_bias = self.mood_bias["all_self"][actor]
                 # Map mood bias to expected satisfaction contribution
-                # mood_bias = ±6.0, normalize to [-1, +1] range
-                # Use sigmoid to map logit space to satisfaction space
                 expected_mood_logit = mood_bias / self.base_satisfaction_bias  # Normalize
-                expected_mood_contribution = np.tanh(expected_mood_logit) * 0.3  # Scale down more conservatively
-            elif none_self_conf > 0.3:  # Confident in none_self
+                expected_mood_contribution = np.tanh(expected_mood_logit) * self.config.mood.demood_scale_factor
+            elif none_self_conf > demood_threshold:  # Confident in none_self
                 mood_bias = self.mood_bias["none_self"][actor]
                 expected_mood_logit = mood_bias / self.base_satisfaction_bias
-                expected_mood_contribution = np.tanh(expected_mood_logit) * 0.3
+                expected_mood_contribution = np.tanh(expected_mood_logit) * self.config.mood.demood_scale_factor
             
             # De-mood satisfaction: subtract expected mood contribution
             demooded_satisfaction = satisfaction - expected_mood_contribution
@@ -230,7 +227,8 @@ class HierarchicalPreferenceModel:
         # FIX C: Check if satisfaction matches preference expectation
         # BUT: Only apply this check if we have a well-learned preference (avoid blocking early learning)
         current_phi = self.phi_mean[recipe_name].get(spice, 0.0)
-        if abs(current_phi) > 1.0:  # Only check if preference is well-learned
+        mismatch_threshold = self.config.hbm.preference_mismatch_threshold
+        if abs(current_phi) > mismatch_threshold:  # Only check if preference is well-learned
             pref_logit = sign_actor * current_phi
             pref_expectation = pref_logit > 0  # positive if preference suggests satisfaction
             sat_positive = demooded_satisfaction > 0  # Use de-mooded satisfaction
@@ -239,7 +237,7 @@ class HierarchicalPreferenceModel:
             # BUT: Don't block updates completely, just reduce strength
             if pref_expectation != sat_positive:
                 # Mismatch: reduce update strength (likely mood, not preference)
-                g_neutral = g_neutral * 0.3  # Reduced from 0.1 to 0.3 - less aggressive
+                g_neutral = g_neutral * self.config.hbm.preference_mismatch_penalty
         
         # Use full signal (neutral mood)
         if neutral_conf >= neutral_threshold:
@@ -255,8 +253,24 @@ class HierarchicalPreferenceModel:
             φ ~ N(theta_s, σ_r^2)
         
         FIX D: Adaptive EMA - less smoothing early in learning
+        FIX 2: Early initialization - direct phi initialization for first few observations
         """
         self._total_observations += 1
+        self._spice_observation_count[spice] += 1
+        obs_count = self._spice_observation_count[spice]
+
+        # FIX 2: Early initialization - directly set phi from first few observations
+        # This breaks the circular dependency between mood inference and preference learning
+        if obs_count <= 5:
+            # Direct initialization: phi = sign(actor) * satisfaction * base_bias
+            # No smoothing, no prior - just direct observation
+            # g already contains: sign(actor) * satisfaction * base_bias
+            # For early init, we want to directly use g as phi estimate
+            phi_init = g  # Direct initialization
+            self.phi_mean[recipe_name][spice] = phi_init
+            self.phi_ema[recipe_name][spice] = phi_init
+            self.phi_var[recipe_name][spice] = self.sigma_r**2
+            return
 
         theta_mean = self.theta_mean[spice]
         sigma_r2 = self.sigma_r**2
@@ -266,22 +280,56 @@ class HierarchicalPreferenceModel:
         prior_mean = theta_mean
         prior_var = sigma_r2
 
-        # Posterior
-        post_var = 1.0 / (1.0/prior_var + 1.0/sigma_obs2)
-        post_mean = post_var * (prior_mean/prior_var + g/sigma_obs2)
+        # Learning rate annealing (reduce LR over time for stability)
+        anneal_factor = 1.0
+        if self.config.hbm.use_lr_annealing:
+            if self._total_observations > self.config.hbm.lr_annealing_start:
+                if self._total_observations >= self.config.hbm.lr_annealing_end:
+                    anneal_factor = self.config.hbm.lr_annealing_min / self.config.hbm.base_learning_rate
+                else:
+                    # Linear interpolation
+                    progress = (self._total_observations - self.config.hbm.lr_annealing_start) / (
+                        self.config.hbm.lr_annealing_end - self.config.hbm.lr_annealing_start)
+                    anneal_factor = 1.0 - progress * (1.0 - self.config.hbm.lr_annealing_min / self.config.hbm.base_learning_rate)
+        
+        # Get current variance (before update) for variance-adaptive scaling and convergence detection
+        current_var = self.phi_var[recipe_name].get(spice, sigma_r2)
+        is_converged = current_var < self.config.hbm.variance_converged_threshold
+        
+        # Variance-adaptive learning rate scaling (to reduce oscillations when converged)
+        # When variance is low (high confidence), make updates smaller to reduce oscillations
+        # When variance is high (low confidence), allow larger updates for faster learning
+        lr_scale = 1.0
+        if self.config.hbm.use_variance_adaptive_lr:
+            # Normalize: high var → 1.0 (allow updates), low var → min_scale (smaller updates)
+            # When variance is very low, we're converged, so reduce update magnitude
+            var_normalized = min(1.0, max(0.0, np.sqrt(current_var / sigma_r2)))
+            lr_scale = (self.config.hbm.variance_adaptive_min_scale * (1 - var_normalized) + 
+                       self.config.hbm.variance_adaptive_max_scale * var_normalized)
+        
+        # Apply both annealing and variance scaling to the effective observation variance
+        # This scales how much we trust new observations vs. prior
+        effective_sigma_obs2 = sigma_obs2 / (anneal_factor * lr_scale)
 
-        # FIX D: Adaptive EMA smoothing - less smoothing early in learning
+        # Posterior (with scaled observation variance)
+        post_var = 1.0 / (1.0/prior_var + 1.0/effective_sigma_obs2)
+        post_mean = post_var * (prior_mean/prior_var + g/effective_sigma_obs2)
+
+        # FIX D: Adaptive EMA smoothing - less smoothing early, more when converged
         current_ema = self.phi_ema[recipe_name][spice]
         if current_ema == 0.0 and self.phi_mean[recipe_name][spice] == 0.0:
             smoothed_mean = post_mean
         else:
-            # Adaptive EMA: less smoothing early (faster recovery from mistakes)
-            if self._total_observations < 20:
-                ema_alpha = 0.7  # Less smoothing (70% new info) early
-            elif self._total_observations < 50:
-                ema_alpha = 0.5  # Medium smoothing
+            
+            # Adaptive EMA: less smoothing early (faster recovery), more when converged (stability)
+            if self._total_observations < self.config.hbm.ema_early_threshold:
+                ema_alpha = self.config.hbm.ema_early_alpha
+            elif self._total_observations < self.config.hbm.ema_medium_threshold:
+                ema_alpha = self.config.hbm.ema_medium_alpha
+            elif is_converged:
+                ema_alpha = self.config.hbm.ema_alpha_converged  # More smoothing when converged
             else:
-                ema_alpha = self.ema_alpha  # Normal smoothing (40% new info) later
+                ema_alpha = self.ema_alpha  # Normal smoothing
             smoothed_mean = ema_alpha * post_mean + (1 - ema_alpha) * current_ema
         
         self.phi_mean[recipe_name][spice] = smoothed_mean
@@ -316,13 +364,15 @@ class HierarchicalPreferenceModel:
             # Reduce both prior variance and observation variance for faster convergence
             if len(self.recipes) == 1:
                 # Much stronger updates: reduce both variances
-                prior_var = (self.sigma0**2 + self.sigma_h**2) * 0.25  # 0.5 instead of 2.0 (4x reduction)
-                sigma_obs2 = self.sigma_r**2 * 0.25  # 0.25 instead of 1.0 (4x reduction)
+                prior_var_mult = self.config.hbm.single_recipe_prior_var_multiplier
+                obs_var_mult = self.config.hbm.single_recipe_obs_var_multiplier
+                prior_var = (self.sigma0**2 + self.sigma_h**2) * prior_var_mult
+                sigma_obs2 = self.sigma_r**2 * obs_var_mult
                 # This makes theta move much more directly toward phi
                 # CRITICAL FIX: For single recipe, mu (prior_mean) tends to stay near 0 and pull theta back
-                # Instead of using mu as prior, use a weaker prior centered at current theta to allow more movement
-                # This prevents mu from pulling theta back toward 0
-                prior_mean = self.theta_mean[s] * 0.3 + self.mu_mean[s] * 0.7  # Weighted: mostly current theta, some mu
+                # Instead of using mu as prior, use current theta as prior (momentum-based)
+                # This completely removes mu's pull-back effect, allowing theta to converge freely
+                prior_mean = self.theta_mean[s]  # Use current theta, not mu!
                 post_var = 1.0 / (1.0/prior_var + 1.0/sigma_obs2)
                 post_mean = post_var * (prior_mean/prior_var + y/sigma_obs2)
             else:
@@ -375,13 +425,13 @@ class HierarchicalPreferenceModel:
         neutral_conf = self.mood_posterior[neutral_idx]
         
         # FIX B: Stricter threshold - only update if very confident in neutral mood
-        effective_threshold = max(neutral_threshold, 0.7)  # At least 0.7 confidence required
+        effective_threshold = max(neutral_threshold, self.config.update.effective_threshold_min)
         
         # Batch update preferences using all episode observations if confident in neutral mood
         if neutral_conf >= effective_threshold and self._current_recipe_name:
             # Weight all observations by final confidence
             confidence_weight = (neutral_conf - effective_threshold) / (1.0 - effective_threshold)
-            confidence_weight = max(confidence_weight, 0.1)  # Minimum 10% weight
+            confidence_weight = max(confidence_weight, self.config.update.confidence_weight_min)
             
             # Process all observations from the episode
             for (actor, spice, satisfaction) in self.episode_data:
@@ -391,7 +441,7 @@ class HierarchicalPreferenceModel:
                 g_weighted = g * confidence_weight
                 
                 # Learning rate based on confidence
-                base_lr = 0.15
+                base_lr = self.config.hbm.base_learning_rate
                 learning_rate = base_lr * confidence_weight
                 
                 self._update_phi(self._current_recipe_name, spice, g_weighted, learning_rate=learning_rate)

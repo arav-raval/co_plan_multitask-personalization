@@ -19,17 +19,17 @@ from hidden_hbm_configs import get_hidden_hbm_config, create_theta_params_from_c
 
 # ---------------- PARAMETER SETUP ----------------
 PARAMETERS = {
-    "num_episodes": 1000,
+    "num_episodes": 500,
     "num_epochs": 5, 
-    "profile": "ChefAExpanded",
-    "recipe_name": "UltraComplexFeast",
+    "profile": "ChefA",
+    "recipe_name": "FortyStepFeast",
     "env_seed": 123,
     "csp_seed": 369,
     "logging_level": logging.INFO,
     "train_frac": 0.7,  # 70% train, 30% test for better split
     "verbose": True,
     "use_hbm": True,
-    "num_seeds": 1,  # Number of seeds to run for error bars
+    "num_seeds": 5,  # Number of seeds to run for error bars
     "use_hidden_hbm": True,  # Whether to use hidden HBM for generating preferences
     "num_humans": 1,  # Number of different humans (hidden HBMs) to test
     "hidden_hbm_config_name": "SpiceSpecificHuman",  # Name of hidden HBM config to use (see hidden_hbm_configs.py)
@@ -94,6 +94,69 @@ def _create_hidden_hbm(spices: list[str], recipes: list[str],
     
     return hbm
 
+def _compute_cross_recipe_preference_accuracy(
+    generator: SpicesAssignCSPGenerator,
+    test_recipes: list[str],
+    hidden_hbm: HierarchicalPreferenceModel | None = None
+) -> dict[str, float]:
+    """
+    Compute preference prediction accuracy on test recipes using θ/μ priors.
+    
+    For each test recipe, predicts preferred actor for each spice using:
+    1. θ (human-level) if available
+    2. μ (global-level) as fallback
+    
+    Compares predictions against ground-truth preferences from hidden_hbm.
+    
+    Returns:
+        Dictionary with accuracy metrics per recipe and overall
+    """
+    if not PARAMETERS["use_hbm"] or generator._pref_gen._hbm is None:
+        return {}
+    
+    hbm = generator._pref_gen._hbm
+    results = {}
+    
+    for recipe_name in test_recipes:
+        recipe = get_recipe(recipe_name)
+        spices = list(recipe.spices)
+        
+        correct_predictions = 0
+        total_predictions = 0
+        
+        for spice in spices:
+            # Get predicted preference using θ (human-level) or μ (global) as fallback
+            if spice in hbm.theta_mean and abs(hbm.theta_mean[spice]) > 1e-6:
+                # Use theta if available and non-zero
+                predicted_pref = "human" if hbm.theta_mean[spice] > 0 else "robot"
+            elif spice in hbm.mu_mean and abs(hbm.mu_mean[spice]) > 1e-6:
+                # Fallback to mu
+                predicted_pref = "human" if hbm.mu_mean[spice] > 0 else "robot"
+            else:
+                # No preference learned, skip
+                continue
+            
+            # Get ground-truth preference from hidden_hbm
+            if hidden_hbm is not None and spice in hidden_hbm.theta_mean:
+                # Sample phi from hidden HBM for this recipe
+                theta_mean = hidden_hbm.theta_mean[spice]
+                # For simplicity, use theta directly (could sample phi ~ N(theta, sigma_r^2))
+                true_pref = "human" if theta_mean > 0 else "robot"
+                
+                if predicted_pref == true_pref:
+                    correct_predictions += 1
+                total_predictions += 1
+        
+        if total_predictions > 0:
+            accuracy = correct_predictions / total_predictions
+            results[recipe_name] = accuracy
+    
+    # Overall accuracy
+    if results:
+        results["overall"] = np.mean(list(results.values()))
+    
+    return results
+
 def _make_env(seed: int, name: str = PARAMETERS["recipe_name"], hidden_hbm: HierarchicalPreferenceModel | None = None) -> SpiceEnv:
     recipe = get_recipe(name)
     scene_spec = SpiceSceneSpec(recipe=recipe)
@@ -127,6 +190,14 @@ def run_one_episode(env, generator, solver_seed=123, track_mood_evolution=True):
     true_mood = None
     steps_to_correct_mood = None
     mood_correctly_inferred = False
+    
+    # Track when mood inference becomes confident (regardless of correctness)
+    steps_to_confident_mood = None
+    confident_mood = None
+    
+    # Track satisfaction before/after mood inference
+    satisfaction_before_mood = []
+    satisfaction_after_mood = []
 
     while not terminated:
         prev_obs = obs
@@ -178,6 +249,39 @@ def run_one_episode(env, generator, solver_seed=123, track_mood_evolution=True):
                 if inferred_mood == true_mood:
                     steps_to_correct_mood = step_count
                     mood_correctly_inferred = True
+        
+        # Track when mood inference becomes confident (for any mood, not just correct)
+        # This happens when a non-neutral mood has high confidence
+        if steps_to_confident_mood is None and info.get("last_spice") is not None:
+            mood_posterior = info.get("mood_posterior", {})
+            if mood_posterior:
+                # Check if we're confident in a non-neutral mood
+                neutral_conf = mood_posterior.get("neutral", 0.0)
+                all_self_conf = mood_posterior.get("all_self", 0.0)
+                none_self_conf = mood_posterior.get("none_self", 0.0)
+                # Use the same threshold as for preference updates
+                confidence_threshold = 0.5
+                
+                if neutral_conf < confidence_threshold and (all_self_conf >= confidence_threshold or none_self_conf >= confidence_threshold):
+                    steps_to_confident_mood = step_count
+                    # Determine which non-neutral mood we're confident in
+                    if all_self_conf >= confidence_threshold:
+                        confident_mood = "all_self"
+                    elif none_self_conf >= confidence_threshold:
+                        confident_mood = "none_self"
+                    else:
+                        confident_mood = "neutral"  # Fallback (shouldn't happen)
+        
+        # Track satisfaction for all steps (we'll split later based on mood confidence)
+        if info.get("last_spice") is not None:
+            sat = info.get("satisfaction", 0)
+            if sat != 0:  # Only track non-zero satisfaction (actual assignments)
+                # If mood hasn't become confident yet, add to before
+                if steps_to_confident_mood is None:
+                    satisfaction_before_mood.append(sat)
+                else:
+                    # Mood became confident - add to after
+                    satisfaction_after_mood.append(sat)
 
         # Log mood estimates from info dict
         if PARAMETERS["verbose"] and info.get("last_spice") is not None:
@@ -206,15 +310,60 @@ def run_one_episode(env, generator, solver_seed=123, track_mood_evolution=True):
                 steps_to_correct_mood = step_count - 1  # Last step (0-indexed)
                 mood_correctly_inferred = True
     
+    # Final check: if mood didn't become confident during episode, check final mood posterior
+    if steps_to_confident_mood is None:
+        mood_posterior = info.get("mood_posterior", {})
+        if mood_posterior:
+            neutral_conf = mood_posterior.get("neutral", 0.0)
+            all_self_conf = mood_posterior.get("all_self", 0.0)
+            none_self_conf = mood_posterior.get("none_self", 0.0)
+            confidence_threshold = 0.5
+            
+            if neutral_conf < confidence_threshold and (all_self_conf >= confidence_threshold or none_self_conf >= confidence_threshold):
+                steps_to_confident_mood = step_count - 1
+                if all_self_conf >= confidence_threshold:
+                    confident_mood = "all_self"
+                elif none_self_conf >= confidence_threshold:
+                    confident_mood = "none_self"
+                else:
+                    confident_mood = "neutral"
+    
     if track_mood_evolution:
         info["mood_evolution"] = mood_evolution
+    
+    # Compute satisfaction metrics for mood adaptation
+    # For episodes where mood became confident, use before/after split
+    # For neutral episodes (mood never confident), use first half / second half of episode
+    if steps_to_confident_mood is not None:
+        # We have both before and after data from confident mood inference
+        mean_satisfaction_before_mood = np.mean(satisfaction_before_mood) if satisfaction_before_mood else np.nan
+        mean_satisfaction_after_mood = np.mean(satisfaction_after_mood) if satisfaction_after_mood else np.nan
+        satisfaction_recovery = mean_satisfaction_after_mood - mean_satisfaction_before_mood if (satisfaction_before_mood and satisfaction_after_mood) else np.nan
+    else:
+        # Mood never became confident (likely neutral episode)
+        # Use first half vs second half of episode as proxy for before/after
+        if satisfaction_before_mood:
+            mid_point = len(satisfaction_before_mood) // 2
+            first_half = satisfaction_before_mood[:mid_point] if mid_point > 0 else []
+            second_half = satisfaction_before_mood[mid_point:] if mid_point < len(satisfaction_before_mood) else []
+            
+            mean_satisfaction_before_mood = np.mean(first_half) if first_half else np.nan
+            mean_satisfaction_after_mood = np.mean(second_half) if second_half else np.nan
+            satisfaction_recovery = mean_satisfaction_after_mood - mean_satisfaction_before_mood if (first_half and second_half) else np.nan
+        else:
+            mean_satisfaction_before_mood = np.nan
+            mean_satisfaction_after_mood = np.nan
+            satisfaction_recovery = np.nan
     
     # Add mood inference metrics to info
     info["mood_inference_metrics"] = {
         "true_mood": true_mood,
         "steps_to_correct_mood": steps_to_correct_mood,  # None if never correctly inferred
         "mood_correctly_inferred": mood_correctly_inferred,
-        "total_steps": step_count
+        "total_steps": step_count,
+        "mean_satisfaction_before_mood": mean_satisfaction_before_mood,
+        "mean_satisfaction_after_mood": mean_satisfaction_after_mood,
+        "satisfaction_recovery": satisfaction_recovery,
     }
     
     return info
@@ -240,6 +389,12 @@ def update_metrics(metrics, info, hbm_info):
             metrics["steps_to_correct_mood"] = []
         if "mood_correctly_inferred" not in metrics:
             metrics["mood_correctly_inferred"] = []
+        if "mean_satisfaction_before_mood" not in metrics:
+            metrics["mean_satisfaction_before_mood"] = []
+        if "mean_satisfaction_after_mood" not in metrics:
+            metrics["mean_satisfaction_after_mood"] = []
+        if "satisfaction_recovery" not in metrics:
+            metrics["satisfaction_recovery"] = []
         
         steps = mood_metrics.get("steps_to_correct_mood")
         # Use total_steps if mood was never correctly inferred
@@ -247,6 +402,9 @@ def update_metrics(metrics, info, hbm_info):
             steps = mood_metrics.get("total_steps", -1)  # -1 indicates never inferred
         metrics["steps_to_correct_mood"].append(steps)
         metrics["mood_correctly_inferred"].append(mood_metrics.get("mood_correctly_inferred", False))
+        metrics["mean_satisfaction_before_mood"].append(mood_metrics.get("mean_satisfaction_before_mood", np.nan))
+        metrics["mean_satisfaction_after_mood"].append(mood_metrics.get("mean_satisfaction_after_mood", np.nan))
+        metrics["satisfaction_recovery"].append(mood_metrics.get("satisfaction_recovery", np.nan))
 
     # Track HBM evolution
     if PARAMETERS["use_hbm"]:
@@ -311,6 +469,8 @@ def visualize(num_episodes, metrics, aggregated_metrics=None):
         # Plot average satisfaction with error bars
         if satisfactions_mean is not None:
             _plot_average_satisfaction(satisfactions_mean, moods, satisfactions_std)
+            # Also plot neutral episodes only
+            _plot_neutral_episodes_only(satisfactions_mean, moods, satisfactions_std)
         
         # Filter out HBM-related metrics and empty metrics for standard visualization
         # Exclude keys that are HBM-related or have _mean/_std/_raw suffixes (except average_satisfactions)
@@ -320,7 +480,10 @@ def visualize(num_episodes, metrics, aggregated_metrics=None):
             "phi_history_std", "theta_history_std", "mu_history_std",
             "moods_raw", "actor_distributions_raw", "last_episode_mood_evolution_raw",
             "average_satisfactions_mean", "average_satisfactions_std", "average_satisfactions_raw",  # Already plotted above with error bars
-            "satisfaction_variances", "satisfaction_variances_mean", "satisfaction_variances_std", "satisfaction_variances_raw"  # Variance already shown in error bars
+            "satisfaction_variances", "satisfaction_variances_mean", "satisfaction_variances_std", "satisfaction_variances_raw",  # Variance already shown in error bars
+            "mean_satisfaction_before_mood", "mean_satisfaction_after_mood", "satisfaction_recovery",  # Plotted separately in combined plot
+            "mean_satisfaction_before_mood_mean", "mean_satisfaction_after_mood_mean", "satisfaction_recovery_mean",  # Aggregated versions
+            "mean_satisfaction_before_mood_std", "mean_satisfaction_after_mood_std", "satisfaction_recovery_std",  # Std versions
         ])
         # Also exclude any other keys with _raw or _std
         excluded_keys.update([k for k in aggregated_metrics.keys() 
@@ -339,7 +502,9 @@ def visualize(num_episodes, metrics, aggregated_metrics=None):
         # Filter out HBM-related metrics and empty metrics for standard visualization
         standard_metrics = {
             k: v for k, v in metrics.items() 
-                                if k not in ["phi_history", "theta_history", "mu_history", "mood_posterior_history", "last_episode_mood_evolution", "satisfaction_variances"]
+                                if k not in ["phi_history", "theta_history", "mu_history", "mood_posterior_history", 
+                                           "last_episode_mood_evolution", "satisfaction_variances",
+                                           "mean_satisfaction_before_mood", "mean_satisfaction_after_mood", "satisfaction_recovery"]  # Plotted separately
             and v is not None and len(v) > 0  # Only include non-empty metrics
         }
     
@@ -347,11 +512,35 @@ def visualize(num_episodes, metrics, aggregated_metrics=None):
     if "average_satisfactions" in standard_metrics:
         _plot_average_satisfaction(standard_metrics["average_satisfactions"], 
                                   metrics.get("moods", None))
+        # Also plot neutral episodes only
+        _plot_neutral_episodes_only(standard_metrics["average_satisfactions"], 
+                                   metrics.get("moods", None))
         # Remove satisfaction from other metrics
         other_metrics = {k: v for k, v in standard_metrics.items() 
                         if k != "average_satisfactions"}
     else:
         other_metrics = standard_metrics
+    
+    # Plot satisfaction before/after mood inference if available (combined plot)
+    if aggregated_metrics is not None:
+        before_mean = aggregated_metrics.get("mean_satisfaction_before_mood_mean")
+        after_mean = aggregated_metrics.get("mean_satisfaction_after_mood_mean")
+        recovery_mean = aggregated_metrics.get("satisfaction_recovery_mean")
+    else:
+        # For single seed, get from original metrics dict
+        before_mean = metrics.get("mean_satisfaction_before_mood")
+        after_mean = metrics.get("mean_satisfaction_after_mood")
+        recovery_mean = metrics.get("satisfaction_recovery")
+    
+    if before_mean is not None and after_mean is not None:
+        _plot_satisfaction_before_after_mood(before_mean, after_mean, recovery_mean)
+        # Remove these from other_metrics so they don't get plotted again
+        if "mean_satisfaction_before_mood" in other_metrics:
+            del other_metrics["mean_satisfaction_before_mood"]
+        if "mean_satisfaction_after_mood" in other_metrics:
+            del other_metrics["mean_satisfaction_after_mood"]
+        if "satisfaction_recovery" in other_metrics:
+            del other_metrics["satisfaction_recovery"]
     
     # Plot other metrics if any
     if len(other_metrics) > 0:
@@ -398,29 +587,24 @@ def visualize_hbm_evolution(metrics, recipe_name=None, spices=None, hidden_hbm=N
 def _plot_average_satisfaction(satisfactions, moods=None, satisfactions_std=None):
     """
     Plot average satisfaction with optional error bars (shaded regions).
+    Uses colored points to indicate mood instead of text labels.
     
     Args:
         satisfactions: List of satisfaction values or mean values
-        moods: Optional list of mood strings for annotation
+        moods: Optional list of mood strings for coloring points
         satisfactions_std: Optional list of std values for error bars/shaded regions
     """
     if not satisfactions or len(satisfactions) == 0:
         return
     
-    mood_symbols = {
-        "all_self": "A",
-        "neutral": "N",
-        "none_self": "X",
-    }
-    
     mood_colors = {
-        "all_self": "green",
-        "neutral": "gray",
-        "none_self": "red",
+        "all_self": "#2ecc71",      # Green
+        "neutral": "#95a5a6",       # Gray
+        "none_self": "#e74c3c",     # Red
     }
     
     # Create separate figure for satisfaction
-    fig, ax = plt.subplots(figsize=(10, 6))
+    fig, ax = plt.subplots(figsize=(12, 6))
     fig.patch.set_facecolor('white')
     
     # Use actual length of metric data
@@ -433,72 +617,421 @@ def _plot_average_satisfaction(satisfactions, moods=None, satisfactions_std=None
         # Replace NaNs with 0 so shaded region still renders when some seeds are shorter
         satisfactions_std = np.nan_to_num(np.array(satisfactions_std), nan=0.0)
     
-    # Plot with shaded error regions if std provided
-    if satisfactions_std is not None and len(satisfactions_std) == len(satisfactions):
-        # Plot mean line
-        ax.plot(x_vals, satisfactions, marker='o', linewidth=2, markersize=6, 
-               markerfacecolor='#3498db', markeredgecolor='white', markeredgewidth=1.5,
-               color='#3498db', alpha=0.85, label='Mean')
+    # Determine bin size based on number of episodes for better readability
+    # For < 100 episodes: show individual points
+    # For 100-300: bin size 10
+    # For 300-500: bin size 20
+    # For > 500: bin size 25
+    if actual_episodes < 100:
+        use_binning = False
+        bin_size = 1
+    elif actual_episodes < 300:
+        use_binning = True
+        bin_size = 10
+    elif actual_episodes < 500:
+        use_binning = True
+        bin_size = 20
+    else:
+        use_binning = True
+        bin_size = 20
+    
+    # Create figure with subplots if we have mood info and binning
+    if use_binning and moods is not None:
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 10), 
+                                       gridspec_kw={'height_ratios': [3, 1], 'hspace': 0.3})
+        fig.patch.set_facecolor('white')
+    else:
+        fig, ax1 = plt.subplots(figsize=(12, 6))
+        fig.patch.set_facecolor('white')
+        ax2 = None
+    
+    if use_binning:
+        # Bin the data
+        num_bins = (actual_episodes + bin_size - 1) // bin_size
+        bin_centers = []
+        bin_means = []
+        bin_stds = []
+        bin_mood_dist = []  # For mood distribution
+        
+        for i in range(num_bins):
+            start_idx = i * bin_size
+            end_idx = min((i + 1) * bin_size, actual_episodes)
+            bin_episodes = x_vals[start_idx:end_idx]
+            bin_sats = satisfactions[start_idx:end_idx]
+            
+            bin_center = (bin_episodes[0] + bin_episodes[-1]) / 2
+            bin_mean = np.nanmean(bin_sats)
+            bin_std = np.nanstd(bin_sats) if len(bin_sats) > 1 else 0.0
+            
+            # If we have std from multiple seeds, use that instead
+            if satisfactions_std is not None and len(satisfactions_std) == len(satisfactions):
+                bin_std = np.nanmean(satisfactions_std[start_idx:end_idx])
+            
+            bin_centers.append(bin_center)
+            bin_means.append(bin_mean)
+            bin_stds.append(bin_std)
+            
+            # Track mood distribution in this bin
+            if moods is not None:
+                bin_moods = moods[start_idx:end_idx]
+                mood_counts = {
+                    "all_self": sum(1 for m in bin_moods if m == "all_self"),
+                    "neutral": sum(1 for m in bin_moods if m == "neutral"),
+                    "none_self": sum(1 for m in bin_moods if m == "none_self"),
+                }
+                total = sum(mood_counts.values())
+                if total > 0:
+                    mood_dist = {k: v / total for k, v in mood_counts.items()}
+                else:
+                    mood_dist = {"all_self": 0, "neutral": 0, "none_self": 0}
+                bin_mood_dist.append(mood_dist)
+        
+        bin_centers = np.array(bin_centers)
+        bin_means = np.array(bin_means)
+        bin_stds = np.array(bin_stds)
+        
+        # Plot main satisfaction line with shaded error region
+        ax1.plot(bin_centers, bin_means, linewidth=2.5, 
+                color='#3498db', alpha=0.9, zorder=2, label='Mean Satisfaction', marker='o', markersize=6)
         
         # Add shaded error region
-        upper_bound = satisfactions + satisfactions_std
-        lower_bound = satisfactions - satisfactions_std
-        ax.fill_between(x_vals, lower_bound, upper_bound, alpha=0.2, color='#3498db', label='±1 std')
+        upper_bound = bin_means + bin_stds
+        lower_bound = bin_means - bin_stds
+        ax1.fill_between(bin_centers, lower_bound, upper_bound, alpha=0.2, 
+                        color='#3498db', zorder=1, label='±1 std')
+        
+        # If we have mood info, plot mood distribution below
+        if ax2 is not None and bin_mood_dist:
+            bin_width = bin_size * 0.8
+            bottom_all_self = np.zeros(num_bins)
+            bottom_neutral = np.array([bin_mood_dist[i]["all_self"] for i in range(num_bins)])
+            bottom_none_self = bottom_neutral + np.array([bin_mood_dist[i]["neutral"] for i in range(num_bins)])
+            
+            ax2.bar(bin_centers, [bin_mood_dist[i]["all_self"] for i in range(num_bins)], 
+                   width=bin_width, bottom=bottom_all_self, color=mood_colors["all_self"], 
+                   alpha=0.8, label='All-Self', edgecolor='white', linewidth=0.5)
+            ax2.bar(bin_centers, [bin_mood_dist[i]["neutral"] for i in range(num_bins)], 
+                   width=bin_width, bottom=bottom_neutral, color=mood_colors["neutral"], 
+                   alpha=0.8, label='Neutral', edgecolor='white', linewidth=0.5)
+            ax2.bar(bin_centers, [bin_mood_dist[i]["none_self"] for i in range(num_bins)], 
+                   width=bin_width, bottom=bottom_none_self, color=mood_colors["none_self"], 
+                   alpha=0.8, label='None-Self', edgecolor='white', linewidth=0.5)
+            
+            ax2.set_ylabel("Mood Fraction", fontsize=11, fontweight='bold')
+            ax2.set_xlabel("Episode (Binned)", fontsize=11, fontweight='bold')
+            ax2.set_ylim(0, 1)
+            ax2.set_yticks([0, 0.5, 1.0])
+            ax2.legend(loc='upper right', fontsize=9, frameon=True, fancybox=True, 
+                      shadow=True, framealpha=0.95, ncol=3)
+            ax2.grid(True, alpha=0.2, axis='y', zorder=0)
+            ax2.spines['top'].set_visible(False)
+            ax2.spines['right'].set_visible(False)
     else:
-        # Plot without error bars
-        ax.plot(x_vals, satisfactions, marker='o', linewidth=2, markersize=6, 
-           markerfacecolor='#3498db', markeredgecolor='white', markeredgewidth=1.5,
-           color='#3498db', alpha=0.85)
+        # Original plotting for fewer episodes
+        if satisfactions_std is not None and len(satisfactions_std) == len(satisfactions):
+            ax1.plot(x_vals, satisfactions, linewidth=2, 
+                   color='#bdc3c7', alpha=0.4, zorder=1, label='Mean')
+            upper_bound = satisfactions + satisfactions_std
+            lower_bound = satisfactions - satisfactions_std
+            ax1.fill_between(x_vals, lower_bound, upper_bound, alpha=0.15, 
+                            color='#bdc3c7', zorder=1)
+        else:
+            ax1.plot(x_vals, satisfactions, linewidth=2, 
+                   color='#bdc3c7', alpha=0.3, zorder=1)
+        
+        # Plot colored points based on mood
+        if moods is not None and len(moods) == len(satisfactions):
+            for mood in ["all_self", "neutral", "none_self"]:
+                mood_mask = np.array([m == mood for m in moods])
+                if np.any(mood_mask):
+                    mood_x = x_vals[mood_mask]
+                    mood_y = satisfactions[mood_mask]
+                    color = mood_colors.get(mood, "#95a5a6")
+                    ax1.scatter(mood_x, mood_y, s=80, c=color, alpha=0.8, 
+                              edgecolors='white', linewidths=1.5, zorder=2,
+                              label=mood.replace('_', ' ').title())
+        else:
+            ax1.scatter(x_vals, satisfactions, s=80, c='#3498db', alpha=0.8,
+                      edgecolors='white', linewidths=1.5, zorder=2)
     
-    # Annotate mood on satisfaction graph with better styling
-    if moods is not None and len(moods) == len(satisfactions):
-        for ep, (x, y, mood) in enumerate(zip(x_vals, satisfactions, moods)):
-            symbol = mood_symbols.get(mood, "?")
-            color = mood_colors.get(mood, "black")
-            ax.text(
-                x,
-                y + 0.03 + (satisfactions_std[ep] if satisfactions_std is not None and ep < len(satisfactions_std) else 0),
-                symbol,
-                color=color,
-                fontsize=11,
-                fontweight="bold",
-                ha="center",
-                va="bottom",
-                bbox=dict(boxstyle="round,pad=0.3", facecolor='white', 
-                         edgecolor=color, linewidth=1.5, alpha=0.8)
-            )
-
-        # Add legend for mood symbols - positioned at bottom right
-        legend_handles = [
-            plt.Line2D([0], [0], marker='s', color='w', markersize=8,
-                       label='All-Self (A)', markerfacecolor='green', 
-                       markeredgecolor='white', markeredgewidth=1),
-            plt.Line2D([0], [0], marker='s', color='w', markersize=8,
-                       label='Neutral (N)', markerfacecolor='gray',
-                       markeredgecolor='white', markeredgewidth=1),
-            plt.Line2D([0], [0], marker='s', color='w', markersize=8,
-                       label='None-Self (X)', markerfacecolor='red',
-                       markeredgecolor='white', markeredgewidth=1),
-        ]
-        ax.legend(handles=legend_handles, loc="lower right", fontsize=9,
-                 frameon=True, fancybox=True, shadow=True, framealpha=0.9)
-    
-    # Clean title and labels
-    title = "Average Satisfaction per Episode"
+    # Title and labels for main plot
+    title = f"Average Satisfaction per Episode"
+    if use_binning:
+        title += f" (Binned: {bin_size} episodes per bin)"
     if satisfactions_std is not None:
-        title += " (with Error Bars)"
+        title += " (Mean ± 1 std across seeds)"
+    ax1.set_title(title, fontsize=14, fontweight='bold', pad=15)
+    ax1.set_xlabel("Episode" + (" (Binned)" if use_binning else ""), fontsize=12, fontweight='bold')
+    ax1.set_ylabel("Average Satisfaction", fontsize=12, fontweight='bold')
+    
+    # Professional grid and styling
+    ax1.grid(True, alpha=0.2, linestyle='-', linewidth=0.5, color='gray', zorder=0)
+    ax1.set_ylim(-0.05, 1.05)
+    ax1.axhline(y=0.5, color='k', linestyle='--', linewidth=1, alpha=0.2, zorder=0)
+    ax1.spines['top'].set_visible(False)
+    ax1.spines['right'].set_visible(False)
+    ax1.spines['left'].set_linewidth(1.2)
+    ax1.spines['bottom'].set_linewidth(1.2)
+    
+    if not use_binning and moods is not None:
+        ax1.legend(loc="lower right", fontsize=10,
+                 frameon=True, fancybox=True, shadow=True, framealpha=0.95,
+                 title="Mood", title_fontsize=11)
+    elif use_binning:
+        ax1.legend(loc="lower right", fontsize=10,
+                 frameon=True, fancybox=True, shadow=True, framealpha=0.95)
+    
+    plt.tight_layout()
+    plt.show()
+
+
+def _plot_neutral_episodes_only(satisfactions, moods=None, satisfactions_std=None):
+    """
+    Plot average satisfaction for neutral episodes only.
+    
+    Args:
+        satisfactions: List of satisfaction values or mean values
+        moods: List of mood strings to filter neutral episodes
+        satisfactions_std: Optional list of std values for error bars
+    """
+    if not satisfactions or len(satisfactions) == 0:
+        return
+    
+    if moods is None or len(moods) != len(satisfactions):
+        logging.warning("Cannot filter neutral episodes: mood information not available")
+        return
+    
+    # Filter to neutral episodes only
+    neutral_mask = np.array([m == "neutral" for m in moods])
+    if not np.any(neutral_mask):
+        logging.warning("No neutral episodes found to plot")
+        return
+    
+    neutral_episodes = np.where(neutral_mask)[0] + 1  # Episode numbers (1-indexed)
+    neutral_satisfactions = np.array(satisfactions)[neutral_mask]
+    
+    if satisfactions_std is not None and len(satisfactions_std) == len(satisfactions):
+        neutral_std = np.array(satisfactions_std)[neutral_mask]
+        neutral_std = np.nan_to_num(neutral_std, nan=0.0)
+    else:
+        neutral_std = None
+    
+    # Create figure
+    fig, ax = plt.subplots(figsize=(12, 6))
+    fig.patch.set_facecolor('white')
+    
+    # Plot with error bars if available
+    if neutral_std is not None:
+        # Plot mean line
+        ax.plot(neutral_episodes, neutral_satisfactions, linewidth=2, 
+               color='#95a5a6', alpha=0.4, zorder=1, label='Mean')
+        
+        # Add shaded error region
+        upper_bound = neutral_satisfactions + neutral_std
+        lower_bound = neutral_satisfactions - neutral_std
+        ax.fill_between(neutral_episodes, lower_bound, upper_bound, alpha=0.2, 
+                        color='#95a5a6', zorder=1, label='±1 std')
+    else:
+        # Plot subtle connecting line
+        ax.plot(neutral_episodes, neutral_satisfactions, linewidth=1.5, 
+               color='#95a5a6', alpha=0.3, zorder=1)
+    
+    # Plot points
+    ax.scatter(neutral_episodes, neutral_satisfactions, s=100, c='#95a5a6', 
+              alpha=0.8, edgecolors='white', linewidths=2, zorder=2)
+    
+    # Title and labels
+    num_neutral = len(neutral_episodes)
+    total_episodes = len(satisfactions)
+    title = f"Average Satisfaction: Neutral Episodes Only\n({num_neutral} of {total_episodes} episodes)"
+    if neutral_std is not None:
+        title += " (Mean ± 1 std across seeds)"
     ax.set_title(title, fontsize=14, fontweight='bold', pad=15)
-    ax.set_xlabel("Episode", fontsize=12, fontweight='bold')
+    ax.set_xlabel("Episode Number", fontsize=12, fontweight='bold')
     ax.set_ylabel("Average Satisfaction", fontsize=12, fontweight='bold')
     
     # Professional grid and styling
-    ax.grid(True, alpha=0.25, linestyle='-', linewidth=0.5, color='gray')
-    ax.set_ylim(-0.05, 1.05)  # Ensure full range is visible
-    ax.axhline(y=0.5, color='k', linestyle='--', linewidth=1, alpha=0.3)
+    ax.grid(True, alpha=0.2, linestyle='-', linewidth=0.5, color='gray', zorder=0)
+    ax.set_ylim(-0.05, 1.05)
+    ax.axhline(y=0.5, color='k', linestyle='--', linewidth=1, alpha=0.2, zorder=0)
     ax.spines['top'].set_visible(False)
     ax.spines['right'].set_visible(False)
     ax.spines['left'].set_linewidth(1.2)
     ax.spines['bottom'].set_linewidth(1.2)
+    
+    plt.tight_layout()
+    plt.show()
+
+
+def _plot_satisfaction_before_after_mood(before_satisfactions, after_satisfactions, 
+                                        recovery=None, episodes_with_mood=None):
+    """
+    Plot satisfaction before and after mood inference in a combined visualization.
+    Shows episodes where mood was correctly inferred and the improvement.
+    
+    Args:
+        before_satisfactions: List of mean satisfaction before mood inference (NaN for episodes without mood)
+        after_satisfactions: List of mean satisfaction after mood inference (NaN for episodes without mood)
+        recovery: Optional list of recovery values (after - before)
+        episodes_with_mood: Optional list of episode numbers where mood was inferred
+    """
+    if not before_satisfactions or not after_satisfactions:
+        return
+    
+    before_satisfactions = np.array(before_satisfactions)
+    after_satisfactions = np.array(after_satisfactions)
+    
+    # Filter to only episodes where mood was inferred (both values are not NaN)
+    valid_mask = ~(np.isnan(before_satisfactions) | np.isnan(after_satisfactions))
+    
+    if not np.any(valid_mask):
+        logging.warning("No episodes with mood inference data to plot")
+        return
+    
+    # Get valid episodes and values
+    if episodes_with_mood is not None:
+        valid_episodes = np.array(episodes_with_mood)[valid_mask]
+    else:
+        valid_episodes = np.where(valid_mask)[0] + 1  # Episode numbers (1-indexed)
+    
+    valid_before = before_satisfactions[valid_mask]
+    valid_after = after_satisfactions[valid_mask]
+    
+    if recovery is not None:
+        recovery = np.array(recovery)
+        valid_recovery = recovery[valid_mask]
+    else:
+        valid_recovery = valid_after - valid_before
+    
+    num_episodes_with_mood = len(valid_episodes)
+    
+    # Determine bin size based on number of episodes
+    if num_episodes_with_mood < 50:
+        use_binning = False
+        bin_size = 1
+    elif num_episodes_with_mood < 150:
+        use_binning = True
+        bin_size = 10
+    elif num_episodes_with_mood < 300:
+        use_binning = True
+        bin_size = 20
+    else:
+        use_binning = True
+        bin_size = 25
+    
+    # Create figure
+    fig, ax = plt.subplots(figsize=(14, 7))
+    fig.patch.set_facecolor('white')
+    
+    if use_binning:
+        # Bin the data
+        num_bins = (num_episodes_with_mood + bin_size - 1) // bin_size
+        bin_centers = []
+        bin_before_means = []
+        bin_after_means = []
+        bin_before_stds = []
+        bin_after_stds = []
+        
+        # Sort by episode number to ensure proper binning
+        sort_idx = np.argsort(valid_episodes)
+        sorted_episodes = valid_episodes[sort_idx]
+        sorted_before = valid_before[sort_idx]
+        sorted_after = valid_after[sort_idx]
+        
+        for i in range(num_bins):
+            start_idx = i * bin_size
+            end_idx = min((i + 1) * bin_size, num_episodes_with_mood)
+            
+            bin_episodes = sorted_episodes[start_idx:end_idx]
+            bin_before = sorted_before[start_idx:end_idx]
+            bin_after = sorted_after[start_idx:end_idx]
+            
+            bin_center = (bin_episodes[0] + bin_episodes[-1]) / 2
+            bin_before_mean = np.nanmean(bin_before)
+            bin_after_mean = np.nanmean(bin_after)
+            bin_before_std = np.nanstd(bin_before) if len(bin_before) > 1 else 0.0
+            bin_after_std = np.nanstd(bin_after) if len(bin_after) > 1 else 0.0
+            
+            bin_centers.append(bin_center)
+            bin_before_means.append(bin_before_mean)
+            bin_after_means.append(bin_after_mean)
+            bin_before_stds.append(bin_before_std)
+            bin_after_stds.append(bin_after_std)
+        
+        bin_centers = np.array(bin_centers)
+        bin_before_means = np.array(bin_before_means)
+        bin_after_means = np.array(bin_after_means)
+        bin_before_stds = np.array(bin_before_stds)
+        bin_after_stds = np.array(bin_after_stds)
+        
+        # Plot binned means with error bars
+        ax.plot(bin_centers, bin_before_means, marker='o', linewidth=2.5, markersize=8,
+               markerfacecolor='#e74c3c', markeredgecolor='white', markeredgewidth=2,
+               color='#e74c3c', alpha=0.9, label='Before Mood Inference', zorder=2)
+        
+        ax.plot(bin_centers, bin_after_means, marker='s', linewidth=2.5, markersize=8,
+               markerfacecolor='#2ecc71', markeredgecolor='white', markeredgewidth=2,
+               color='#2ecc71', alpha=0.9, label='After Mood Inference', zorder=2)
+        
+        # Add shaded error regions
+        ax.fill_between(bin_centers, bin_before_means - bin_before_stds, 
+                       bin_before_means + bin_before_stds, 
+                       alpha=0.15, color='#e74c3c', zorder=1)
+        ax.fill_between(bin_centers, bin_after_means - bin_after_stds, 
+                       bin_after_means + bin_after_stds, 
+                       alpha=0.15, color='#2ecc71', zorder=1)
+        
+        xlabel = f"Episode Number (Binned: {bin_size} episodes per bin)"
+    else:
+        # Plot individual points for fewer episodes
+        ax.plot(valid_episodes, valid_before, marker='o', linewidth=2.5, markersize=10,
+               markerfacecolor='#e74c3c', markeredgecolor='white', markeredgewidth=2,
+               color='#e74c3c', alpha=0.8, label='Before Mood Inference', zorder=2)
+        
+        ax.plot(valid_episodes, valid_after, marker='s', linewidth=2.5, markersize=10,
+               markerfacecolor='#2ecc71', markeredgecolor='white', markeredgewidth=2,
+               color='#2ecc71', alpha=0.8, label='After Mood Inference', zorder=2)
+        
+        xlabel = "Episode Number"
+    
+    # Title and labels
+    title = f"Satisfaction Before vs After Mood Inference\n({num_episodes_with_mood} episodes with mood inference)"
+    if use_binning:
+        title += f" (Binned: {bin_size} episodes per bin)"
+    ax.set_title(title, fontsize=14, fontweight='bold', pad=15)
+    ax.set_xlabel(xlabel, fontsize=12, fontweight='bold')
+    ax.set_ylabel("Average Satisfaction", fontsize=12, fontweight='bold')
+    
+    # Add statistics text box
+    mean_before = np.mean(valid_before)
+    mean_after = np.mean(valid_after)
+    mean_recovery = np.mean(valid_recovery)
+    stats_text = f'Mean Before: {mean_before:.3f}\nMean After: {mean_after:.3f}\nMean Recovery: {mean_recovery:+.3f}'
+    ax.text(0.02, 0.98, stats_text, transform=ax.transAxes, fontsize=10,
+           verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', 
+                                            alpha=0.8, edgecolor='gray', linewidth=1))
+    
+    # Professional grid and styling
+    ax.grid(True, alpha=0.2, linestyle='-', linewidth=0.5, color='gray', zorder=0)
+    # Extend y-axis to show negative values clearly
+    y_min = min(np.nanmin(valid_before) if len(valid_before) > 0 and not np.all(np.isnan(valid_before)) else -1.0, 
+                np.nanmin(valid_after) if len(valid_after) > 0 and not np.all(np.isnan(valid_after)) else -1.0)
+    y_max = max(np.nanmax(valid_before) if len(valid_before) > 0 and not np.all(np.isnan(valid_before)) else 1.0, 
+                np.nanmax(valid_after) if len(valid_after) > 0 and not np.all(np.isnan(valid_after)) else 1.0)
+    # Add padding and ensure we show negative axis
+    y_range = max(y_max - y_min, 0.5)  # Minimum range
+    y_padding = 0.15 * y_range
+    ax.set_ylim(max(y_min - y_padding, -1.1), min(y_max + y_padding, 1.1))
+    ax.axhline(y=0.5, color='k', linestyle='--', linewidth=1, alpha=0.2, zorder=0)
+    ax.axhline(y=0, color='k', linestyle='-', linewidth=1.5, alpha=0.4, zorder=0, label='Zero satisfaction')
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.spines['left'].set_linewidth(1.2)
+    ax.spines['bottom'].set_linewidth(1.2)
+    
+    # Legend
+    ax.legend(loc="lower right", fontsize=11, frameon=True, fancybox=True, 
+             shadow=True, framealpha=0.95)
     
     plt.tight_layout()
     plt.show()
@@ -552,13 +1085,75 @@ def _plot_standard_metrics(axes, num_episodes, metrics):
             cumulative_correct = np.cumsum([1 if m else 0 for m in metric])
             cumulative_pct = 100.0 * cumulative_correct / np.arange(1, len(metric) + 1)
             
-            ax.plot(x_vals, percentages, marker='o', linewidth=2, markersize=4, alpha=0.7, 
-                   label='Per Episode', color='#3498db')
-            ax.plot(x_vals, cumulative_pct, marker='s', linewidth=2, markersize=4, alpha=0.7,
-                   label='Cumulative %', color='#2ecc71', linestyle='--')
-            ax.set_title("Mood Correctly Inferred per Episode", 
-                        fontsize=12, fontweight='bold', pad=10)
-            ax.set_xlabel("Episode", fontsize=11, fontweight='bold')
+            # Determine bin size based on number of episodes
+            if actual_episodes < 100:
+                use_binning = False
+                bin_size = 1
+            elif actual_episodes < 300:
+                use_binning = True
+                bin_size = 10
+            elif actual_episodes < 500:
+                use_binning = True
+                bin_size = 20
+            else:
+                use_binning = True
+                bin_size = 25
+            
+            if use_binning:
+                # Bin the data
+                num_bins = (actual_episodes + bin_size - 1) // bin_size
+                bin_centers = []
+                bin_percentages_means = []
+                bin_percentages_stds = []
+                bin_cumulative_means = []
+                
+                for i in range(num_bins):
+                    start_idx = i * bin_size
+                    end_idx = min((i + 1) * bin_size, actual_episodes)
+                    
+                    bin_percentages = percentages[start_idx:end_idx]
+                    bin_cumulative = cumulative_pct[start_idx:end_idx]
+                    
+                    bin_center = (x_vals[start_idx] + x_vals[end_idx - 1]) / 2
+                    bin_percentages_mean = np.nanmean(bin_percentages)
+                    bin_percentages_std = np.nanstd(bin_percentages) if len(bin_percentages) > 1 else 0.0
+                    bin_cumulative_mean = np.nanmean(bin_cumulative)
+                    
+                    bin_centers.append(bin_center)
+                    bin_percentages_means.append(bin_percentages_mean)
+                    bin_percentages_stds.append(bin_percentages_std)
+                    bin_cumulative_means.append(bin_cumulative_mean)
+                
+                bin_centers = np.array(bin_centers)
+                bin_percentages_means = np.array(bin_percentages_means)
+                bin_percentages_stds = np.array(bin_percentages_stds)
+                bin_cumulative_means = np.array(bin_cumulative_means)
+                
+                # Plot binned per-episode percentages with error bars
+                ax.plot(bin_centers, bin_percentages_means, marker='o', linewidth=2.5, markersize=6,
+                       label='Per Episode (Binned)', color='#3498db', alpha=0.9, zorder=2)
+                ax.fill_between(bin_centers, bin_percentages_means - bin_percentages_stds,
+                               bin_percentages_means + bin_percentages_stds,
+                               alpha=0.15, color='#3498db', zorder=1)
+                
+                # Plot binned cumulative percentage
+                ax.plot(bin_centers, bin_cumulative_means, marker='s', linewidth=2.5, markersize=6,
+                       label='Cumulative % (Binned)', color='#2ecc71', linestyle='--', alpha=0.9, zorder=2)
+                
+                xlabel = f"Episode (Binned: {bin_size} episodes per bin)"
+            else:
+                # Original plotting for fewer episodes
+                ax.plot(x_vals, percentages, marker='o', linewidth=2, markersize=4, alpha=0.7, 
+                       label='Per Episode', color='#3498db')
+                ax.plot(x_vals, cumulative_pct, marker='s', linewidth=2, markersize=4, alpha=0.7,
+                       label='Cumulative %', color='#2ecc71', linestyle='--')
+                xlabel = "Episode"
+            
+            title = "Mood Correctly Inferred per Episode"
+            if use_binning:
+                title += f" (Binned: {bin_size} episodes per bin)"
+            ax.set_title(title, fontsize=12, fontweight='bold', pad=10)
+            ax.set_xlabel(xlabel, fontsize=11, fontweight='bold')
             ax.set_ylabel("Percentage (%)", fontsize=11, fontweight='bold')
             ax.set_ylim(-5, 105)
             ax.axhline(y=0, color='k', linestyle='-', linewidth=0.5, alpha=0.3)
@@ -572,19 +1167,102 @@ def _plot_standard_metrics(axes, num_episodes, metrics):
             # Filter out -1 values for plotting (but show them differently)
             valid_steps = [s if s >= 0 else np.nan for s in metric]
             
-            ax.plot(x_vals, valid_steps, marker='o', linewidth=2, markersize=5, alpha=0.7, color='#e74c3c')
-            # Mark episodes where mood was never correctly inferred
-            never_inferred = [i+1 for i, s in enumerate(metric) if s < 0]
-            if never_inferred:
-                ax.scatter(never_inferred, [0] * len(never_inferred), marker='x', 
-                          s=100, color='red', alpha=0.7, label='Never inferred', zorder=5)
-            ax.set_title("Steps to Correct Mood Inference per Episode", 
-                        fontsize=12, fontweight='bold', pad=10)
-            ax.set_xlabel("Episode", fontsize=11, fontweight='bold')
+            # Determine bin size based on number of episodes
+            if actual_episodes < 100:
+                use_binning = False
+                bin_size = 1
+            elif actual_episodes < 300:
+                use_binning = True
+                bin_size = 10
+            elif actual_episodes < 500:
+                use_binning = True
+                bin_size = 20
+            else:
+                use_binning = True
+                bin_size = 25
+            
+            if use_binning:
+                # Bin the data
+                num_bins = (actual_episodes + bin_size - 1) // bin_size
+                bin_centers = []
+                bin_steps_means = []
+                bin_steps_stds = []
+                bin_never_inferred_counts = []  # Count of never-inferred episodes per bin
+                
+                for i in range(num_bins):
+                    start_idx = i * bin_size
+                    end_idx = min((i + 1) * bin_size, actual_episodes)
+                    
+                    bin_steps = valid_steps[start_idx:end_idx]
+                    bin_never_inferred = sum(1 for s in metric[start_idx:end_idx] if s < 0)
+                    
+                    bin_center = (x_vals[start_idx] + x_vals[end_idx - 1]) / 2
+                    # Only compute mean/std for valid (non-NaN) values
+                    valid_bin_steps = [s for s in bin_steps if not np.isnan(s)]
+                    if valid_bin_steps:
+                        bin_steps_mean = np.mean(valid_bin_steps)
+                        bin_steps_std = np.std(valid_bin_steps) if len(valid_bin_steps) > 1 else 0.0
+                    else:
+                        bin_steps_mean = np.nan
+                        bin_steps_std = 0.0
+                    
+                    bin_centers.append(bin_center)
+                    bin_steps_means.append(bin_steps_mean)
+                    bin_steps_stds.append(bin_steps_std)
+                    bin_never_inferred_counts.append(bin_never_inferred)
+                
+                bin_centers = np.array(bin_centers)
+                bin_steps_means = np.array(bin_steps_means)
+                bin_steps_stds = np.array(bin_steps_stds)
+                
+                # Plot binned means with error bars - enhanced styling
+                valid_bin_mask = ~np.isnan(bin_steps_means)
+                if np.any(valid_bin_mask):
+                    ax.plot(bin_centers[valid_bin_mask], bin_steps_means[valid_bin_mask], 
+                           marker='o', linewidth=2.8, markersize=8, 
+                           markerfacecolor='#e74c3c', markeredgecolor='white', markeredgewidth=2,
+                           color='#e74c3c', alpha=0.95, zorder=2, 
+                           label='Mean Steps to Correct (Binned)')
+                    ax.fill_between(bin_centers[valid_bin_mask], 
+                                   bin_steps_means[valid_bin_mask] - bin_steps_stds[valid_bin_mask],
+                                   bin_steps_means[valid_bin_mask] + bin_steps_stds[valid_bin_mask],
+                                   alpha=0.2, color='#e74c3c', zorder=1, label='±1 std')
+                
+                # Mark bins with never-inferred episodes - enhanced styling
+                never_inferred_bins = [i for i, count in enumerate(bin_never_inferred_counts) if count > 0]
+                if never_inferred_bins:
+                    never_inferred_centers = bin_centers[never_inferred_bins]
+                    never_inferred_counts = [bin_never_inferred_counts[i] for i in never_inferred_bins]
+                    # Scale marker size by count
+                    marker_sizes = [60 + count * 15 for count in never_inferred_counts]
+                    ax.scatter(never_inferred_centers, [0] * len(never_inferred_centers), 
+                              marker='x', s=marker_sizes, color='#c0392b', alpha=0.8, 
+                              linewidths=2.5, label=f'Never Inferred (Binned)', zorder=5)
+                
+                xlabel = f"Episode (Binned: {bin_size} episodes per bin)"
+            else:
+                # Original plotting for fewer episodes
+                ax.plot(x_vals, valid_steps, marker='o', linewidth=2, markersize=5, alpha=0.7, color='#e74c3c')
+                # Mark episodes where mood was never correctly inferred
+                never_inferred = [i+1 for i, s in enumerate(metric) if s < 0]
+                if never_inferred:
+                    ax.scatter(never_inferred, [0] * len(never_inferred), marker='x', 
+                              s=100, color='red', alpha=0.7, label='Never inferred', zorder=5)
+                xlabel = "Episode"
+            
+            title = "Steps to Correct Mood Inference per Episode"
+            if use_binning:
+                title += f" (Binned: {bin_size} episodes per bin)"
+            ax.set_title(title, fontsize=12, fontweight='bold', pad=12)
+            ax.set_xlabel(xlabel, fontsize=11, fontweight='bold')
             ax.set_ylabel("Steps", fontsize=11, fontweight='bold')
-            if never_inferred:
-                ax.legend()
-                continue
+            ax.grid(True, alpha=0.25, linestyle='-', linewidth=0.5, color='gray', zorder=0)
+            ax.spines['top'].set_visible(False)
+            ax.spines['right'].set_visible(False)
+            ax.spines['left'].set_linewidth(1.2)
+            ax.spines['bottom'].set_linewidth(1.2)
+            ax.legend(fontsize=10, frameon=True, fancybox=True, shadow=True, framealpha=0.95)
+            continue
 
         # Normal plot (satisfaction is handled separately)
         # Use actual length of metric data, not num_episodes
@@ -1601,10 +2279,13 @@ def visualize_distribution_convergence(aggregated_metrics: dict, hidden_hbm, spi
     # Select a few key spices
     spices_to_plot = spices[:5]
     
-    fig, axes = plt.subplots(len(spices_to_plot), 1, figsize=(12, 3*len(spices_to_plot)))
+    fig, axes = plt.subplots(len(spices_to_plot), 1, figsize=(14, 3.5*len(spices_to_plot)))
     if len(spices_to_plot) == 1:
         axes = [axes]
     fig.patch.set_facecolor('white')
+    
+    # Use a beautiful color palette - going from light to dark (early to late episodes)
+    color_palette = plt.cm.plasma  # Beautiful purple-to-yellow gradient
     
     for spice_idx, spice in enumerate(spices_to_plot):
         ax = axes[spice_idx]
@@ -1615,8 +2296,17 @@ def visualize_distribution_convergence(aggregated_metrics: dict, hidden_hbm, spi
         true_theta = hidden_hbm.theta_mean[spice]
         spice_display = spice.replace("_", " ").title()
         
-        # Plot distribution at selected episodes
-        for ep_idx in selected_episodes:
+        # Calculate convergence error for each episode to show improvement
+        convergence_errors = []
+        for ep_idx in range(len(theta_mean_hist)):
+            if ep_idx < len(theta_mean_hist):
+                learned_mean = theta_mean_hist[ep_idx].get(spice, 0.0)
+                error = abs(learned_mean - true_theta)
+                convergence_errors.append(error)
+        
+        # Plot distribution at selected episodes with improved styling
+        max_ep = max(selected_episodes) if selected_episodes else 1
+        for idx, ep_idx in enumerate(selected_episodes):
             if ep_idx >= len(theta_mean_hist):
                 continue
                 
@@ -1627,43 +2317,66 @@ def visualize_distribution_convergence(aggregated_metrics: dict, hidden_hbm, spi
             else:
                 learned_std = 0.1  # Default small std for single seed
             
-            # Create x range zero-centered (for easier visualization)
-            x_range = max(abs(true_theta), abs(learned_mean)) + 3 * max(learned_std, 0.5)
-            x = np.linspace(-x_range, x_range, 200)
+            # Create x range with padding
+            x_range = max(abs(true_theta), abs(learned_mean)) + 4 * max(learned_std, 0.5)
+            x = np.linspace(-x_range, x_range, 300)  # Higher resolution for smoother curves
             
-            # Shift learned_mean relative to zero (for zero-centered plot)
-            learned_mean_shifted = learned_mean
+            # Plot as normal distribution approximation with proper normalization
+            y = np.exp(-0.5 * ((x - learned_mean) / (learned_std + 0.1))**2)
+            y = y / np.max(y) if np.max(y) > 0 else y  # Normalize to [0, 1]
             
-            # Plot as normal distribution approximation (centered at learned_mean_shifted)
-            y = np.exp(-0.5 * ((x - learned_mean_shifted) / (learned_std + 0.1))**2)
-            y = y / np.max(y) if np.max(y) > 0 else y  # Normalize
+            # Beautiful color gradient - darker/more saturated for later episodes
+            color_ratio = ep_idx / max_ep if max_ep > 0 else 0
+            color = color_palette(0.2 + 0.7 * color_ratio)  # Start at 0.2, go to 0.9
+            alpha = 0.4 + 0.5 * color_ratio  # More opaque for later episodes
+            linewidth = 1.5 + 1.5 * color_ratio  # Thicker lines for later episodes
             
-            # Color intensity based on episode (darker = later)
-            max_ep = max(selected_episodes) if selected_episodes else 1
-            alpha = 0.3 + 0.7 * (ep_idx / max_ep) if max_ep > 0 else 0.5
-            # Label all episodes in the legend
-            label = f'Ep {ep_idx}'
-            ax.plot(x, y, linewidth=2, alpha=alpha, 
-                   label=label, color=plt.cm.viridis(ep_idx / max_ep) if max_ep > 0 else 'blue')
+            # Label with episode number and error
+            error = convergence_errors[ep_idx] if ep_idx < len(convergence_errors) else 0
+            label = f'Ep {ep_idx} (err={error:.3f})'
+            
+            # Plot with filled area for better visual appeal
+            ax.fill_between(x, 0, y, alpha=0.15 * alpha, color=color, zorder=1)
+            ax.plot(x, y, linewidth=linewidth, alpha=alpha, 
+                   label=label, color=color, zorder=2)
         
-        # Mark true value with vertical line (zero-centered, so true_theta is at its actual value)
-        ax.axvline(x=true_theta, color='red', linestyle='--', linewidth=3, 
-                  label=f'True θ = {true_theta:.2f}', alpha=0.9, zorder=10)
-        # Also mark zero for reference
-        ax.axvline(x=0, color='gray', linestyle=':', linewidth=1, alpha=0.5, zorder=5)
+        # Mark true value with prominent vertical line
+        ax.axvline(x=true_theta, color='#e74c3c', linestyle='--', linewidth=3.5, 
+                  label=f'True θ = {true_theta:.3f}', alpha=0.95, zorder=10)
         
-        ax.set_title(f"{spice_display}: Distribution Shift Over Episodes", 
-                    fontsize=11, fontweight='bold')
-        ax.set_xlabel("θ Value", fontsize=10)
-        ax.set_ylabel("Density (normalized)", fontsize=10)
-        ax.legend(fontsize=8, loc='upper right')
-        ax.grid(True, alpha=0.2)
+        # Mark zero for reference with subtle line
+        ax.axvline(x=0, color='#95a5a6', linestyle=':', linewidth=1.5, alpha=0.4, zorder=5)
+        
+        # Add convergence arrow annotation (if we have multiple episodes)
+        if len(selected_episodes) > 1:
+            first_mean = theta_mean_hist[selected_episodes[0]].get(spice, 0.0)
+            last_mean = theta_mean_hist[selected_episodes[-1]].get(spice, 0.0)
+            if abs(first_mean - true_theta) > abs(last_mean - true_theta):
+                # Show improvement arrow
+                arrow_x = (first_mean + last_mean) / 2
+                arrow_y = 0.5
+                ax.annotate('', xy=(last_mean, arrow_y), xytext=(first_mean, arrow_y),
+                           arrowprops=dict(arrowstyle='->', lw=2.5, color='#27ae60', alpha=0.7),
+                           zorder=8)
+        
+        # Enhanced styling
+        ax.set_title(f"{spice_display}: Distribution Convergence Over Episodes", 
+                    fontsize=12, fontweight='bold', pad=12)
+        ax.set_xlabel("θ Value", fontsize=11, fontweight='bold')
+        ax.set_ylabel("Normalized Density", fontsize=11, fontweight='bold')
+        ax.legend(fontsize=9, loc='upper right', frameon=True, fancybox=True, 
+                 shadow=True, framealpha=0.95, ncol=1)
+        ax.grid(True, alpha=0.25, linestyle='-', linewidth=0.5, color='gray', zorder=0)
+        ax.set_ylim(-0.05, 1.1)
         ax.spines['top'].set_visible(False)
         ax.spines['right'].set_visible(False)
+        ax.spines['left'].set_linewidth(1.2)
+        ax.spines['bottom'].set_linewidth(1.2)
     
-        plt.suptitle("Distribution Convergence: Learned θ → True θ\n(Shows how learned distribution approaches target)\n(Zero-centered for easier visualization)", 
-                fontsize=14, fontweight='bold')
-    plt.tight_layout()
+    plt.suptitle("HBM Distribution Convergence: Learned θ → True θ\n" + 
+                "Shows how learned preference distributions approach ground truth over time", 
+                fontsize=15, fontweight='bold', y=0.995)
+    plt.tight_layout(rect=[0, 0, 1, 0.98])
     plt.show()
 
 def _aggregate_metrics_across_seeds(all_metrics: list[dict]) -> dict:
@@ -1839,6 +2552,9 @@ def _run_single_recipe_experiment(recipe_name: str, num_episodes: int, env_seed:
         "mood_posterior_history": [],
         "steps_to_correct_mood": [],
         "mood_correctly_inferred": [],
+        "mean_satisfaction_before_mood": [],
+        "mean_satisfaction_after_mood": [],
+        "satisfaction_recovery": [],
     }
 
     # Make environment and CSP generator
@@ -2202,6 +2918,19 @@ def test_spices_csp_multiple_recipes(num_episodes: int = PARAMETERS["num_episode
     logging.info(f"Test spices ({len(test_spices)}): {test_spices}")
     logging.info(f"All spices ({len(all_spices)}): {all_spices}")
     
+    # Create hidden HBM if requested (for cross-recipe accuracy computation)
+    hidden_hbm = None
+    if PARAMETERS["use_hidden_hbm"]:
+        # Collect all spices from all recipes
+        all_spices_set = set()
+        for recipe_name in all_recipes:
+            recipe = get_recipe(recipe_name)
+            all_spices_set.update(recipe.spices)
+        all_spices_list = sorted(list(all_spices_set))
+        
+        config_name = PARAMETERS.get("hidden_hbm_config_name", "SpiceSpecificHuman")
+        hidden_hbm = _create_hidden_hbm(all_spices_list, all_recipes, config_name=config_name)
+    
     # Create generator with all spices (needed for test recipes)
     generator = SpicesAssignCSPGenerator(
         spice_list=all_spices,
@@ -2252,7 +2981,7 @@ def test_spices_csp_multiple_recipes(num_episodes: int = PARAMETERS["num_episode
         logging.info(f"{'='*60}")
         
         for recipe_name in train_recipes:
-            env = _make_env(seed=env_seed, name=recipe_name)
+            env = _make_env(seed=env_seed, name=recipe_name, hidden_hbm=hidden_hbm)
             logging.info(f"\n[Train Epoch {epoch+1}] {recipe_name}")
             
             # Initialize recipe tracking on first epoch
@@ -2390,7 +3119,7 @@ def test_spices_csp_multiple_recipes(num_episodes: int = PARAMETERS["num_episode
     }
     
     for recipe_name in test_recipes:
-        env = _make_env(seed=env_seed, name=recipe_name)
+        env = _make_env(seed=env_seed, name=recipe_name, hidden_hbm=hidden_hbm)
         logging.info(f"\n[Test] {recipe_name}")
         
         recipe_sats = []
@@ -2442,6 +3171,22 @@ def test_spices_csp_multiple_recipes(num_episodes: int = PARAMETERS["num_episode
         test_results["mood_accuracy"][recipe_name] = recipe_mood_accuracy
         env.close()
     
+    # Store training vs test performance metrics
+    test_results["training_vs_test_performance"] = {
+        "mean_train_satisfaction": mean_train_sat,
+        "mean_test_satisfaction": mean_test_sat,
+        "train_satisfactions_by_recipe": {k: np.mean(v) for k, v in train_results["satisfactions"].items()},
+        "test_satisfactions_by_recipe": {k: np.mean(v) for k, v in test_results["satisfactions"].items()},
+        "transfer_ratio": mean_test_sat / mean_train_sat if mean_train_sat > 0 else np.nan,
+    }
+    
+    # Compute cross-recipe preference accuracy (using θ/μ priors)
+    cross_recipe_accuracy = {}
+    if PARAMETERS["use_hidden_hbm"] and hidden_hbm is not None:
+        cross_recipe_accuracy = _compute_cross_recipe_preference_accuracy(
+            generator, test_recipes, hidden_hbm
+        )
+    
     # Test summary
     logging.info(f"\n{'='*60}")
     logging.info(f"[Test Summary]")
@@ -2464,12 +3209,20 @@ def test_spices_csp_multiple_recipes(num_episodes: int = PARAMETERS["num_episode
             f"mood_acc={recipe_acc:.3f}"
         )
     
+    # Compute cross-recipe preference accuracy if hidden HBM is available
+    # We need to get hidden_hbm from the profile or pass it through
+    # For now, add placeholder - will need to be passed as parameter
+    test_results["cross_recipe_preference_accuracy"] = cross_recipe_accuracy
+    
     logging.info(f"\n{'='*60}")
     logging.info(f"[Cross-Recipe Transfer Summary]")
     logging.info(f"Train satisfaction: {mean_train_sat:.3f}")
     logging.info(f"Test satisfaction:  {mean_test_sat:.3f}")
     logging.info(f"Transfer ratio:     {mean_test_sat/mean_train_sat:.3f}" if mean_train_sat > 0 else "N/A")
     logging.info(f"Mood inference accuracy: {mean_mood_accuracy:.3f}")
+    if cross_recipe_accuracy:
+        overall_acc = cross_recipe_accuracy.get("overall", np.nan)
+        logging.info(f"Cross-recipe preference accuracy: {overall_acc:.3f} ({100*overall_acc:.1f}%)")
     logging.info(f"{'='*60}")
     
     # Visualize HBM evolution for each training recipe (using existing visualization)

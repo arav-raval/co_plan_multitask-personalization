@@ -18,6 +18,7 @@ from multitask_personalization.csp_generation import (
 
 from multitask_personalization.envs.spices.spices_env import SpiceAction, SpiceState
 from multitask_personalization.envs.spices.spices_hbm import HierarchicalPreferenceModel
+from multitask_personalization.envs.spices.spices_config import DEFAULT_CONFIG, SpicesConfig
 
 from multitask_personalization.structs import (
     CSP,
@@ -76,10 +77,14 @@ class _AssignPreferenceGenerator(CSPConstraintGenerator[SpiceState, SpiceAction]
         neutral_confidence_threshold: float = 0.5, # only learn spice preferences when P(neutral) > threshold
         use_hbm: bool = True,  # Use HBM for continuous learning
         seed: int = 0, 
-        verbose: bool = False) -> None:
+        verbose: bool = False,
+        config: SpicesConfig | None = None) -> None:
         super().__init__(seed)
         self._spice_to_index = {spice: i for i, spice in enumerate(spice_list)}
         self._actor_to_index = {actor: i for i, actor in enumerate(["human", "robot"])}
+        
+        # Load configuration
+        self.config = config if config is not None else DEFAULT_CONFIG
 
         # HBM for continuous preference learning
         self._use_hbm = use_hbm
@@ -97,32 +102,27 @@ class _AssignPreferenceGenerator(CSPConstraintGenerator[SpiceState, SpiceAction]
                 spices=spice_list,
                 recipes=self._recipe_list,
                 base_satisfaction_bias=base_satisfaction_bias,
-                mu0=0.0,
-                sigma0=1.0,
-                sigma_h=1.0,
-                sigma_r=1.0,
-                sigma_obs=1.0,
+                mu0=self.config.hbm.mu0,
+                sigma0=self.config.hbm.sigma0,
+                sigma_h=self.config.hbm.sigma_h,
+                sigma_r=self.config.hbm.sigma_r,
+                sigma_obs=self.config.hbm.sigma_obs,
+                config=self.config,
             )
             # Sync HBM mood posterior with our mood inference
-            self._hbm.mood_posterior = np.array([0.05, 0.9, 0.05], dtype=float)
+            self._hbm.mood_posterior = np.array(self.config.mood_prior_array, dtype=float).copy()
         else:
             self._hbm = None
 
         # Mood bias
         self._base_satisfaction_bias = base_satisfaction_bias
-        self._mood_bias_strength = base_satisfaction_bias * 2.0
+        self._mood_bias_strength = self.config.mood_bias_strength
         self._neutral_confidence_threshold = neutral_confidence_threshold
 
-        self._mood_bias = {
-            "all_self":   {"human": +self._mood_bias_strength, "robot": -self._mood_bias_strength},
-            "neutral":    {"human": 0.0,  "robot": 0.0},
-            "none_self":  {"human": -self._mood_bias_strength, "robot": +self._mood_bias_strength},
-        }
+        self._mood_bias = self.config.get_mood_bias()
 
         # Mood inference state (per episode)
-        # Stronger prior for neutral to require more evidence to switch
-        # STRONGER bias towards neutral to prevent wild swings
-        self._mood_prior = np.array([0.05, 0.90, 0.05], dtype=float) # strong bias towards neutral mood
+        self._mood_prior = np.array(self.config.mood_prior_array, dtype=float)
         self._mood_posterior = self._mood_prior.copy()
 
         # Per-episode buffers for mood inference (still needed for our mood inference)
@@ -193,7 +193,7 @@ class _AssignPreferenceGenerator(CSPConstraintGenerator[SpiceState, SpiceAction]
         
         for m in MOODS:
             # Use stronger prior to prevent wild swings
-            prior_weight = 2.0  # Weight prior more heavily
+            prior_weight = self.config.mood.mood_prior_weight
             lp = np.log(self._mood_prior[MOODS.index(m)]) * prior_weight
             
             # Compute likelihood under this mood hypothesis
@@ -224,11 +224,13 @@ class _AssignPreferenceGenerator(CSPConstraintGenerator[SpiceState, SpiceAction]
                     if matches_preference:
                         # Satisfaction matches preference: could be mood OR preference
                         # Use mood bias but with some preference influence
-                        logit = mood_bias + sign_actor * phi_pref * 0.2  # preference has 20% weight
+                        pref_weight = self.config.mood.non_neutral_pref_weight_match
+                        logit = mood_bias + sign_actor * phi_pref * pref_weight
                     else:
                         # Satisfaction doesn't match preference: strong evidence for mood
                         # Mood bias dominates
-                        logit = mood_bias + sign_actor * phi_pref * 0.1  # preference has minimal weight
+                        pref_weight = self.config.mood.non_neutral_pref_weight_mismatch
+                        logit = mood_bias + sign_actor * phi_pref * pref_weight
                 
                 p = 1.0 / (1.0 + np.exp(-logit))
                 
@@ -240,9 +242,10 @@ class _AssignPreferenceGenerator(CSPConstraintGenerator[SpiceState, SpiceAction]
                 # CRITICAL FIX: Use Gaussian likelihood instead of Beta for stability
                 # Map expected probability p to expected satisfaction
                 sat_expected = 2.0 * p - 1.0
-                sigma_sat = 0.3  # Reasonable variance for satisfaction
+                sigma_sat = self.config.mood.satisfaction_sigma
                 log_lik = -0.5 * ((sat - sat_expected) / sigma_sat)**2
-                log_lik = np.clip(log_lik, -10.0, 0.0)  # Prevent extreme values
+                log_lik = np.clip(log_lik, self.config.mood.satisfaction_loglik_min,
+                                 self.config.mood.satisfaction_loglik_max)
                 lp += log_lik
             
             logps.append(lp)
@@ -254,8 +257,8 @@ class _AssignPreferenceGenerator(CSPConstraintGenerator[SpiceState, SpiceAction]
         ps /= ps.sum()
         
         # CRITICAL FIX: Smooth with previous posterior to prevent rapid swings
-        # Use exponential moving average with high retention (0.7 = keep 70% of old, 30% new)
-        smoothing_alpha = 0.3  # Only 30% new info per update
+        # Use exponential moving average with high retention
+        smoothing_alpha = self.config.mood.mood_smoothing_alpha
         ps = smoothing_alpha * ps + (1 - smoothing_alpha) * self._mood_posterior
         ps /= ps.sum()  # Renormalize
         
@@ -396,7 +399,8 @@ class _AssignPreferenceGenerator(CSPConstraintGenerator[SpiceState, SpiceAction]
             most_likely_mood, most_likely_conf = self.get_most_likely_mood()
             is_neutral_most_likely = (most_likely_mood == "neutral")
             is_above_threshold = (neutral_conf >= self._neutral_confidence_threshold)
-            should_learn = (is_neutral_most_likely or is_above_threshold) and neutral_conf >= 0.3
+            legacy_threshold = self.config.update.legacy_learning_threshold
+            should_learn = (is_neutral_most_likely or is_above_threshold) and neutral_conf >= legacy_threshold
             
             if should_learn:
                 if hasattr(self, '_episode_features') and hasattr(self, '_episode_labels'):
@@ -493,7 +497,7 @@ class _AssignPreferenceGenerator(CSPConstraintGenerator[SpiceState, SpiceAction]
 class SpicesAssignCSPGenerator(CSPGenerator[SpiceState, SpiceAction]):
     """CSP: choose the actor for the environment's current spice; learn the preferences"""
 
-    def __init__(self, spice_list: list[str], recipe_list: list[str] | None = None, base_satisfaction_bias: float = 3.0, neutral_confidence_threshold: float = 0.75, use_hbm: bool = True, verbose: bool = False, **kwargs) -> None:
+    def __init__(self, spice_list: list[str], recipe_list: list[str] | None = None, base_satisfaction_bias: float = 3.0, neutral_confidence_threshold: float = 0.75, use_hbm: bool = True, verbose: bool = False, config: SpicesConfig | None = None, **kwargs) -> None:
         super().__init__(**kwargs)
         self._spices = list(spice_list)
         self._pref_gen = _AssignPreferenceGenerator(
@@ -503,7 +507,8 @@ class SpicesAssignCSPGenerator(CSPGenerator[SpiceState, SpiceAction]):
             neutral_confidence_threshold=neutral_confidence_threshold,
             use_hbm=use_hbm,
             seed=self._seed, 
-            verbose=verbose
+            verbose=verbose,
+            config=config
         )
 
         # Separate RNG that won't be reset

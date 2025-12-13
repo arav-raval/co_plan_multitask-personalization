@@ -1818,6 +1818,85 @@ PERUVIAN_JAPANESE_FUSION = RecipeSpec(
     },
 )
 
+# 40-Step Comprehensive Recipe
+FORTY_STEP_FEAST = RecipeSpec(
+    name="FortyStepFeast",
+    spices=(
+        "salt", "pepper", "olive_oil", "butter", "onion", "garlic", "ginger",
+        "turmeric", "cumin", "coriander", "cardamom", "cinnamon", "clove",
+        "nutmeg", "paprika", "chili", "cayenne", "black_pepper", "white_pepper",
+        "bay_leaf", "thyme", "rosemary", "oregano", "basil", "parsley", "cilantro",
+        "mint", "lemongrass", "star_anise", "fennel", "mustard_seed", "fenugreek",
+        "curry_leaves", "tamarind", "tomato", "coconut", "yogurt", "honey",
+        "vinegar", "soy_sauce"
+    ),
+    predecessors={
+        # Base foundation (chain)
+        "salt": (),
+        "pepper": ("salt",),
+        "olive_oil": ("salt",),
+        "butter": ("olive_oil",),
+        
+        # Aromatic base branch
+        "onion": ("butter", "olive_oil"),
+        "garlic": ("onion",),
+        "ginger": ("onion",),
+        
+        # Core spice foundation
+        "turmeric": ("garlic", "ginger"),
+        "cumin": ("turmeric",),
+        "coriander": ("turmeric", "cumin"),
+        
+        # Warm spice branch
+        "cardamom": ("cumin",),
+        "cinnamon": ("cardamom",),
+        "clove": ("cinnamon",),
+        "nutmeg": ("clove",),
+        
+        # Heat and color branch
+        "paprika": ("coriander",),
+        "chili": ("paprika", "pepper"),
+        "cayenne": ("chili",),
+        "black_pepper": ("pepper", "chili"),
+        "white_pepper": ("black_pepper",),
+        
+        # Herbal branch 1
+        "bay_leaf": ("cinnamon", "cumin"),
+        "thyme": ("bay_leaf",),
+        "rosemary": ("thyme",),
+        "oregano": ("rosemary",),
+        
+        # Herbal branch 2
+        "basil": ("oregano", "onion"),
+        "parsley": ("basil",),
+        "cilantro": ("parsley", "coriander"),
+        "mint": ("cilantro", "basil"),
+        
+        # Aromatic herbs branch
+        "lemongrass": ("ginger", "mint"),
+        "star_anise": ("lemongrass", "cinnamon"),
+        "fennel": ("star_anise",),
+        
+        # Seed spices branch
+        "mustard_seed": ("fennel", "cumin"),
+        "fenugreek": ("mustard_seed",),
+        "curry_leaves": ("fenugreek", "lemongrass"),
+        
+        # Acidic and tangy branch
+        "tamarind": ("curry_leaves", "chili"),
+        "vinegar": ("tamarind",),
+        "soy_sauce": ("vinegar", "ginger"),
+        
+        # Base ingredients
+        "tomato": ("onion", "garlic", "coriander"),
+        "coconut": ("tomato", "turmeric"),
+        
+        # Finishing touches
+        "yogurt": ("coconut", "tomato", "bay_leaf"),
+        "honey": ("yogurt", "cinnamon", "paprika"),
+    },
+)
+
 # Profiles
 
 CHEF_A = ProfileSpec(
@@ -1927,6 +2006,7 @@ ALL_RECIPES = {
     "GermanSauerbraten": GERMAN_SAUERBRATEN,
     "NigerianJollof": NIGERIAN_Jollof,
     "PeruvianJapaneseFusion": PERUVIAN_JAPANESE_FUSION,
+    "FortyStepFeast": FORTY_STEP_FEAST,
 }
 
 def get_recipe(name: str) -> RecipeSpec:
