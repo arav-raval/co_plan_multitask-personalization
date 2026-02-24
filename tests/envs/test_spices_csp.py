@@ -14,13 +14,16 @@ from multitask_personalization.envs.spices.spices_env import (
 from recipe import get_recipe, get_profile
 from collections import Counter
 
-from multitask_personalization.envs.spices.spices_hbm import HierarchicalPreferenceModel
+from multitask_personalization.envs.spices.spices_hbm import (
+    HierarchicalPreferenceModel,
+    MultiHumanHierarchicalPreferenceModel,
+)
 from hidden_hbm_configs import get_hidden_hbm_config, create_theta_params_from_config, list_hidden_hbm_configs
 
 # ---------------- PARAMETER SETUP ----------------
 PARAMETERS = {
-    "num_episodes": 500,
-    "num_epochs": 5, 
+    "num_episodes": 50,
+    "num_epochs": 2, 
     "profile": "ChefA",
     "recipe_name": "FortyStepFeast",
     "env_seed": 123,
@@ -29,9 +32,9 @@ PARAMETERS = {
     "train_frac": 0.7,  # 70% train, 30% test for better split
     "verbose": True,
     "use_hbm": True,
-    "num_seeds": 5,  # Number of seeds to run for error bars
+    "num_seeds": 2,  # Number of seeds to run for error bars
     "use_hidden_hbm": True,  # Whether to use hidden HBM for generating preferences
-    "num_humans": 1,  # Number of different humans (hidden HBMs) to test
+    "num_humans": 3,  # Number of different humans (hidden HBMs) to test
     "hidden_hbm_config_name": "SpiceSpecificHuman",  # Name of hidden HBM config to use (see hidden_hbm_configs.py)
     "hidden_hbm_config_names": None,  # List of config names for multiple humans (if None, auto-generates)
 }
@@ -169,7 +172,14 @@ def _make_env(seed: int, name: str = PARAMETERS["recipe_name"], hidden_hbm: Hier
 
     return SpiceEnv(scene_spec, hidden_spec=hidden_spec, seed=seed, eval_mode=False, verbose=PARAMETERS["verbose"])
 
-def run_one_episode(env, generator, solver_seed=123, track_mood_evolution=True):
+def run_one_episode(
+    env,
+    generator,
+    solver_seed: int = 123,
+    track_mood_evolution: bool = True,
+    multi_human_hbm: MultiHumanHierarchicalPreferenceModel | None = None,
+    human_id: str | None = None,
+):
     """Run a full episode of a recipe and update the generator (training step).
     
     Args:
@@ -221,6 +231,32 @@ def run_one_episode(env, generator, solver_seed=123, track_mood_evolution=True):
 
         # Observe the transition
         generator.observe_transition(prev_obs, action, obs, done, info)
+
+        # Optional: feed observations into a shared multi-human HBM (analysis / evaluation only).
+        # This does not affect the CSP policy; it is used to study how a single HBM pools
+        # information across humans and recipes.
+        if (
+            multi_human_hbm is not None
+            and human_id is not None
+            and info.get("last_spice") is not None
+            and info.get("last_actor") is not None
+        ):
+            recipe_name = info.get("recipe_name")
+            spice = str(info["last_spice"])
+            actor = str(info["last_actor"])
+            satisfaction = float(info.get("satisfaction", 0.0))
+
+            # Map satisfaction + actor into a scalar pseudo-observation g.
+            # Positive g means "human should add this spice", negative means "robot should".
+            sign = 1.0 if actor == "human" else -1.0
+            g = sign * satisfaction * getattr(env, "_base_satisfaction_bias", 1.0)
+
+            try:
+                multi_human_hbm.update_phi(human_id, recipe_name, spice, g)
+            except (AssertionError, KeyError):
+                # If the spice / recipe / human is not registered in the shared HBM,
+                # skip the update rather than failing the episode.
+                pass
 
         # Get true mood (should be same throughout episode)
         if true_mood is None and "mood" in info:
@@ -328,6 +364,10 @@ def run_one_episode(env, generator, solver_seed=123, track_mood_evolution=True):
                 else:
                     confident_mood = "neutral"
     
+    # After the episode, update hierarchical levels for the shared multi-human HBM.
+    if multi_human_hbm is not None:
+        multi_human_hbm.update_theta_and_mu()
+
     if track_mood_evolution:
         info["mood_evolution"] = mood_evolution
     
@@ -429,133 +469,38 @@ def update_metrics(metrics, info, hbm_info):
 # --------------------------------------------------
 # Visualization utilities
 # --------------------------------------------------
-def plot_phi_evolution(phi_history, recipe_name):
-    plt.figure(figsize=(8,4))
-    for spice in phi_history[0].keys():
-        vals = [ph[spice] for ph in phi_history]
-        plt.plot(vals, "-o", label=spice, alpha=0.7)
-
-    plt.title(f"φ evolution for recipe={recipe_name}")
-    plt.xlabel("Episode")
-    plt.ylabel("φ_{r,s}")
-    plt.legend()
-    plt.grid(True)
-    plt.tight_layout()
-    plt.show()
-
 def visualize(num_episodes, metrics, aggregated_metrics=None):
     """
-    Visualize standard metrics (satisfactions, actor distributions, etc.).
-    Can handle both single-seed and multi-seed (aggregated) metrics.
-    
-    Args:
-        num_episodes: Number of episodes
-        metrics: Dictionary of standard metrics (satisfactions, moods, etc.) or aggregated metrics
-        aggregated_metrics: Optional aggregated metrics dict with _mean and _std keys
+    Minimal visualization: only plot average satisfaction over episodes.
+
+    - If aggregated_metrics is provided (multi-seed), use
+      average_satisfactions_mean +/- std and first seed's moods (if available).
+    - Otherwise, use metrics['average_satisfactions'] and metrics['moods'].
     """
-    # Check if this is aggregated metrics (has _mean keys)
-    if aggregated_metrics is None and any("_mean" in k for k in metrics.keys()):
-        aggregated_metrics = metrics
-        metrics = {}  # Clear metrics to use aggregated
-    
-    # Handle aggregated metrics (multi-seed)
+    # Multi-seed / aggregated case
     if aggregated_metrics is not None:
         satisfactions_mean = aggregated_metrics.get("average_satisfactions_mean")
         satisfactions_std = aggregated_metrics.get("average_satisfactions_std")
         moods_raw = aggregated_metrics.get("moods_raw")
-        # Use first seed's moods for annotation (if available)
         moods = moods_raw[0] if moods_raw and len(moods_raw) > 0 else None
-        
-        # Plot average satisfaction with error bars
+
         if satisfactions_mean is not None:
             _plot_average_satisfaction(satisfactions_mean, moods, satisfactions_std)
-            # Also plot neutral episodes only
-            _plot_neutral_episodes_only(satisfactions_mean, moods, satisfactions_std)
-        
-        # Filter out HBM-related metrics and empty metrics for standard visualization
-        # Exclude keys that are HBM-related or have _mean/_std/_raw suffixes (except average_satisfactions)
-        excluded_keys = set([
-            "phi_history", "theta_history", "mu_history", "mood_posterior_history",
-            "phi_history_mean", "theta_history_mean", "mu_history_mean",
-            "phi_history_std", "theta_history_std", "mu_history_std",
-            "moods_raw", "actor_distributions_raw", "last_episode_mood_evolution_raw",
-            "average_satisfactions_mean", "average_satisfactions_std", "average_satisfactions_raw",  # Already plotted above with error bars
-            "satisfaction_variances", "satisfaction_variances_mean", "satisfaction_variances_std", "satisfaction_variances_raw",  # Variance already shown in error bars
-            "mean_satisfaction_before_mood", "mean_satisfaction_after_mood", "satisfaction_recovery",  # Plotted separately in combined plot
-            "mean_satisfaction_before_mood_mean", "mean_satisfaction_after_mood_mean", "satisfaction_recovery_mean",  # Aggregated versions
-            "mean_satisfaction_before_mood_std", "mean_satisfaction_after_mood_std", "satisfaction_recovery_std",  # Std versions
-        ])
-        # Also exclude any other keys with _raw or _std
-        excluded_keys.update([k for k in aggregated_metrics.keys() 
-                             if (("_raw" in k or "_std" in k) and "average_satisfactions" not in k)])
-        
-        standard_metrics = {
-            k: v for k, v in aggregated_metrics.items() 
-            if k not in excluded_keys
-            and v is not None 
-            and (not isinstance(v, list) or len(v) > 0)
-        }
-        other_metrics = standard_metrics
-    else:
-        # Single seed metrics
+        else:
+            logging.warning("No average_satisfactions_mean found in aggregated_metrics")
+        return
 
-        # Filter out HBM-related metrics and empty metrics for standard visualization
-        standard_metrics = {
-            k: v for k, v in metrics.items() 
-                                if k not in ["phi_history", "theta_history", "mu_history", "mood_posterior_history", 
-                                           "last_episode_mood_evolution", "satisfaction_variances",
-                                           "mean_satisfaction_before_mood", "mean_satisfaction_after_mood", "satisfaction_recovery"]  # Plotted separately
-            and v is not None and len(v) > 0  # Only include non-empty metrics
-        }
-    
-    # Separate average satisfaction into its own figure
-    if "average_satisfactions" in standard_metrics:
-        _plot_average_satisfaction(standard_metrics["average_satisfactions"], 
-                                  metrics.get("moods", None))
-        # Also plot neutral episodes only
-        _plot_neutral_episodes_only(standard_metrics["average_satisfactions"], 
-                                   metrics.get("moods", None))
-        # Remove satisfaction from other metrics
-        other_metrics = {k: v for k, v in standard_metrics.items() 
-                        if k != "average_satisfactions"}
+    # Single-seed case
+    if metrics is None:
+        logging.warning("visualize called with no metrics")
+        return
+
+    satisfactions = metrics.get("average_satisfactions")
+    moods = metrics.get("moods")
+    if satisfactions is not None and len(satisfactions) > 0:
+        _plot_average_satisfaction(satisfactions, moods)
     else:
-        other_metrics = standard_metrics
-    
-    # Plot satisfaction before/after mood inference if available (combined plot)
-    if aggregated_metrics is not None:
-        before_mean = aggregated_metrics.get("mean_satisfaction_before_mood_mean")
-        after_mean = aggregated_metrics.get("mean_satisfaction_after_mood_mean")
-        recovery_mean = aggregated_metrics.get("satisfaction_recovery_mean")
-    else:
-        # For single seed, get from original metrics dict
-        before_mean = metrics.get("mean_satisfaction_before_mood")
-        after_mean = metrics.get("mean_satisfaction_after_mood")
-        recovery_mean = metrics.get("satisfaction_recovery")
-    
-    if before_mean is not None and after_mean is not None:
-        _plot_satisfaction_before_after_mood(before_mean, after_mean, recovery_mean)
-        # Remove these from other_metrics so they don't get plotted again
-        if "mean_satisfaction_before_mood" in other_metrics:
-            del other_metrics["mean_satisfaction_before_mood"]
-        if "mean_satisfaction_after_mood" in other_metrics:
-            del other_metrics["mean_satisfaction_after_mood"]
-        if "satisfaction_recovery" in other_metrics:
-            del other_metrics["satisfaction_recovery"]
-    
-    # Plot other metrics if any
-    if len(other_metrics) > 0:
-        num_other_plots = len(other_metrics)
-        fig, axes = plt.subplots(num_other_plots, 1, figsize=(10, 4 * num_other_plots))
-        fig.patch.set_facecolor('white')
-        if num_other_plots == 1:
-            axes = [axes]
-        
-        _plot_standard_metrics(axes, num_episodes, other_metrics)
-        plt.suptitle("Episode Metrics", fontsize=15, fontweight='bold', y=0.995)
-        plt.tight_layout(rect=[0, 0, 1, 0.98])
-        plt.show()
-    elif len(standard_metrics) == 0:
-        logging.warning("No standard metrics to visualize")
+        logging.warning("No average_satisfactions to visualize")
 
 
 def visualize_hbm_evolution(metrics, recipe_name=None, spices=None, hidden_hbm=None):
@@ -603,10 +548,6 @@ def _plot_average_satisfaction(satisfactions, moods=None, satisfactions_std=None
         "none_self": "#e74c3c",     # Red
     }
     
-    # Create separate figure for satisfaction
-    fig, ax = plt.subplots(figsize=(12, 6))
-    fig.patch.set_facecolor('white')
-    
     # Use actual length of metric data
     actual_episodes = len(satisfactions)
     x_vals = np.arange(1, actual_episodes + 1)
@@ -651,7 +592,8 @@ def _plot_average_satisfaction(satisfactions, moods=None, satisfactions_std=None
         bin_centers = []
         bin_means = []
         bin_stds = []
-        bin_mood_dist = []  # For mood distribution
+        bin_mood_dist = []  # For mood distribution (kept for backward-compatibility)
+        bin_neutral_means = []  # For neutral-only satisfaction
         
         for i in range(num_bins):
             start_idx = i * bin_size
@@ -685,10 +627,22 @@ def _plot_average_satisfaction(satisfactions, moods=None, satisfactions_std=None
                 else:
                     mood_dist = {"all_self": 0, "neutral": 0, "none_self": 0}
                 bin_mood_dist.append(mood_dist)
+                
+                # Compute neutral-only average satisfaction for this bin
+                neutral_indices = [j for j, m in enumerate(bin_moods) if m == "neutral"]
+                if neutral_indices:
+                    neutral_sats = [bin_sats[j] for j in neutral_indices]
+                    neutral_mean = np.nanmean(neutral_sats)
+                else:
+                    neutral_mean = np.nan
+                bin_neutral_means.append(neutral_mean)
+            else:
+                bin_neutral_means.append(np.nan)
         
         bin_centers = np.array(bin_centers)
         bin_means = np.array(bin_means)
         bin_stds = np.array(bin_stds)
+        bin_neutral_means = np.array(bin_neutral_means)
         
         # Plot main satisfaction line with shaded error region
         ax1.plot(bin_centers, bin_means, linewidth=2.5, 
@@ -700,32 +654,36 @@ def _plot_average_satisfaction(satisfactions, moods=None, satisfactions_std=None
         ax1.fill_between(bin_centers, lower_bound, upper_bound, alpha=0.2, 
                         color='#3498db', zorder=1, label='±1 std')
         
-        # If we have mood info, plot mood distribution below
-        if ax2 is not None and bin_mood_dist:
-            bin_width = bin_size * 0.8
-            bottom_all_self = np.zeros(num_bins)
-            bottom_neutral = np.array([bin_mood_dist[i]["all_self"] for i in range(num_bins)])
-            bottom_none_self = bottom_neutral + np.array([bin_mood_dist[i]["neutral"] for i in range(num_bins)])
-            
-            ax2.bar(bin_centers, [bin_mood_dist[i]["all_self"] for i in range(num_bins)], 
-                   width=bin_width, bottom=bottom_all_self, color=mood_colors["all_self"], 
-                   alpha=0.8, label='All-Self', edgecolor='white', linewidth=0.5)
-            ax2.bar(bin_centers, [bin_mood_dist[i]["neutral"] for i in range(num_bins)], 
-                   width=bin_width, bottom=bottom_neutral, color=mood_colors["neutral"], 
-                   alpha=0.8, label='Neutral', edgecolor='white', linewidth=0.5)
-            ax2.bar(bin_centers, [bin_mood_dist[i]["none_self"] for i in range(num_bins)], 
-                   width=bin_width, bottom=bottom_none_self, color=mood_colors["none_self"], 
-                   alpha=0.8, label='None-Self', edgecolor='white', linewidth=0.5)
-            
-            ax2.set_ylabel("Mood Fraction", fontsize=11, fontweight='bold')
-            ax2.set_xlabel("Episode (Binned)", fontsize=11, fontweight='bold')
-            ax2.set_ylim(0, 1)
-            ax2.set_yticks([0, 0.5, 1.0])
-            ax2.legend(loc='upper right', fontsize=9, frameon=True, fancybox=True, 
-                      shadow=True, framealpha=0.95, ncol=3)
-            ax2.grid(True, alpha=0.2, axis='y', zorder=0)
-            ax2.spines['top'].set_visible(False)
-            ax2.spines['right'].set_visible(False)
+        # If we have mood info, show neutral-only satisfaction in a subplot
+        if ax2 is not None:
+            # Only plot bins that actually have neutral episodes
+            valid_mask = ~np.isnan(bin_neutral_means)
+            if np.any(valid_mask):
+                ax2.plot(
+                    bin_centers[valid_mask],
+                    bin_neutral_means[valid_mask],
+                    marker="o",
+                    linewidth=2.0,
+                    markersize=6,
+                    color=mood_colors["neutral"],
+                    alpha=0.9,
+                    label="Neutral Episodes Only (Binned)",
+                )
+                ax2.set_title(
+                    "Neutral Episodes Only (Binned)",
+                    fontsize=12,
+                    fontweight="bold",
+                    pad=10,
+                )
+                ax2.set_ylabel("Neutral Avg. Sat.", fontsize=11, fontweight='bold')
+                ax2.set_xlabel("Episode (Binned)", fontsize=11, fontweight='bold')
+                ax2.set_ylim(-0.05, 1.05)
+                ax2.axhline(y=0.5, color='k', linestyle='--', linewidth=1, alpha=0.2, zorder=0)
+                ax2.legend(loc='lower right', fontsize=9, frameon=True, fancybox=True, 
+                          shadow=True, framealpha=0.95)
+                ax2.grid(True, alpha=0.2, axis='y', zorder=0)
+                ax2.spines['top'].set_visible(False)
+                ax2.spines['right'].set_visible(False)
     else:
         # Original plotting for fewer episodes
         if satisfactions_std is not None and len(satisfactions_std) == len(satisfactions):
@@ -786,81 +744,8 @@ def _plot_average_satisfaction(satisfactions, moods=None, satisfactions_std=None
 
 
 def _plot_neutral_episodes_only(satisfactions, moods=None, satisfactions_std=None):
-    """
-    Plot average satisfaction for neutral episodes only.
-    
-    Args:
-        satisfactions: List of satisfaction values or mean values
-        moods: List of mood strings to filter neutral episodes
-        satisfactions_std: Optional list of std values for error bars
-    """
-    if not satisfactions or len(satisfactions) == 0:
-        return
-    
-    if moods is None or len(moods) != len(satisfactions):
-        logging.warning("Cannot filter neutral episodes: mood information not available")
-        return
-    
-    # Filter to neutral episodes only
-    neutral_mask = np.array([m == "neutral" for m in moods])
-    if not np.any(neutral_mask):
-        logging.warning("No neutral episodes found to plot")
-        return
-    
-    neutral_episodes = np.where(neutral_mask)[0] + 1  # Episode numbers (1-indexed)
-    neutral_satisfactions = np.array(satisfactions)[neutral_mask]
-    
-    if satisfactions_std is not None and len(satisfactions_std) == len(satisfactions):
-        neutral_std = np.array(satisfactions_std)[neutral_mask]
-        neutral_std = np.nan_to_num(neutral_std, nan=0.0)
-    else:
-        neutral_std = None
-    
-    # Create figure
-    fig, ax = plt.subplots(figsize=(12, 6))
-    fig.patch.set_facecolor('white')
-    
-    # Plot with error bars if available
-    if neutral_std is not None:
-        # Plot mean line
-        ax.plot(neutral_episodes, neutral_satisfactions, linewidth=2, 
-               color='#95a5a6', alpha=0.4, zorder=1, label='Mean')
-        
-        # Add shaded error region
-        upper_bound = neutral_satisfactions + neutral_std
-        lower_bound = neutral_satisfactions - neutral_std
-        ax.fill_between(neutral_episodes, lower_bound, upper_bound, alpha=0.2, 
-                        color='#95a5a6', zorder=1, label='±1 std')
-    else:
-        # Plot subtle connecting line
-        ax.plot(neutral_episodes, neutral_satisfactions, linewidth=1.5, 
-               color='#95a5a6', alpha=0.3, zorder=1)
-    
-    # Plot points
-    ax.scatter(neutral_episodes, neutral_satisfactions, s=100, c='#95a5a6', 
-              alpha=0.8, edgecolors='white', linewidths=2, zorder=2)
-    
-    # Title and labels
-    num_neutral = len(neutral_episodes)
-    total_episodes = len(satisfactions)
-    title = f"Average Satisfaction: Neutral Episodes Only\n({num_neutral} of {total_episodes} episodes)"
-    if neutral_std is not None:
-        title += " (Mean ± 1 std across seeds)"
-    ax.set_title(title, fontsize=14, fontweight='bold', pad=15)
-    ax.set_xlabel("Episode Number", fontsize=12, fontweight='bold')
-    ax.set_ylabel("Average Satisfaction", fontsize=12, fontweight='bold')
-    
-    # Professional grid and styling
-    ax.grid(True, alpha=0.2, linestyle='-', linewidth=0.5, color='gray', zorder=0)
-    ax.set_ylim(-0.05, 1.05)
-    ax.axhline(y=0.5, color='k', linestyle='--', linewidth=1, alpha=0.2, zorder=0)
-    ax.spines['top'].set_visible(False)
-    ax.spines['right'].set_visible(False)
-    ax.spines['left'].set_linewidth(1.2)
-    ax.spines['bottom'].set_linewidth(1.2)
-    
-    plt.tight_layout()
-    plt.show()
+    """Deprecated: neutral-only satisfaction plotting removed (kept as stub)."""
+    return
 
 
 def _plot_satisfaction_before_after_mood(before_satisfactions, after_satisfactions, 
@@ -1075,193 +960,34 @@ def _plot_standard_metrics(axes, num_episodes, metrics):
             ax.legend()
             continue
         
-        # Special case: mood_correctly_inferred (boolean, show as percentage)
+        # Special case: mood_correctly_inferred (boolean) – no graph, just summary text
         if metric_name == "mood_correctly_inferred":
-            actual_episodes = len(metric)
-            x_vals = np.arange(1, actual_episodes + 1)
-            # Convert to percentage
-            percentages = [100.0 if m else 0.0 for m in metric]
-            # Also compute cumulative percentage
-            cumulative_correct = np.cumsum([1 if m else 0 for m in metric])
-            cumulative_pct = 100.0 * cumulative_correct / np.arange(1, len(metric) + 1)
-            
-            # Determine bin size based on number of episodes
-            if actual_episodes < 100:
-                use_binning = False
-                bin_size = 1
-            elif actual_episodes < 300:
-                use_binning = True
-                bin_size = 10
-            elif actual_episodes < 500:
-                use_binning = True
-                bin_size = 20
-            else:
-                use_binning = True
-                bin_size = 25
-            
-            if use_binning:
-                # Bin the data
-                num_bins = (actual_episodes + bin_size - 1) // bin_size
-                bin_centers = []
-                bin_percentages_means = []
-                bin_percentages_stds = []
-                bin_cumulative_means = []
-                
-                for i in range(num_bins):
-                    start_idx = i * bin_size
-                    end_idx = min((i + 1) * bin_size, actual_episodes)
-                    
-                    bin_percentages = percentages[start_idx:end_idx]
-                    bin_cumulative = cumulative_pct[start_idx:end_idx]
-                    
-                    bin_center = (x_vals[start_idx] + x_vals[end_idx - 1]) / 2
-                    bin_percentages_mean = np.nanmean(bin_percentages)
-                    bin_percentages_std = np.nanstd(bin_percentages) if len(bin_percentages) > 1 else 0.0
-                    bin_cumulative_mean = np.nanmean(bin_cumulative)
-                    
-                    bin_centers.append(bin_center)
-                    bin_percentages_means.append(bin_percentages_mean)
-                    bin_percentages_stds.append(bin_percentages_std)
-                    bin_cumulative_means.append(bin_cumulative_mean)
-                
-                bin_centers = np.array(bin_centers)
-                bin_percentages_means = np.array(bin_percentages_means)
-                bin_percentages_stds = np.array(bin_percentages_stds)
-                bin_cumulative_means = np.array(bin_cumulative_means)
-                
-                # Plot binned per-episode percentages with error bars
-                ax.plot(bin_centers, bin_percentages_means, marker='o', linewidth=2.5, markersize=6,
-                       label='Per Episode (Binned)', color='#3498db', alpha=0.9, zorder=2)
-                ax.fill_between(bin_centers, bin_percentages_means - bin_percentages_stds,
-                               bin_percentages_means + bin_percentages_stds,
-                               alpha=0.15, color='#3498db', zorder=1)
-                
-                # Plot binned cumulative percentage
-                ax.plot(bin_centers, bin_cumulative_means, marker='s', linewidth=2.5, markersize=6,
-                       label='Cumulative % (Binned)', color='#2ecc71', linestyle='--', alpha=0.9, zorder=2)
-                
-                xlabel = f"Episode (Binned: {bin_size} episodes per bin)"
-            else:
-                # Original plotting for fewer episodes
-                ax.plot(x_vals, percentages, marker='o', linewidth=2, markersize=4, alpha=0.7, 
-                       label='Per Episode', color='#3498db')
-                ax.plot(x_vals, cumulative_pct, marker='s', linewidth=2, markersize=4, alpha=0.7,
-                       label='Cumulative %', color='#2ecc71', linestyle='--')
-                xlabel = "Episode"
-            
-            title = "Mood Correctly Inferred per Episode"
-            if use_binning:
-                title += f" (Binned: {bin_size} episodes per bin)"
-            ax.set_title(title, fontsize=12, fontweight='bold', pad=10)
-            ax.set_xlabel(xlabel, fontsize=11, fontweight='bold')
-            ax.set_ylabel("Percentage (%)", fontsize=11, fontweight='bold')
-            ax.set_ylim(-5, 105)
-            ax.axhline(y=0, color='k', linestyle='-', linewidth=0.5, alpha=0.3)
-            ax.legend()
+            total = len(metric)
+            if total > 0:
+                correct = sum(1 for m in metric if m)
+                pct = 100.0 * correct / total
+                logging.info(
+                    f"Mood correctly inferred in {correct}/{total} episodes "
+                    f"({pct:.1f}%)."
+                )
             continue
         
-        # Special case: steps_to_correct_mood (handle -1 as "never inferred")
+        # Special case: steps_to_correct_mood – no graph, just summary text
         if metric_name == "steps_to_correct_mood":
-            actual_episodes = len(metric)
-            x_vals = np.arange(1, actual_episodes + 1)
-            # Filter out -1 values for plotting (but show them differently)
-            valid_steps = [s if s >= 0 else np.nan for s in metric]
-            
-            # Determine bin size based on number of episodes
-            if actual_episodes < 100:
-                use_binning = False
-                bin_size = 1
-            elif actual_episodes < 300:
-                use_binning = True
-                bin_size = 10
-            elif actual_episodes < 500:
-                use_binning = True
-                bin_size = 20
-            else:
-                use_binning = True
-                bin_size = 25
-            
-            if use_binning:
-                # Bin the data
-                num_bins = (actual_episodes + bin_size - 1) // bin_size
-                bin_centers = []
-                bin_steps_means = []
-                bin_steps_stds = []
-                bin_never_inferred_counts = []  # Count of never-inferred episodes per bin
-                
-                for i in range(num_bins):
-                    start_idx = i * bin_size
-                    end_idx = min((i + 1) * bin_size, actual_episodes)
-                    
-                    bin_steps = valid_steps[start_idx:end_idx]
-                    bin_never_inferred = sum(1 for s in metric[start_idx:end_idx] if s < 0)
-                    
-                    bin_center = (x_vals[start_idx] + x_vals[end_idx - 1]) / 2
-                    # Only compute mean/std for valid (non-NaN) values
-                    valid_bin_steps = [s for s in bin_steps if not np.isnan(s)]
-                    if valid_bin_steps:
-                        bin_steps_mean = np.mean(valid_bin_steps)
-                        bin_steps_std = np.std(valid_bin_steps) if len(valid_bin_steps) > 1 else 0.0
-                    else:
-                        bin_steps_mean = np.nan
-                        bin_steps_std = 0.0
-                    
-                    bin_centers.append(bin_center)
-                    bin_steps_means.append(bin_steps_mean)
-                    bin_steps_stds.append(bin_steps_std)
-                    bin_never_inferred_counts.append(bin_never_inferred)
-                
-                bin_centers = np.array(bin_centers)
-                bin_steps_means = np.array(bin_steps_means)
-                bin_steps_stds = np.array(bin_steps_stds)
-                
-                # Plot binned means with error bars - enhanced styling
-                valid_bin_mask = ~np.isnan(bin_steps_means)
-                if np.any(valid_bin_mask):
-                    ax.plot(bin_centers[valid_bin_mask], bin_steps_means[valid_bin_mask], 
-                           marker='o', linewidth=2.8, markersize=8, 
-                           markerfacecolor='#e74c3c', markeredgecolor='white', markeredgewidth=2,
-                           color='#e74c3c', alpha=0.95, zorder=2, 
-                           label='Mean Steps to Correct (Binned)')
-                    ax.fill_between(bin_centers[valid_bin_mask], 
-                                   bin_steps_means[valid_bin_mask] - bin_steps_stds[valid_bin_mask],
-                                   bin_steps_means[valid_bin_mask] + bin_steps_stds[valid_bin_mask],
-                                   alpha=0.2, color='#e74c3c', zorder=1, label='±1 std')
-                
-                # Mark bins with never-inferred episodes - enhanced styling
-                never_inferred_bins = [i for i, count in enumerate(bin_never_inferred_counts) if count > 0]
-                if never_inferred_bins:
-                    never_inferred_centers = bin_centers[never_inferred_bins]
-                    never_inferred_counts = [bin_never_inferred_counts[i] for i in never_inferred_bins]
-                    # Scale marker size by count
-                    marker_sizes = [60 + count * 15 for count in never_inferred_counts]
-                    ax.scatter(never_inferred_centers, [0] * len(never_inferred_centers), 
-                              marker='x', s=marker_sizes, color='#c0392b', alpha=0.8, 
-                              linewidths=2.5, label=f'Never Inferred (Binned)', zorder=5)
-                
-                xlabel = f"Episode (Binned: {bin_size} episodes per bin)"
-            else:
-                # Original plotting for fewer episodes
-                ax.plot(x_vals, valid_steps, marker='o', linewidth=2, markersize=5, alpha=0.7, color='#e74c3c')
-                # Mark episodes where mood was never correctly inferred
-                never_inferred = [i+1 for i, s in enumerate(metric) if s < 0]
-                if never_inferred:
-                    ax.scatter(never_inferred, [0] * len(never_inferred), marker='x', 
-                              s=100, color='red', alpha=0.7, label='Never inferred', zorder=5)
-                xlabel = "Episode"
-            
-            title = "Steps to Correct Mood Inference per Episode"
-            if use_binning:
-                title += f" (Binned: {bin_size} episodes per bin)"
-            ax.set_title(title, fontsize=12, fontweight='bold', pad=12)
-            ax.set_xlabel(xlabel, fontsize=11, fontweight='bold')
-            ax.set_ylabel("Steps", fontsize=11, fontweight='bold')
-            ax.grid(True, alpha=0.25, linestyle='-', linewidth=0.5, color='gray', zorder=0)
-            ax.spines['top'].set_visible(False)
-            ax.spines['right'].set_visible(False)
-            ax.spines['left'].set_linewidth(1.2)
-            ax.spines['bottom'].set_linewidth(1.2)
-            ax.legend(fontsize=10, frameon=True, fancybox=True, shadow=True, framealpha=0.95)
+            total = len(metric)
+            if total > 0:
+                # Episodes where we ever got a correct mood (steps >= 0)
+                valid_steps = [s for s in metric if s is not None and s >= 0]
+                never_inferred = sum(1 for s in metric if s is None or s < 0)
+                if valid_steps:
+                    mean_steps = float(np.mean(valid_steps))
+                    logging.info(
+                        f"Average steps_to_correct_mood over episodes with a correct inference: "
+                        f"{mean_steps:.2f} steps (based on {len(valid_steps)}/{total} episodes)."
+                    )
+                logging.info(
+                    f"Mood never correctly inferred in {never_inferred}/{total} episodes."
+                )
             continue
 
         # Normal plot (satisfaction is handled separately)
@@ -1462,218 +1188,7 @@ def _plot_hbm_evolution(hbm_metrics, recipe_name, spices, num_episodes, training
             logging.info(f"  Late episodes (avg): {late_phi:.3f}")
             logging.info(f"  Change: {late_phi - early_phi:+.3f}")
 
-def _plot_multirecipe_hbm_evolution_unused(hbm_metrics_by_recipe, train_recipes, num_episodes, num_epochs, all_spices):
-    """
-    Visualize HBM evolution across all training recipes showing generalization.
-    Shows how theta/mu generalize across recipes while phi stays recipe-specific.
-    """
-    if not hbm_metrics_by_recipe:
-        return
-    
-    # Find common spices across recipes
-    common_spices = []
-    for recipe_name in train_recipes:
-        if recipe_name in hbm_metrics_by_recipe:
-            recipe_spices = hbm_metrics_by_recipe[recipe_name]["spices"]
-            if not common_spices:
-                common_spices = list(recipe_spices)
-            else:
-                common_spices = [s for s in common_spices if s in recipe_spices]
-    
-    common_spices = sorted(common_spices)[:6]  # Limit to 6 for clarity
-    
-    # Aggregate data across all recipes
-    # For theta and mu: use first recipe's history (they're shared)
-    # For phi: collect from all recipes
-    first_recipe = train_recipes[0]
-    if first_recipe not in hbm_metrics_by_recipe:
-        return
-    
-    theta_history = hbm_metrics_by_recipe[first_recipe]["theta_history"]
-    mu_history = hbm_metrics_by_recipe[first_recipe]["mu_history"]
-    total_episodes = len(theta_history)
-    
-    # Calculate recipe boundaries (episodes per recipe per epoch)
-    episodes_per_recipe_per_epoch = num_episodes
-    recipe_boundaries = []
-    for epoch in range(num_epochs):
-        for i, recipe_name in enumerate(train_recipes):
-            episode_start = epoch * len(train_recipes) * num_episodes + i * num_episodes
-            episode_end = episode_start + num_episodes
-            recipe_boundaries.append((episode_start, episode_end, recipe_name, epoch))
-    
-    # Professional figure styling
-    fig = plt.figure(figsize=(18, 10))
-    fig.patch.set_facecolor('white')
-    
-    # Color palette for spices
-    spice_colors = plt.cm.tab10(np.linspace(0, 1, len(common_spices)))
-    
-    # Plot 1: Recipe-specific preferences (phi) - show divergence per recipe
-    ax1 = plt.subplot(2, 2, 1)
-    
-    for recipe_idx, recipe_name in enumerate(train_recipes):
-        if recipe_name not in hbm_metrics_by_recipe:
-            continue
-        metrics = hbm_metrics_by_recipe[recipe_name]
-        phi_history = metrics["phi_history"]
-        
-        # Find where this recipe appears in the timeline
-        recipe_episodes = []
-        recipe_phi_vals = {spice: [] for spice in common_spices}
-        
-        for start, end, r_name, epoch in recipe_boundaries:
-            if r_name == recipe_name:
-                for ep_idx in range(start, min(end, total_episodes)):
-                    if ep_idx < len(phi_history):
-                        recipe_episodes.append(ep_idx)
-                        for spice in common_spices:
-                            if spice in phi_history[ep_idx]:
-                                recipe_phi_vals[spice].append(phi_history[ep_idx][spice])
-                            else:
-                                recipe_phi_vals[spice].append(0.0)
-        
-        # Plot phi for each spice for this recipe
-        for spice_idx, spice in enumerate(common_spices):
-            if recipe_episodes and len(recipe_phi_vals[spice]) == len(recipe_episodes):
-                spice_display = spice.replace("_", " ").title()
-                label = f"{spice_display} ({recipe_name.replace('_', ' ').title()})" if recipe_idx == 0 else None
-                ax1.plot(recipe_episodes, recipe_phi_vals[spice], "-o", 
-                        label=label, color=spice_colors[spice_idx], 
-                        linewidth=1.5, markersize=3, alpha=0.6,
-                        linestyle='-' if recipe_idx == 0 else '--')
-    
-    # Add recipe transition markers
-    for start, end, recipe_name, epoch in recipe_boundaries:
-        if start < total_episodes:
-            ax1.axvline(x=start, color='gray', linestyle=':', linewidth=1, alpha=0.3)
-            if epoch == 0:  # Only label first epoch
-                recipe_display = recipe_name.replace("_", " ").title()[:15]
-                ax1.text(start + num_episodes/2, ax1.get_ylim()[1] * 0.9, recipe_display,
-                        ha='center', fontsize=7, rotation=90, alpha=0.6)
-    
-    # Add epoch markers (align with episode numbers: 10, 20, 30, etc.)
-    for epoch in range(1, num_epochs + 1):
-        epoch_pos = epoch * len(train_recipes) * num_episodes
-        if epoch_pos <= total_episodes:
-            ax1.axvline(x=epoch_pos, color='black', linestyle='--', linewidth=1.5, alpha=0.5)
-            ax1.text(epoch_pos, ax1.get_ylim()[1] * 0.98, f'E{epoch}', 
-                    ha='center', fontsize=9, fontweight='bold', alpha=0.8)
-    
-    ax1.set_title("Recipe-Specific Preferences (φ) - Diverges Per Recipe", 
-                 fontsize=12, fontweight='bold')
-    ax1.set_xlabel("Training Episode (Across All Recipes)", fontsize=11, fontweight='bold')
-    ax1.set_ylabel("φ (Recipe-Specific Preference)", fontsize=11, fontweight='bold')
-    ax1.legend(ncol=2, fontsize=8, frameon=True, fancybox=True, shadow=True, framealpha=0.95)
-    ax1.grid(True, alpha=0.25, linestyle='-', linewidth=0.5, color='gray')
-    ax1.axhline(y=0, color='k', linestyle='--', linewidth=1.5, alpha=0.4)
-    ax1.spines['top'].set_visible(False)
-    ax1.spines['right'].set_visible(False)
-    
-    # Plot 2: Human-level preferences (theta) - shows generalization
-    ax2 = plt.subplot(2, 2, 2)
-    episodes = range(total_episodes)
-    for spice_idx, spice in enumerate(common_spices):
-        if spice in theta_history[0]:
-            theta_vals = [th.get(spice, 0.0) for th in theta_history]
-            spice_display = spice.replace("_", " ").title()
-            ax2.plot(episodes, theta_vals, "-s", label=spice_display, 
-                    color=spice_colors[spice_idx], linewidth=1.5, markersize=4,
-                    markerfacecolor=spice_colors[spice_idx], markeredgecolor='white', 
-                    markeredgewidth=1, alpha=0.7)
-    
-    # Add epoch markers (align with episode numbers)
-    for epoch in range(1, num_epochs + 1):
-        epoch_pos = epoch * len(train_recipes) * num_episodes
-        if epoch_pos <= total_episodes:
-            ax2.axvline(x=epoch_pos, color='black', linestyle='--', linewidth=1.5, alpha=0.5)
-            ax2.text(epoch_pos, ax2.get_ylim()[1] * 0.98, f'E{epoch}', 
-                    ha='center', fontsize=9, fontweight='bold', alpha=0.8)
-    
-    ax2.set_title("Human-Level Preferences (θ) - Generalizes Across Recipes", 
-                 fontsize=12, fontweight='bold')
-    ax2.set_xlabel("Training Episode (Across All Recipes)", fontsize=11, fontweight='bold')
-    ax2.set_ylabel("θ (Human-Level Preference)", fontsize=11, fontweight='bold')
-    ax2.legend(ncol=2, fontsize=9, frameon=True, fancybox=True, shadow=True, framealpha=0.95)
-    ax2.grid(True, alpha=0.25, linestyle='-', linewidth=0.5, color='gray')
-    ax2.axhline(y=0, color='k', linestyle='--', linewidth=1.5, alpha=0.4)
-    ax2.spines['top'].set_visible(False)
-    ax2.spines['right'].set_visible(False)
-    
-    # Plot 3: Global preferences (mu) - shows generalization
-    ax3 = plt.subplot(2, 2, 3)
-    for spice_idx, spice in enumerate(common_spices):
-        if spice in mu_history[0]:
-            mu_vals = [mu.get(spice, 0.0) for mu in mu_history]
-            spice_display = spice.replace("_", " ").title()
-            ax3.plot(episodes, mu_vals, "-^", label=spice_display, 
-                    color=spice_colors[spice_idx], linewidth=1.5, markersize=4,
-                    markerfacecolor=spice_colors[spice_idx], markeredgecolor='white', 
-                    markeredgewidth=1, alpha=0.7)
-    
-    # Add epoch markers (align with episode numbers)
-    for epoch in range(1, num_epochs + 1):
-        epoch_pos = epoch * len(train_recipes) * num_episodes
-        if epoch_pos <= total_episodes:
-            ax3.axvline(x=epoch_pos, color='black', linestyle='--', linewidth=1.5, alpha=0.5)
-            ax3.text(epoch_pos, ax3.get_ylim()[1] * 0.98, f'E{epoch}', 
-                    ha='center', fontsize=9, fontweight='bold', alpha=0.8)
-    
-    ax3.set_title("Global Preferences (μ) - Generalizes Across Recipes", 
-                 fontsize=12, fontweight='bold')
-    ax3.set_xlabel("Training Episode (Across All Recipes)", fontsize=11, fontweight='bold')
-    ax3.set_ylabel("μ (Global Preference)", fontsize=11, fontweight='bold')
-    ax3.legend(ncol=2, fontsize=9, frameon=True, fancybox=True, shadow=True, framealpha=0.95)
-    ax3.grid(True, alpha=0.25, linestyle='-', linewidth=0.5, color='gray')
-    ax3.axhline(y=0, color='k', linestyle='--', linewidth=1.5, alpha=0.4)
-    ax3.spines['top'].set_visible(False)
-    ax3.spines['right'].set_visible(False)
-    
-    # Plot 4: Comparison showing generalization vs specialization
-    ax4 = plt.subplot(2, 2, 4)
-    # Show final values: phi varies by recipe, theta/mu are shared
-    final_phi_by_recipe = {}
-    for recipe_name in train_recipes[:3]:  # Show first 3 recipes
-        if recipe_name in hbm_metrics_by_recipe:
-            phi_history = hbm_metrics_by_recipe[recipe_name]["phi_history"]
-            if phi_history:
-                final_phi_by_recipe[recipe_name] = phi_history[-1]
-    
-    x_pos = np.arange(len(common_spices))
-    width = 0.25
-    for i, recipe_name in enumerate(list(final_phi_by_recipe.keys())[:3]):
-        recipe_display = recipe_name.replace("_", " ").title()[:10]
-        phi_vals = [final_phi_by_recipe[recipe_name].get(spice, 0.0) for spice in common_spices]
-        ax4.bar(x_pos + i * width, phi_vals, width, label=f'φ ({recipe_display})', 
-               alpha=0.7)
-    
-    # Add theta and mu for comparison
-    if theta_history and mu_history:
-        final_theta = [theta_history[-1].get(spice, 0.0) for spice in common_spices]
-        final_mu = [mu_history[-1].get(spice, 0.0) for spice in common_spices]
-        ax4.bar(x_pos + 3 * width, final_theta, width, label='θ (Shared)', 
-               color='green', alpha=0.7)
-        ax4.bar(x_pos + 4 * width, final_mu, width, label='μ (Shared)', 
-               color='blue', alpha=0.7)
-    
-    ax4.set_title("Final Preferences: Recipe-Specific vs Shared", 
-                 fontsize=12, fontweight='bold')
-    ax4.set_xlabel("Spice", fontsize=11, fontweight='bold')
-    ax4.set_ylabel("Preference Value", fontsize=11, fontweight='bold')
-    ax4.set_xticks(x_pos + 2 * width)
-    ax4.set_xticklabels([s.replace("_", " ").title() for s in common_spices], 
-                       rotation=45, ha='right')
-    ax4.legend(fontsize=8, frameon=True, fancybox=True, shadow=True, framealpha=0.95)
-    ax4.grid(True, alpha=0.25, axis='y', linestyle='-', linewidth=0.5, color='gray')
-    ax4.axhline(y=0, color='k', linestyle='--', linewidth=1.5, alpha=0.4)
-    ax4.spines['top'].set_visible(False)
-    ax4.spines['right'].set_visible(False)
-    
-    plt.suptitle(f"HBM Multi-Recipe Training: Generalization vs Specialization\n" +
-                f"{len(train_recipes)} Recipes × {num_episodes} Episodes × {num_epochs} Epochs = {total_episodes} Total Episodes", 
-                fontsize=14, fontweight='bold')
-    plt.tight_layout()
-    plt.show()
+# REMOVED: _plot_multirecipe_hbm_evolution_unused (212 lines) - was explicitly marked unused and never called
 
 def visualize_multirecipe_hbm(hbm_history, train_recipes, test_recipes, generator, all_spices, profile_name=None):
     """
@@ -2053,124 +1568,170 @@ def visualize_hbm_evolution_with_error_bars(aggregated_metrics: dict, recipe_nam
     if "(" in recipe_display:
         recipe_display = recipe_display.split("(")[0].strip()
     
+    # Create a single figure with three stacked subplots (μ, θ, φ) sharing the same episode axis.
+    fig, (ax_mu, ax_theta, ax_phi) = plt.subplots(3, 1, figsize=(10, 10), sharex=True)
+    fig.patch.set_facecolor('white')
+    episodes_mu = np.arange(len(mu_mean_hist)) if mu_mean_hist else np.array([])
+    episodes_theta = np.arange(len(theta_mean_hist)) if theta_mean_hist else np.array([])
+    episodes_phi = np.arange(len(phi_mean_hist)) if phi_mean_hist else np.array([])
+
     # Plot mu (global preferences) with error bars
-    if mu_mean_hist:
-        fig, ax = plt.subplots(figsize=(10, 6))
-        fig.patch.set_facecolor('white')
-        episodes = np.arange(len(mu_mean_hist))
+    if mu_mean_hist and len(episodes_mu) > 0:
         for i, spice in enumerate(spices_to_plot):
-            if mu_mean_hist and spice in mu_mean_hist[0]:
+            if spice in mu_mean_hist[0]:
                 mu_vals = np.array([mu.get(spice, 0.0) for mu in mu_mean_hist])
                 mu_stds = np.array([mu.get(spice, 0.0) for mu in mu_std_hist]) if mu_std_hist else None
                 spice_display = spice.replace("_", " ").title()
-                
-                # Plot mean line
-                ax.plot(episodes, mu_vals, "-", label=spice_display, 
-                       color=colors[i], linewidth=2, alpha=0.85, marker='o', markevery=max(1, len(episodes)//20))
-                
-                # Add shaded error region
-                # mu_stds contains the actual standard deviation computed across seeds
-                # (computed by _aggregate_metrics_across_seeds using np.std)
+                ax_mu.plot(
+                    episodes_mu,
+                    mu_vals,
+                    "-",
+                    label=spice_display,
+                    color=colors[i],
+                    linewidth=1,
+                    alpha=0.85,
+                    marker="o",
+                    markevery=max(1, len(episodes_mu) // 20),
+                )
                 if mu_stds is not None and len(mu_stds) == len(mu_vals):
                     upper = mu_vals + mu_stds
                     lower = mu_vals - mu_stds
-                    ax.fill_between(episodes, lower, upper, alpha=0.2, color=colors[i])
-        
-        ax.set_title("Global Preferences (μ) - Mean Across Seeds (±1 std)", fontsize=14, fontweight='bold', pad=15)
-        ax.set_xlabel("Episode", fontsize=12, fontweight='bold')
-        ax.set_ylabel("μ (Global Preference)", fontsize=12, fontweight='bold')
-        ax.legend(ncol=1, fontsize=7, frameon=True, fancybox=True, shadow=True, 
-                 framealpha=0.9, loc='lower right')
-        ax.grid(True, alpha=0.25)
-        ax.axhline(y=0, color='k', linestyle='--', linewidth=1.2, alpha=0.3)
-        ax.spines['top'].set_visible(False)
-        ax.spines['right'].set_visible(False)
-        plt.tight_layout()
-        plt.show()
-    
+                    ax_mu.fill_between(episodes_mu, lower, upper, alpha=0.2, color=colors[i])
+        ax_mu.set_title("Global Preferences (μ)", fontsize=13, fontweight="bold", pad=8)
+        ax_mu.set_ylabel("μ", fontsize=12, fontweight="bold")
+        ax_mu.grid(True, alpha=0.25)
+        ax_mu.axhline(y=0, color="k", linestyle="--", linewidth=1, alpha=0.3)
+        ax_mu.spines["top"].set_visible(False)
+        ax_mu.spines["right"].set_visible(False)
+
     # Plot theta (human-level preferences) with error bars
-    if theta_mean_hist:
-        fig, ax = plt.subplots(figsize=(10, 6))
-        fig.patch.set_facecolor('white')
-        episodes = np.arange(len(theta_mean_hist))
+    if theta_mean_hist and len(episodes_theta) > 0:
         true_theta_added_to_legend = False
-        
         for i, spice in enumerate(spices_to_plot):
-            if theta_mean_hist and spice in theta_mean_hist[0]:
+            if spice in theta_mean_hist[0]:
                 theta_vals = np.array([th.get(spice, 0.0) for th in theta_mean_hist])
-                theta_stds = np.array([th.get(spice, 0.0) for th in theta_std_hist]) if theta_std_hist else None
+                theta_stds = (
+                    np.array([th.get(spice, 0.0) for th in theta_std_hist])
+                    if theta_std_hist
+                    else None
+                )
                 spice_display = spice.replace("_", " ").title()
-                
-                # Plot learned theta with error bars
-                ax.plot(episodes, theta_vals, "-", label=spice_display, 
-                       color=colors[i], linewidth=2, alpha=0.85, marker='s', markevery=max(1, len(episodes)//20))
-                
+                ax_theta.plot(
+                    episodes_theta,
+                    theta_vals,
+                    "-",
+                    label=spice_display,
+                    color=colors[i],
+                    linewidth=2,
+                    alpha=0.85,
+                    marker="s",
+                    markevery=max(1, len(episodes_theta) // 20),
+                )
                 if theta_stds is not None and len(theta_stds) == len(theta_vals):
                     upper = theta_vals + theta_stds
                     lower = theta_vals - theta_stds
-                    ax.fill_between(episodes, lower, upper, alpha=0.2, color=colors[i])
-                
+                    ax_theta.fill_between(episodes_theta, lower, upper, alpha=0.2, color=colors[i])
+
                 # Add true theta as horizontal reference line if hidden_hbm provided
                 if hidden_hbm is not None and spice in hidden_hbm.theta_mean:
                     true_theta = hidden_hbm.theta_mean[spice]
-                    ax.axhline(y=true_theta, color=colors[i], linestyle='--', 
-                             linewidth=2.5, alpha=0.7, zorder=1,
-                             label='True θ (dashed)' if not true_theta_added_to_legend else '')
-                    # Add annotation at the end
-                    if len(episodes) > 0:
-                        ax.text(episodes[-1], true_theta, f'  True={true_theta:.2f}', 
-                                color=colors[i], fontsize=8, va='center', alpha=0.9, 
-                                fontweight='bold',
-                                bbox=dict(boxstyle='round,pad=0.3', facecolor='white', 
-                                         edgecolor=colors[i], linewidth=1.5, alpha=0.8))
+                    ax_theta.axhline(
+                        y=true_theta,
+                        color=colors[i],
+                        linestyle="--",
+                        linewidth=2.5,
+                        alpha=0.7,
+                        zorder=1,
+                        label="True θ (dashed)" if not true_theta_added_to_legend else "",
+                    )
+                    if len(episodes_theta) > 0:
+                        ax_theta.text(
+                            episodes_theta[-1],
+                            true_theta,
+                            f"  True={true_theta:.2f}",
+                            color=colors[i],
+                            fontsize=8,
+                            va="center",
+                            alpha=0.9,
+                            fontweight="bold",
+                            bbox=dict(
+                                boxstyle="round,pad=0.3",
+                                facecolor="white",
+                                edgecolor=colors[i],
+                                linewidth=1.5,
+                                alpha=0.8,
+                            ),
+                        )
                     true_theta_added_to_legend = True
-        
-        title = "Human-Level Preferences (θ) - Mean Across Seeds (±1 std)"
-        if hidden_hbm is not None:
-            title += " - Convergence to True Values"
-        ax.set_title(title, fontsize=14, fontweight='bold', pad=15)
-        ax.set_xlabel("Episode", fontsize=12, fontweight='bold')
-        ax.set_ylabel("θ (Human-Level Preference)", fontsize=12, fontweight='bold')
-        ax.legend(ncol=1, fontsize=7, frameon=True, fancybox=True, shadow=True, 
-                 framealpha=0.9, loc='lower right')
-        ax.grid(True, alpha=0.25)
-        ax.axhline(y=0, color='k', linestyle='--', linewidth=1.2, alpha=0.3)
-        ax.spines['top'].set_visible(False)
-        ax.spines['right'].set_visible(False)
-        plt.tight_layout()
-        plt.show()
-    
+
+        ax_theta.set_title("Human-Level Preferences (θ)", fontsize=13, fontweight="bold", pad=8)
+        ax_theta.set_ylabel("θ", fontsize=12, fontweight="bold")
+        ax_theta.grid(True, alpha=0.25)
+        ax_theta.axhline(y=0, color="k", linestyle="--", linewidth=1.2, alpha=0.3)
+        ax_theta.spines["top"].set_visible(False)
+        ax_theta.spines["right"].set_visible(False)
+
     # Plot phi (recipe-specific preferences) with error bars
-    if phi_mean_hist:
-        fig, ax = plt.subplots(figsize=(10, 6))
-        fig.patch.set_facecolor('white')
-        episodes = np.arange(len(phi_mean_hist))
+    if phi_mean_hist and len(episodes_phi) > 0:
         for i, spice in enumerate(spices_to_plot):
-            if phi_mean_hist and spice in phi_mean_hist[0]:
+            if spice in phi_mean_hist[0]:
                 phi_vals = np.array([ph.get(spice, 0.0) for ph in phi_mean_hist])
-                phi_stds = np.array([ph.get(spice, 0.0) for ph in phi_std_hist]) if phi_std_hist else None
+                phi_stds = (
+                    np.array([ph.get(spice, 0.0) for ph in phi_std_hist])
+                    if phi_std_hist
+                    else None
+                )
                 spice_display = spice.replace("_", " ").title()
-                
-                ax.plot(episodes, phi_vals, "-", label=spice_display, 
-                       color=colors[i], linewidth=2, alpha=0.85, marker='^', markevery=max(1, len(episodes)//20))
-                
+                ax_phi.plot(
+                    episodes_phi,
+                    phi_vals,
+                    "-",
+                    label=spice_display,
+                    color=colors[i],
+                    linewidth=2,
+                    alpha=0.85,
+                    marker="^",
+                    markevery=max(1, len(episodes_phi) // 20),
+                )
                 if phi_stds is not None and len(phi_stds) == len(phi_vals):
                     upper = phi_vals + phi_stds
                     lower = phi_vals - phi_stds
-                    ax.fill_between(episodes, lower, upper, alpha=0.2, color=colors[i])
-        
-        ax.set_title(f"Recipe-Specific Preferences (φ) - {recipe_display}\nMean Across Seeds (±1 std)", 
-                    fontsize=14, fontweight='bold', pad=15)
-        ax.set_xlabel("Episode", fontsize=12, fontweight='bold')
-        ax.set_ylabel("φ (Recipe-Specific Preference)", fontsize=12, fontweight='bold')
-        ax.legend(ncol=1, fontsize=7, frameon=True, fancybox=True, shadow=True, 
-                 framealpha=0.9, loc='lower right')
-        ax.grid(True, alpha=0.25)
-        ax.axhline(y=0, color='k', linestyle='--', linewidth=1.2, alpha=0.3)
-        ax.spines['top'].set_visible(False)
-        ax.spines['right'].set_visible(False)
-        plt.tight_layout()
-        plt.show()
+                    ax_phi.fill_between(episodes_phi, lower, upper, alpha=0.2, color=colors[i])
+
+        ax_phi.set_title("Recipe-Specific Preferences (φ)", fontsize=13, fontweight="bold", pad=8)
+        ax_phi.set_xlabel("Episode", fontsize=12, fontweight="bold")
+        ax_phi.set_ylabel("φ", fontsize=12, fontweight="bold")
+        ax_phi.grid(True, alpha=0.25)
+        ax_phi.axhline(y=0, color="k", linestyle="--", linewidth=1.2, alpha=0.3)
+        ax_phi.spines["top"].set_visible(False)
+        ax_phi.spines["right"].set_visible(False)
+
+    # Single shared legend for all three subplots, using handles from μ-axis.
+    handles, labels = ax_mu.get_legend_handles_labels()
+    if handles and labels:
+        fig.legend(
+            handles,
+            labels,
+            ncol=1,
+            fontsize=8,
+            frameon=True,
+            fancybox=True,
+            shadow=True,
+            framealpha=0.9,
+            loc="center right",
+            #bbox_to_anchor=(1.02, 0.98),
+        )
+
+    # Global suptitle describing recipe and that this is mean across seeds (±1 std)
+    fig.suptitle(
+        f"HBM Preference Evolution for {recipe_display}\nMean Across Seeds (±1 std)",
+        fontsize=15,
+        fontweight="bold",
+        y=0.99,
+    )
+
+    plt.tight_layout(rect=[0, 0, 0.88, 0.95])
+    plt.show()
 
 def visualize_convergence_error(aggregated_metrics: dict, hidden_hbm, spices: list[str], num_episodes: int):
     """Visualize convergence error (distance from true theta) over episodes.
@@ -2181,70 +1742,11 @@ def visualize_convergence_error(aggregated_metrics: dict, hidden_hbm, spices: li
         spices: List of spices
         num_episodes: Number of episodes
     """
+    # Deprecated: convergence error graph removed as per refactor.
+    # Kept as a no-op stub for backward compatibility.
     theta_mean_hist = aggregated_metrics.get("theta_history_mean", [])
-    theta_std_hist = aggregated_metrics.get("theta_history_std", [])
-    
     if not theta_mean_hist:
-        logging.warning("No theta history data for convergence error plot")
         return
-    
-    # Select subset of spices
-    num_spices_to_plot = min(8, len(spices))
-    spices_to_plot = spices[:num_spices_to_plot]
-    colors = plt.cm.Set2(np.linspace(0, 1, len(spices_to_plot)))
-    
-    fig, ax = plt.subplots(figsize=(10, 6))
-    fig.patch.set_facecolor('white')
-    episodes = np.arange(len(theta_mean_hist))
-    
-    for i, spice in enumerate(spices_to_plot):
-        if spice not in hidden_hbm.theta_mean:
-            continue
-            
-        true_theta = hidden_hbm.theta_mean[spice]
-        
-        # Compute error (absolute difference) for each episode
-        errors = []
-        error_stds = []
-        for ep_idx, theta_dict in enumerate(theta_mean_hist):
-            learned_theta = theta_dict.get(spice, 0.0)
-            error = abs(learned_theta - true_theta)
-            errors.append(error)
-            
-            # Compute std of error across seeds
-            # Approximate: std of |learned - true| ≈ std of learned (since true is constant)
-            if theta_std_hist and ep_idx < len(theta_std_hist) and isinstance(theta_std_hist[ep_idx], dict):
-                error_stds.append(theta_std_hist[ep_idx].get(spice, 0.0))
-            else:
-                error_stds.append(0.0)
-        
-        spice_display = spice.replace("_", " ").title()
-        errors = np.array(errors)
-        error_stds = np.array(error_stds)
-        
-        # Plot error line
-        ax.plot(episodes, errors, "-", label=spice_display, 
-               color=colors[i], linewidth=2, alpha=0.85, marker='o', 
-               markevery=max(1, len(episodes)//20))
-        
-        # Add error bars (shaded region) if we have std data
-        if len(error_stds) == len(errors) and np.any(error_stds > 0):
-            upper = errors + error_stds
-            lower = np.maximum(errors - error_stds, 0)  # Can't be negative
-            ax.fill_between(episodes, lower, upper, alpha=0.2, color=colors[i])
-    
-    ax.set_title("Convergence Error: |Learned θ - True θ| Over Episodes\n(Should decrease over time)", 
-                fontsize=14, fontweight='bold', pad=15)
-    ax.set_xlabel("Episode", fontsize=12, fontweight='bold')
-    ax.set_ylabel("Absolute Error", fontsize=12, fontweight='bold')
-    ax.legend(ncol=1, fontsize=7, frameon=True, fancybox=True, shadow=True, 
-             framealpha=0.9, loc='upper right')
-    ax.grid(True, alpha=0.25)
-    ax.axhline(y=0, color='k', linestyle='--', linewidth=1.2, alpha=0.3)
-    ax.spines['top'].set_visible(False)
-    ax.spines['right'].set_visible(False)
-    plt.tight_layout()
-    plt.show()
 
 def visualize_distribution_convergence(aggregated_metrics: dict, hidden_hbm, spices: list[str], 
                                        num_episodes: int, selected_episodes: list[int] = None):
@@ -2525,8 +2027,16 @@ def _aggregate_metrics_across_seeds(all_metrics: list[dict]) -> dict:
     return aggregated
 
 # ---------------- TEST FUNCTIONS ----------------
-def _run_single_recipe_experiment(recipe_name: str, num_episodes: int, env_seed: int, csp_seed: int, 
-                                   hidden_hbm: HierarchicalPreferenceModel | None = None) -> dict:
+def _run_single_recipe_experiment(
+    recipe_name: str,
+    num_episodes: int,
+    env_seed: int,
+    csp_seed: int,
+    hidden_hbm: HierarchicalPreferenceModel | None = None,
+    multi_human_hbm: MultiHumanHierarchicalPreferenceModel | None = None,
+    human_id: str | None = None,
+    multi_human_histories: dict | None = None,
+) -> dict:
     """
     Run a single experiment for one recipe and return metrics.
     
@@ -2589,7 +2099,13 @@ def _run_single_recipe_experiment(recipe_name: str, num_episodes: int, env_seed:
 
         # Run a single episode (track mood evolution for last episode only)
         track_evolution = (i == num_episodes - 1)  # Only track last episode
-        info = run_one_episode(env, csp_generator, track_mood_evolution=track_evolution)
+        info = run_one_episode(
+            env,
+            csp_generator,
+            track_mood_evolution=track_evolution,
+            multi_human_hbm=multi_human_hbm,
+            human_id=human_id,
+        )
         
         if track_evolution and "mood_evolution" in info:
             last_episode_mood_evolution = info["mood_evolution"]
@@ -2597,6 +2113,51 @@ def _run_single_recipe_experiment(recipe_name: str, num_episodes: int, env_seed:
         # Update metrics
         hbm_info = (csp_generator, spices, recipe_name)
         metrics = update_metrics(metrics, info, hbm_info)
+
+        # Optionally record snapshots from the shared multi-human HBM for analysis.
+        if (
+            multi_human_hbm is not None
+            and human_id is not None
+            and multi_human_histories is not None
+        ):
+            mu_hist: list[dict[str, float]] = multi_human_histories.setdefault(
+                "mu_history", []
+            )
+            theta_hist_by_human: dict[str, list[dict[str, float]]] = multi_human_histories.setdefault(
+                "theta_history_by_human", {}
+            )
+            phi_hist_by_human: dict[str, list[dict[str, float]]] = multi_human_histories.setdefault(
+                "phi_history_by_human", {}
+            )
+
+            # Initialize per-human containers if needed
+            if human_id not in theta_hist_by_human:
+                theta_hist_by_human[human_id] = []
+            if human_id not in phi_hist_by_human:
+                phi_hist_by_human[human_id] = []
+
+            # Snapshot current μ, θ_h, φ_{h,r} for this recipe
+            try:
+                mu_snapshot = {sp: multi_human_hbm.get_mu(sp) for sp in spices}
+                theta_snapshot = {
+                    sp: multi_human_hbm.get_theta(human_id, sp) for sp in spices
+                }
+                phi_snapshot = {
+                    sp: multi_human_hbm.get_phi(human_id, recipe_name, sp)
+                    for sp in spices
+                }
+            except (AssertionError, KeyError):
+                # If any key is missing, skip recording for this episode.
+                mu_snapshot = None
+                theta_snapshot = None
+                phi_snapshot = None
+
+            if mu_snapshot is not None:
+                mu_hist.append(mu_snapshot)
+            if theta_snapshot is not None:
+                theta_hist_by_human[human_id].append(theta_snapshot)
+            if phi_snapshot is not None:
+                phi_hist_by_human[human_id].append(phi_snapshot)
 
         if PARAMETERS["verbose"]:
             logging.info(
@@ -2663,14 +2224,12 @@ def test_spices_csp_single_recipe(num_episodes: int = PARAMETERS["num_episodes"]
         
         # Visualize HBM evolution with error bars
         if "phi_history_mean" in aggregated_metrics or "phi_history_raw" in aggregated_metrics:
-            visualize_hbm_evolution_with_error_bars(aggregated_metrics, recipe_name, spices, num_episodes, hidden_hbm=hidden_hbm)
+            visualize_hbm_evolution_with_error_bars(
+                aggregated_metrics, recipe_name, spices, num_episodes, hidden_hbm=hidden_hbm
+            )
             
-            # Add convergence visualizations if hidden HBM is available
+            # Optional: distribution shift visualization (kept)
             if hidden_hbm is not None:
-                # Option 2: Convergence error plot
-                visualize_convergence_error(aggregated_metrics, hidden_hbm, spices, num_episodes)
-                
-                # Option 3: Distribution shift visualization
                 visualize_distribution_convergence(aggregated_metrics, hidden_hbm, spices, num_episodes)
     else:
         # Single seed - use existing visualization
@@ -2678,11 +2237,11 @@ def test_spices_csp_single_recipe(num_episodes: int = PARAMETERS["num_episodes"]
 
         visualize(num_episodes, metrics)
     
-    #Visualize HBM evolution if available
+    # Visualize HBM evolution if available
         if metrics.get("phi_history"):
             visualize_hbm_evolution(metrics, recipe_name, spices, hidden_hbm=hidden_hbm)
             
-            # Add convergence visualizations if hidden HBM is available (single seed)
+            # Optional: distribution shift visualization if hidden HBM is available (single seed)
             if hidden_hbm is not None:
                 # For single seed, we need to create aggregated-like structure
                 # Create a simple aggregated metrics dict from single seed
@@ -2699,10 +2258,6 @@ def test_spices_csp_single_recipe(num_episodes: int = PARAMETERS["num_episodes"]
                     "theta_history_mean": theta_history,
                     "theta_history_std": theta_std_history,
                 }
-                # Option 2: Convergence error plot
-                visualize_convergence_error(single_aggregated, hidden_hbm, spices, num_episodes)
-                
-                # Option 3: Distribution shift visualization
                 visualize_distribution_convergence(single_aggregated, hidden_hbm, spices, num_episodes)
     
     # Visualize mood posterior evolution from last episode
@@ -2734,12 +2289,21 @@ def test_spices_csp_multiple_humans(num_episodes: int = PARAMETERS["num_episodes
     logging.info(f"Recipe: {recipe_name}")
     logging.info(f"{'='*60}")
     
+    # Shared multi-human HBM that pools across all humans for this recipe.
+    human_names = [f"Human_{i + 1}" for i in range(num_humans)]
+    multi_human_hbm = MultiHumanHierarchicalPreferenceModel(
+        spices=spices,
+        recipes=[recipe_name],
+        human_ids=human_names,
+    )
+    multi_human_histories: dict = {}
+
     # Run experiments for each human
     all_human_metrics = {}
     all_human_aggregated = {}
     
     for human_idx, hidden_hbm in enumerate(hidden_hbms):
-        human_name = f"Human_{human_idx + 1}"
+        human_name = human_names[human_idx]
         logging.info(f"\n{'='*60}")
         logging.info(f"Testing {human_name}")
         logging.info(f"{'='*60}")
@@ -2759,7 +2323,16 @@ def test_spices_csp_multiple_humans(num_episodes: int = PARAMETERS["num_episodes
             if PARAMETERS["verbose"]:
                 logging.info(f"  Seed {seed_idx + 1}/{num_seeds}")
             
-            metrics = _run_single_recipe_experiment(recipe_name, num_episodes, env_seed, csp_seed, hidden_hbm)
+            metrics = _run_single_recipe_experiment(
+                recipe_name,
+                num_episodes,
+                env_seed,
+                csp_seed,
+                hidden_hbm=hidden_hbm,
+                multi_human_hbm=multi_human_hbm,
+                human_id=human_name,
+                multi_human_histories=multi_human_histories,
+            )
             all_metrics.append(metrics)
         
         all_human_metrics[human_name] = all_metrics
@@ -2769,9 +2342,30 @@ def test_spices_csp_multiple_humans(num_episodes: int = PARAMETERS["num_episodes
             aggregated = _aggregate_metrics_across_seeds(all_metrics)
             all_human_aggregated[human_name] = aggregated
     
-    # Visualize comparison across humans
+    # Log pooled global and human-level preferences from the shared multi-human HBM.
+    logging.info(f"\n{'='*60}")
+    logging.info("Shared Multi-Human HBM Summary (μ and θ)")
+    logging.info(f"{'='*60}")
+    sample_spices = spices[:5]
+    for spice in sample_spices:
+        mu_val = multi_human_hbm.get_mu(spice)
+        logging.info(f"\nSpice: {spice}")
+        logging.info(f"  Global μ[{spice}]: {mu_val:+7.3f}")
+        for human_name in human_names:
+            theta_val = multi_human_hbm.get_theta(human_name, spice)
+            logging.info(f"  θ[{human_name}, {spice}]: {theta_val:+7.3f}")
+
+    # Visualize comparison across humans (existing plots: satisfaction + per-human θ vs true θ)
     visualize_multiple_humans_comparison(all_human_metrics, all_human_aggregated, hidden_hbms, 
                                         recipe_name, spices, num_episodes, num_seeds)
+
+    # Visualize a single snapshot of the shared multi-human HBM hierarchy (μ, θ, φ).
+    visualize_shared_multi_human_hbm_snapshot(
+        multi_human_hbm=multi_human_hbm,
+        recipe_name=recipe_name,
+        spices=spices,
+        human_names=human_names,
+    )
 
 def visualize_multiple_humans_comparison(all_human_metrics: dict, all_human_aggregated: dict,
                                         hidden_hbms: list[HierarchicalPreferenceModel],
@@ -2781,41 +2375,52 @@ def visualize_multiple_humans_comparison(all_human_metrics: dict, all_human_aggr
     if not all_human_metrics:
         return
     
-    # Plot 1: Average satisfaction comparison across humans
-    fig, ax = plt.subplots(figsize=(12, 6))
+    # Plot 1: Average satisfaction comparison across humans (summary bar chart with deviation).
+    fig, ax = plt.subplots(figsize=(10, 6))
     fig.patch.set_facecolor('white')
     
-    colors = plt.cm.tab10(np.linspace(0, 1, len(all_human_metrics)))
+    human_names: list[str] = []
+    mean_sats: list[float] = []
+    std_sats: list[float] = []
     
-    for idx, (human_name, metrics_list) in enumerate(all_human_metrics.items()):
+    for human_name, metrics_list in all_human_metrics.items():
         if num_seeds > 1 and human_name in all_human_aggregated:
-            # Use aggregated means and stds
             agg = all_human_aggregated[human_name]
-            satisfactions_mean = agg.get("average_satisfactions_mean", [])
-            satisfactions_std = agg.get("average_satisfactions_std", [])
-            x_vals = np.arange(1, len(satisfactions_mean) + 1)
-            ax.errorbar(x_vals, satisfactions_mean, yerr=satisfactions_std,
-                       label=human_name, color=colors[idx], marker='o', linewidth=2,
-                       markersize=5, capsize=3, alpha=0.8)
+            sats_series = agg.get("average_satisfactions_mean", [])
+            if sats_series:
+                human_names.append(human_name)
+                mean_sats.append(float(np.mean(sats_series)))
+                std_sats.append(float(np.std(sats_series)))
         else:
-            # Single seed - use first metrics
-            satisfactions = metrics_list[0].get("average_satisfactions", [])
-            x_vals = np.arange(1, len(satisfactions) + 1)
-            ax.plot(x_vals, satisfactions, label=human_name, color=colors[idx], 
-                   marker='o', linewidth=2, markersize=5, alpha=0.8)
+            # Single seed – summarize over episodes from the first metrics dict.
+            sats = metrics_list[0].get("average_satisfactions", [])
+            if sats:
+                human_names.append(human_name)
+                mean_sats.append(float(np.mean(sats)))
+                std_sats.append(float(np.std(sats)))
     
-    ax.set_title(f"Satisfaction Learning: Comparison Across {len(all_human_metrics)} Humans\n{recipe_name.replace('_', ' ').title()}", 
-                fontsize=14, fontweight='bold', pad=15)
-    ax.set_xlabel("Episode", fontsize=12, fontweight='bold')
-    ax.set_ylabel("Average Satisfaction", fontsize=12, fontweight='bold')
-    ax.legend(fontsize=10, frameon=True, fancybox=True, shadow=True)
-    ax.grid(True, alpha=0.25)
-    ax.set_ylim(-0.05, 1.05)
-    ax.axhline(y=0.5, color='k', linestyle='--', linewidth=1, alpha=0.3)
-    ax.spines['top'].set_visible(False)
-    ax.spines['right'].set_visible(False)
-    plt.tight_layout()
-    plt.show()
+    if human_names:
+        x_pos = np.arange(len(human_names))
+        colors = plt.cm.tab10(np.linspace(0, 1, len(human_names)))
+        
+        ax.bar(x_pos, mean_sats, yerr=std_sats, capsize=4, color=colors, alpha=0.85)
+        ax.set_xticks(x_pos)
+        ax.set_xticklabels(human_names, rotation=0, fontsize=10)
+        ax.set_ylabel("Average Satisfaction", fontsize=12, fontweight='bold')
+        ax.set_xlabel("Human", fontsize=12, fontweight='bold')
+        ax.set_title(
+            f"Satisfaction Summary Across {len(human_names)} Humans\n{recipe_name.replace('_', ' ').title()}",
+            fontsize=14,
+            fontweight='bold',
+            pad=15,
+        )
+        ax.grid(True, axis='y', alpha=0.25)
+        ax.set_ylim(-0.05, 1.05)
+        ax.axhline(y=0.5, color='k', linestyle='--', linewidth=1, alpha=0.3)
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        plt.tight_layout()
+        plt.show()
     
     # Plot 2: Final learned theta vs true theta for each human
     if num_seeds > 0:
@@ -2879,6 +2484,95 @@ def visualize_multiple_humans_comparison(all_human_metrics: dict, all_human_aggr
                     error = abs(learned_theta - true_theta)
                     logging.info(f"  {spice:20s}: True={true_theta:+7.3f}, Learned={learned_theta:+7.3f}, Error={error:.3f}")
 
+    # Plot 3: HBM evolution (μ, θ, φ) per human to show the three preference layers over episodes.
+    # We reuse the single-human multi-seed visualization for each human that has aggregated metrics.
+    for human_name, hidden_hbm in zip(all_human_metrics.keys(), hidden_hbms):
+        if num_seeds > 1 and human_name in all_human_aggregated:
+            agg = all_human_aggregated[human_name]
+            if "phi_history_mean" in agg or "phi_history_raw" in agg:
+                visualize_hbm_evolution_with_error_bars(
+                    aggregated_metrics=agg,
+                    recipe_name=recipe_name,
+                    spices=spices,
+                    num_episodes=num_episodes,
+                    hidden_hbm=hidden_hbm,
+                )
+
+
+def visualize_shared_multi_human_hbm_snapshot(
+    multi_human_hbm: MultiHumanHierarchicalPreferenceModel,
+    recipe_name: str,
+    spices: list[str],
+    human_names: list[str],
+) -> None:
+    """
+    Visualize a single snapshot of the shared multi-human HBM:
+      - Global μ per spice
+      - Human-level θ per spice and human
+      - Recipe-level φ per spice and human for the given recipe
+    """
+    if multi_human_hbm is None or not spices or not human_names:
+        return
+
+    # Limit to a manageable number of spices for readability.
+    spices_to_plot = spices[: min(8, len(spices))]
+    spice_labels = [s.replace("_", " ").title() for s in spices_to_plot]
+
+    fig, axes = plt.subplots(3, 1, figsize=(10, 10), sharex=True)
+    fig.patch.set_facecolor("white")
+
+    # --- Panel 1: Global μ per spice ---
+    ax_mu = axes[0]
+    mu_vals = [multi_human_hbm.get_mu(s) for s in spices_to_plot]
+    x = np.arange(len(spices_to_plot))
+    ax_mu.bar(x, mu_vals, color="#8e44ad", alpha=0.85)
+    ax_mu.set_ylabel("μ", fontsize=11, fontweight="bold")
+    ax_mu.set_title("Shared Global Preferences μ (across humans)", fontsize=13, fontweight="bold", pad=8)
+    ax_mu.axhline(0, color="k", linestyle="--", linewidth=0.8, alpha=0.3)
+    ax_mu.grid(True, axis="y", alpha=0.25)
+    ax_mu.spines["top"].set_visible(False)
+    ax_mu.spines["right"].set_visible(False)
+
+    # --- Panel 2: Human-level θ per spice and human ---
+    ax_theta = axes[1]
+    width = 0.8 / max(1, len(human_names))
+    colors = plt.cm.tab10(np.linspace(0, 1, len(human_names)))
+    for i, human_name in enumerate(human_names):
+        theta_vals = [multi_human_hbm.get_theta(human_name, s) for s in spices_to_plot]
+        offsets = x - 0.4 + width / 2 + i * width
+        ax_theta.bar(offsets, theta_vals, width=width, label=human_name, color=colors[i], alpha=0.9)
+    ax_theta.set_ylabel("θ", fontsize=11, fontweight="bold")
+    ax_theta.set_title("Human-Level Preferences θ per Spice", fontsize=13, fontweight="bold", pad=8)
+    ax_theta.axhline(0, color="k", linestyle="--", linewidth=0.8, alpha=0.3)
+    ax_theta.grid(True, axis="y", alpha=0.25)
+    ax_theta.spines["top"].set_visible(False)
+    ax_theta.spines["right"].set_visible(False)
+    ax_theta.legend(fontsize=9, ncol=min(3, len(human_names)))
+
+    # --- Panel 3: Recipe-level φ per spice and human (for this recipe) ---
+    ax_phi = axes[2]
+    for i, human_name in enumerate(human_names):
+        phi_vals = [multi_human_hbm.get_phi(human_name, recipe_name, s) for s in spices_to_plot]
+        offsets = x - 0.4 + width / 2 + i * width
+        ax_phi.bar(offsets, phi_vals, width=width, label=human_name, color=colors[i], alpha=0.9)
+    ax_phi.set_ylabel("φ", fontsize=11, fontweight="bold")
+    ax_phi.set_title("Recipe-Level Preferences φ per Spice and Human", fontsize=13, fontweight="bold", pad=8)
+    ax_phi.axhline(0, color="k", linestyle="--", linewidth=0.8, alpha=0.3)
+    ax_phi.grid(True, axis="y", alpha=0.25)
+    ax_phi.spines["top"].set_visible(False)
+    ax_phi.spines["right"].set_visible(False)
+    ax_phi.set_xticks(x)
+    ax_phi.set_xticklabels(spice_labels, rotation=30, ha="right", fontsize=9)
+
+    recipe_display = recipe_name.replace("_", " ").title()
+    fig.suptitle(
+        f"Shared Multi-Human HBM Snapshot\nRecipe: {recipe_display}",
+        fontsize=14,
+        fontweight="bold",
+    )
+    plt.tight_layout()
+    plt.show()
+
 @pytest.mark.multiple_recipes
 def test_spices_csp_multiple_recipes(num_episodes: int = PARAMETERS["num_episodes"], profile: str = PARAMETERS["profile"]):
     env_seed = PARAMETERS["env_seed"]
@@ -2940,6 +2634,14 @@ def test_spices_csp_multiple_recipes(num_episodes: int = PARAMETERS["num_episode
         verbose=PARAMETERS["verbose"]
     )
 
+    # Shared multi-human HBM for cross-recipe structure (single human in this test).
+    shared_human_ids = ["Human_1"]
+    multi_human_hbm = MultiHumanHierarchicalPreferenceModel(
+        spices=all_spices,
+        recipes=all_recipes,
+        human_ids=shared_human_ids,
+    )
+
     # ----------------- TRAINING -----------------
     logging.info(f"\n{'='*60}")
     logging.info(f"[TRAINING PHASE] - {PARAMETERS['num_epochs']} epochs")
@@ -2951,24 +2653,6 @@ def test_spices_csp_multiple_recipes(num_episodes: int = PARAMETERS["num_episode
         "expected_moods": {},
         "neutral_confidences": {},
         "neutral_episodes": {},  # Track which episodes were used for learning
-    }
-    
-    # Track HBM evolution per recipe (similar to single recipe format)
-    hbm_metrics_by_recipe = {}
-    for recipe_name in train_recipes:
-        recipe_spices = list(get_recipe(recipe_name).spices)
-        hbm_metrics_by_recipe[recipe_name] = {
-            "phi_history": [],
-            "theta_history": [],
-            "mu_history": [],
-            "spices": recipe_spices,
-        }
-    
-    # Track GLOBAL theta and mu evolution across ALL recipes (shared across recipes)
-    global_hbm_metrics = {
-        "theta_history": [],
-        "mu_history": [],
-        "spices": all_spices,  # All spices seen across all recipes
     }
     
     total_neutral_episodes = 0
@@ -3003,7 +2687,12 @@ def test_spices_csp_multiple_recipes(num_episodes: int = PARAMETERS["num_episode
                 total_episodes += 1
                 neutral_examples_before_episode = len(generator._pref_gen._neutral_training_inputs)
                 
-                info = run_one_episode(env, generator)
+                info = run_one_episode(
+                    env,
+                    generator,
+                    multi_human_hbm=multi_human_hbm,
+                    human_id=shared_human_ids[0],
+                )
                 
                 recipe_sats.append(info.get("average_satisfaction", np.nan))
                 recipe_moods.append(info.get("mood"))
@@ -3017,37 +2706,6 @@ def test_spices_csp_multiple_recipes(num_episodes: int = PARAMETERS["num_episode
                 recipe_neutral_episodes.append(was_used_for_learning)
                 if was_used_for_learning:
                     total_neutral_episodes += 1
-                
-                # Track HBM evolution if using HBM (same format as single recipe)
-                if PARAMETERS["use_hbm"] and generator._pref_gen._hbm is not None:
-                    hbm = generator._pref_gen._hbm
-                    recipe_spices = list(get_recipe(recipe_name).spices)
-                    
-                    # Capture initial state before first episode of this recipe in first epoch
-                    if epoch == 0 and ep == 0 and len(hbm_metrics_by_recipe[recipe_name]["phi_history"]) == 0:
-                        # Initial state - phi should be 0, theta/mu may have values from previous recipes
-                        initial_phi = {spice: 0.0 for spice in recipe_spices}
-                        initial_theta = {spice: hbm.theta_mean[spice] for spice in recipe_spices}
-                        initial_mu = {spice: hbm.mu_mean[spice] for spice in recipe_spices}
-                        hbm_metrics_by_recipe[recipe_name]["phi_history"].append(initial_phi)
-                        hbm_metrics_by_recipe[recipe_name]["theta_history"].append(initial_theta)
-                        hbm_metrics_by_recipe[recipe_name]["mu_history"].append(initial_mu)
-                    
-                    # Recipe-specific phi snapshot (after episode)
-                    phi_snapshot = {spice: hbm.get_phi(recipe_name, spice) for spice in recipe_spices}
-                    hbm_metrics_by_recipe[recipe_name]["phi_history"].append(phi_snapshot)
-                    
-                    # Shared theta and mu snapshots (same for all recipes, evolve across recipes)
-                    theta_snapshot = {spice: hbm.theta_mean[spice] for spice in recipe_spices}
-                    mu_snapshot = {spice: hbm.mu_mean[spice] for spice in recipe_spices}
-                    hbm_metrics_by_recipe[recipe_name]["theta_history"].append(theta_snapshot)
-                    hbm_metrics_by_recipe[recipe_name]["mu_history"].append(mu_snapshot)
-                    
-                    # Track global theta and mu evolution (across all recipes)
-                    global_theta_snapshot = {spice: hbm.theta_mean[spice] for spice in all_spices if spice in hbm.theta_mean}
-                    global_mu_snapshot = {spice: hbm.mu_mean[spice] for spice in all_spices if spice in hbm.mu_mean}
-                    global_hbm_metrics["theta_history"].append(global_theta_snapshot)
-                    global_hbm_metrics["mu_history"].append(global_mu_snapshot)
                 
                 if PARAMETERS["verbose"]:
                     logging.info(
@@ -3129,7 +2787,12 @@ def test_spices_csp_multiple_recipes(num_episodes: int = PARAMETERS["num_episode
         recipe_mood_accuracy = []
         
         for ep in range(num_episodes):
-            info = run_one_episode(env, generator)
+            info = run_one_episode(
+                env,
+                generator,
+                multi_human_hbm=multi_human_hbm,
+                human_id=shared_human_ids[0],
+            )
             
             recipe_sats.append(info.get("average_satisfaction", np.nan))
             true_mood = info.get("mood")
@@ -3171,6 +2834,34 @@ def test_spices_csp_multiple_recipes(num_episodes: int = PARAMETERS["num_episode
         test_results["mood_accuracy"][recipe_name] = recipe_mood_accuracy
         env.close()
     
+    # Compute test satisfaction and mood accuracy
+    mean_test_sat = np.mean([np.mean(v) for v in test_results["satisfactions"].values()])
+    mean_mood_accuracy = np.mean([np.mean(v) for v in test_results["mood_accuracy"].values()])
+    
+    logging.info(f"Mean test satisfaction: {mean_test_sat:.3f}")
+    logging.info(f"Mean mood inference accuracy: {mean_mood_accuracy:.3f} ({100*mean_mood_accuracy:.1f}%)")
+    
+    # Log final shared multi-human HBM snapshot across all recipes and spices.
+    logging.info(f"\n{'='*60}")
+    logging.info("Shared Single-Human HBM (Multi-Recipe) Summary (μ and θ)")
+    logging.info(f"{'='*60}")
+    sample_spices = all_spices[:5]
+    for spice in sample_spices:
+        mu_val = multi_human_hbm.get_mu(spice)
+        theta_val = multi_human_hbm.get_theta(shared_human_ids[0], spice)
+        logging.info(f"Spice: {spice:20s} | μ={mu_val:+7.3f} | θ={theta_val:+7.3f}")
+
+    # Per-recipe breakdown
+    logging.info(f"\n[Per-Recipe Test Results]")
+    for recipe_name in test_recipes:
+        recipe_sat = np.mean(test_results["satisfactions"][recipe_name])
+        recipe_acc = np.mean(test_results["mood_accuracy"][recipe_name])
+        logging.info(
+            f"  {recipe_name}: "
+            f"sat={recipe_sat:.3f}, "
+            f"mood_acc={recipe_acc:.3f}"
+        )
+
     # Store training vs test performance metrics
     test_results["training_vs_test_performance"] = {
         "mean_train_satisfaction": mean_train_sat,
@@ -3186,29 +2877,6 @@ def test_spices_csp_multiple_recipes(num_episodes: int = PARAMETERS["num_episode
         cross_recipe_accuracy = _compute_cross_recipe_preference_accuracy(
             generator, test_recipes, hidden_hbm
         )
-    
-    # Test summary
-    logging.info(f"\n{'='*60}")
-    logging.info(f"[Test Summary]")
-    logging.info(f"{'='*60}")
-    
-    mean_test_sat = np.mean([np.mean(v) for v in test_results["satisfactions"].values()])
-    mean_mood_accuracy = np.mean([np.mean(v) for v in test_results["mood_accuracy"].values()])
-    
-    logging.info(f"Mean test satisfaction: {mean_test_sat:.3f}")
-    logging.info(f"Mean mood inference accuracy: {mean_mood_accuracy:.3f} ({100*mean_mood_accuracy:.1f}%)")
-    
-    # Per-recipe breakdown
-    logging.info(f"\n[Per-Recipe Test Results]")
-    for recipe_name in test_recipes:
-        recipe_sat = np.mean(test_results["satisfactions"][recipe_name])
-        recipe_acc = np.mean(test_results["mood_accuracy"][recipe_name])
-        logging.info(
-            f"  {recipe_name}: "
-            f"sat={recipe_sat:.3f}, "
-            f"mood_acc={recipe_acc:.3f}"
-        )
-    
     # Compute cross-recipe preference accuracy if hidden HBM is available
     # We need to get hidden_hbm from the profile or pass it through
     # For now, add placeholder - will need to be passed as parameter
@@ -3225,88 +2893,5 @@ def test_spices_csp_multiple_recipes(num_episodes: int = PARAMETERS["num_episode
         logging.info(f"Cross-recipe preference accuracy: {overall_acc:.3f} ({100*overall_acc:.1f}%)")
     logging.info(f"{'='*60}")
     
-    # Visualize HBM evolution for each training recipe (using existing visualization)
-    if PARAMETERS["use_hbm"] and generator._pref_gen._hbm is not None:
-        logging.info(f"\n{'='*60}")
-        logging.info(f"[HBM Visualization]")
-        logging.info(f"{'='*60}")
-        
-        # Show GLOBAL theta and mu evolution across ALL training episodes (from all recipes)
-        if global_hbm_metrics["theta_history"]:
-            logging.info(f"\nVisualizing GLOBAL HBM evolution (θ and μ across all training recipes)")
-            total_training_episodes = len(global_hbm_metrics["theta_history"])
-            
-            # For global visualization, show phi from first recipe as example, 
-            # but theta and mu show evolution across ALL recipes
-            first_recipe = train_recipes[0]
-            if first_recipe in hbm_metrics_by_recipe and hbm_metrics_by_recipe[first_recipe]["phi_history"]:
-                # Create visualization showing:
-                # - phi from first recipe (as example of recipe-specific evolution)
-                # - theta and mu from global tracking (showing evolution across ALL recipes)
-                global_hbm_for_viz = {
-                    "phi_history": hbm_metrics_by_recipe[first_recipe]["phi_history"],
-                    "theta_history": global_hbm_metrics["theta_history"],
-                    "mu_history": global_hbm_metrics["mu_history"],
-                }
-                # Use common spices across recipes
-                common_spices = sorted(list(set(hbm_metrics_by_recipe[first_recipe]["spices"]) & set(global_hbm_metrics["spices"])))[:8]
-                # Pass training statistics for subtitle
-                training_stats = {
-                    'num_episodes': num_episodes,
-                    'num_epochs': PARAMETERS["num_epochs"],
-                    'training_set_size': len(train_recipes)
-                }
-                _plot_hbm_evolution(
-                    global_hbm_for_viz,
-                    recipe_name=first_recipe,
-                    spices=common_spices,
-                    num_episodes=total_training_episodes,
-                    training_stats=training_stats
-                )
-        
-        # Then visualize each training recipe individually (showing recipe-specific phi with final global theta/mu)
-        for recipe_name in train_recipes:
-            if recipe_name in hbm_metrics_by_recipe:
-                metrics = hbm_metrics_by_recipe[recipe_name]
-                if metrics["phi_history"]:
-                    logging.info(f"\nVisualizing HBM evolution for training recipe: {recipe_name}")
-                    # Get final global theta/mu (after all training)
-                    final_global_theta = global_hbm_metrics["theta_history"][-1] if global_hbm_metrics["theta_history"] else {}
-                    final_global_mu = global_hbm_metrics["mu_history"][-1] if global_hbm_metrics["mu_history"] else {}
-                    
-                    # Show recipe-specific phi evolution, but use final global theta/mu (constant line)
-                    hbm_metrics_for_viz = {
-                        "phi_history": metrics["phi_history"],
-                        # Show final global values (constant) to indicate these are shared after all training
-                        "theta_history": [final_global_theta] * len(metrics["phi_history"]),
-                        "mu_history": [final_global_mu] * len(metrics["phi_history"]),
-                    }
-                    total_episodes_per_recipe = num_episodes * PARAMETERS["num_epochs"]
-                    _plot_hbm_evolution(
-                        hbm_metrics_for_viz,
-                        recipe_name=recipe_name,
-                        spices=metrics["spices"],
-                        num_episodes=total_episodes_per_recipe
-                    )
-        
-        # Also visualize for test recipes (final state only - no learning)
-        if test_recipes:
-            logging.info(f"\n[Test Recipe Final Preferences]")
-            hbm = generator._pref_gen._hbm
-            for recipe_name in test_recipes:
-                recipe_spices = list(get_recipe(recipe_name).spices)
-                # Create a single-episode snapshot for visualization (test set - no evolution)
-                test_metrics = {
-                    "phi_history": [{spice: hbm.get_phi(recipe_name, spice) for spice in recipe_spices}],
-                    "theta_history": [{spice: hbm.theta_mean[spice] for spice in recipe_spices}],
-                    "mu_history": [{spice: hbm.mu_mean[spice] for spice in recipe_spices}],
-                }
-                logging.info(f"\nFinal preferences for test recipe: {recipe_name}")
-                # Test recipes show final state only (no evolution, learning disabled)
-                _plot_hbm_evolution(
-                    test_metrics,
-                    recipe_name=recipe_name,
-                    spices=recipe_spices,
-                    num_episodes=1
-                )
+    # Note: multi-recipe HBM visualization removed for now to keep tests lightweight.
 

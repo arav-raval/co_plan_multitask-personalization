@@ -31,10 +31,10 @@ class HierarchicalPreferenceModel:
         recipes: List[str],
         base_satisfaction_bias: float = 3.0, # pull from SpiceEnv
         mu0: float = 0.0,
-        sigma0: float = 1.0,
-        sigma_h: float = 1.0,
-        sigma_r: float = 1.0,
-        sigma_obs: float = 1.0,
+        sigma0: float | None = None,
+        sigma_h: float | None = None,
+        sigma_r: float | None = None,
+        sigma_obs: float | None = None,
         config: SpicesConfig | None = None,
     ) -> None:
 
@@ -45,10 +45,10 @@ class HierarchicalPreferenceModel:
         self.config = config if config is not None else DEFAULT_CONFIG
 
         # Variances (use config if not explicitly provided, otherwise use provided values)
-        self.sigma0 = sigma0 if sigma0 != 1.0 else self.config.hbm.sigma0
-        self.sigma_h = sigma_h if sigma_h != 1.0 else self.config.hbm.sigma_h
-        self.sigma_r = sigma_r if sigma_r != 1.0 else self.config.hbm.sigma_r
-        self.sigma_obs = sigma_obs if sigma_obs != 1.0 else self.config.hbm.sigma_obs
+        self.sigma0 = sigma0 if sigma0 is not None else self.config.hbm.sigma0
+        self.sigma_h = sigma_h if sigma_h is not None else self.config.hbm.sigma_h
+        self.sigma_r = sigma_r if sigma_r is not None else self.config.hbm.sigma_r
+        self.sigma_obs = sigma_obs if sigma_obs is not None else self.config.hbm.sigma_obs
 
         # ---------------- Level 1: μ_s ----------------
         self.mu_mean: Dict[str, float] = {s: mu0 for s in self.spices}
@@ -474,3 +474,188 @@ class HierarchicalPreferenceModel:
         logit = sign_actor * phi
         p = 1.0 / (1.0 + np.exp(-logit))
         return float(np.log(max(p, 1e-9)))
+
+
+class MultiHumanHierarchicalPreferenceModel:
+    """
+    Multi-human hierarchical Bayesian model of preferences.
+
+    This is a "pure" preference model without mood inference, with three levels:
+
+        μ_s           ~ N(μ0, σ0^2)                     (global, across humans & recipes)
+        θ_{h,s}       ~ N(μ_s, σ_h^2)                   (human-specific)
+        φ_{h,r,s}     ~ N(θ_{h,s}, σ_r^2)               (human+recipe-specific)
+
+    where:
+        - s indexes spices
+        - r indexes recipes
+        - h indexes humans
+
+    The intended semantics are:
+        - μ_s captures population-level structure shared across humans and recipes.
+        - θ_{h,s} captures how human h deviates from the population mean.
+        - φ_{h,r,s} captures how human h deviates on recipe r from their own θ_{h,s}.
+
+    This class is designed to be independent from the environment / CSP code so
+    that it can be unit-tested in isolation. Integration with `SpicesAssignCSPGenerator`
+    is expected to pass in a `human_id` and `recipe_name` when observing data.
+    """
+
+    def __init__(
+        self,
+        spices: List[str],
+        recipes: List[str],
+        human_ids: List[str],
+        mu0: float = 0.0,
+        sigma0: float | None = None,
+        sigma_h: float | None = None,
+        sigma_r: float | None = None,
+        sigma_obs: float | None = None,
+        config: SpicesConfig | None = None,
+    ) -> None:
+        self.spices = list(spices)
+        self.recipes = list(recipes)
+        self.humans = list(human_ids)
+
+        # Load configuration
+        self.config = config if config is not None else DEFAULT_CONFIG
+
+        # Variances (use config if not explicitly provided, otherwise use provided values)
+        self.sigma0 = sigma0 if sigma0 is not None else self.config.hbm.sigma0
+        self.sigma_h = sigma_h if sigma_h is not None else self.config.hbm.sigma_h
+        self.sigma_r = sigma_r if sigma_r is not None else self.config.hbm.sigma_r
+        self.sigma_obs = sigma_obs if sigma_obs is not None else self.config.hbm.sigma_obs
+
+        # ---------------- Level 1: μ_s (global across humans & recipes) ----------------
+        self.mu_mean: Dict[str, float] = {s: mu0 for s in self.spices}
+        self.mu_var: Dict[str, float] = {s: self.sigma0**2 for s in self.spices}
+
+        # ---------------- Level 2: θ_{h,s} (human-specific) ----------------
+        # theta_mean[human_id][spice]
+        self.theta_mean: Dict[str, Dict[str, float]] = {
+            h: {s: mu0 for s in self.spices} for h in self.humans
+        }
+        # theta_var[human_id][spice]
+        self.theta_var: Dict[str, Dict[str, float]] = {
+            h: {s: self.sigma0**2 + self.sigma_h**2 for s in self.spices}
+            for h in self.humans
+        }
+
+        # ---------------- Level 3: φ_{h,r,s} (human+recipe-specific) ----------------
+        # phi_mean[human_id][recipe_name][spice]
+        self.phi_mean: Dict[str, Dict[str, Dict[str, float]]] = {
+            h: {
+                r: {s: 0.0 for s in self.spices}
+                for r in self.recipes
+            }
+            for h in self.humans
+        }
+        # phi_var[human_id][recipe_name][spice]
+        self.phi_var: Dict[str, Dict[str, Dict[str, float]]] = {
+            h: {
+                r: {s: self.sigma_r**2 for s in self.spices}
+                for r in self.recipes
+            }
+            for h in self.humans
+        }
+
+    # -------------------------------------------------------------------------
+    # Low-level update primitives
+    # -------------------------------------------------------------------------
+    def update_phi(self, human_id: str, recipe_name: str, spice: str, g: float) -> None:
+        """
+        Update φ_{h,r,s} for a single pseudo-observation g.
+
+        Observation model:
+            g ~ N(φ_{h,r,s}, σ_obs^2)
+            φ_{h,r,s} ~ N(θ_{h,s}, σ_r^2)
+
+        Posterior (Normal-Normal):
+            post_var  = 1 / (1/σ_r^2 + 1/σ_obs^2)
+            post_mean = post_var * (θ_{h,s}/σ_r^2 + g/σ_obs^2)
+        """
+        assert human_id in self.humans, f"Unknown human_id: {human_id}"
+        assert recipe_name in self.recipes, f"Unknown recipe_name: {recipe_name}"
+        assert spice in self.spices, f"Unknown spice: {spice}"
+
+        theta_hs = self.theta_mean[human_id][spice]
+        sigma_r2 = self.sigma_r**2
+        sigma_obs2 = self.sigma_obs**2
+
+        # Prior for φ
+        prior_mean = theta_hs
+        prior_var = sigma_r2
+
+        # Posterior
+        post_var = 1.0 / (1.0 / prior_var + 1.0 / sigma_obs2)
+        post_mean = post_var * (prior_mean / prior_var + g / sigma_obs2)
+
+        self.phi_mean[human_id][recipe_name][spice] = post_mean
+        self.phi_var[human_id][recipe_name][spice] = post_var
+
+    def update_theta_and_mu(self) -> None:
+        """
+        Update θ_{h,s} from all φ_{h,r,s}, then update μ_s from all θ_{h,s}.
+
+        - For each human h, spice s:
+              φ_{h,r,s} pooled over recipes r to update θ_{h,s}.
+        - For each spice s:
+              θ_{h,s} pooled over humans h to update μ_s.
+        """
+        # --- Update θ_{h,s} from φ_{h,r,s} ---
+        for h in self.humans:
+            for s in self.spices:
+                # Gather φ over recipes for this human and spice
+                phis: List[float] = []
+                for r in self.recipes:
+                    if s in self.phi_mean[h][r]:
+                        phis.append(self.phi_mean[h][r][s])
+                if not phis:
+                    continue
+
+                y = float(np.mean(phis))
+                prior_mean = self.mu_mean[s]
+                prior_var = self.sigma0**2 + self.sigma_h**2
+                sigma_obs2 = self.sigma_r**2
+
+                post_var = 1.0 / (1.0 / prior_var + 1.0 / sigma_obs2)
+                post_mean = post_var * (prior_mean / prior_var + y / sigma_obs2)
+
+                self.theta_mean[h][s] = post_mean
+                self.theta_var[h][s] = post_var
+
+        # --- Update μ_s from θ_{h,s} across humans ---
+        for s in self.spices:
+            thetas: List[float] = []
+            for h in self.humans:
+                if s in self.theta_mean[h]:
+                    thetas.append(self.theta_mean[h][s])
+            if not thetas:
+                continue
+
+            # Pool θ across humans
+            y = float(np.mean(thetas))
+            prior_mean = 0.0
+            prior_var = self.sigma0**2
+            sigma_obs2 = self.sigma_h**2
+
+            post_var = 1.0 / (1.0 / prior_var + 1.0 / sigma_obs2)
+            post_mean = post_var * (prior_mean / prior_var + y / sigma_obs2)
+
+            self.mu_mean[s] = post_mean
+            self.mu_var[s] = post_var
+
+    # -------------------------------------------------------------------------
+    # Convenience getters
+    # -------------------------------------------------------------------------
+    def get_mu(self, spice: str) -> float:
+        """Get global preference μ_s."""
+        return self.mu_mean[spice]
+
+    def get_theta(self, human_id: str, spice: str) -> float:
+        """Get human-level preference θ_{h,s}."""
+        return self.theta_mean[human_id][spice]
+
+    def get_phi(self, human_id: str, recipe_name: str, spice: str) -> float:
+        """Get human+recipe-specific preference φ_{h,r,s}."""
+        return self.phi_mean[human_id][recipe_name][spice]
