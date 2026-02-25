@@ -87,9 +87,6 @@ class HierarchicalPreferenceModel:
         self.mood_prior = np.array(self.config.mood_prior_array, dtype=float)
         self.mood_posterior = self.mood_prior.copy()
         
-        # Track mood posterior history for smoothing (prevent rapid swings)
-        self._mood_posterior_history = []
-        
         # Track number of observations for adaptive EMA
         self._total_observations = 0
         
@@ -97,7 +94,6 @@ class HierarchicalPreferenceModel:
         self._spice_observation_count: Dict[str, int] = defaultdict(int)
 
         self.base_satisfaction_bias = base_satisfaction_bias
-        self.mood_bias_strength = self.config.mood_bias_strength
         self.mood_bias = self.config.get_mood_bias()
 
     # --- Mood inference ---
@@ -105,73 +101,75 @@ class HierarchicalPreferenceModel:
         self, actor: str, spice: str, satisfaction: float, m: str, recipe_name: str
     ) -> float:
         """
-        Compute log-probability of satisfaction given mood, actor, and spice using the 
-        generative model logit = sign(actor)*phi + mood_bias
-        
-        CONTINUOUS SATISFACTION: satisfaction is now continuous in [-1, +1].
-        We model it using a Beta likelihood for better handling of continuous values.
+        Compute log P(satisfaction | mood, actor, spice) under a Gaussian model.
+
+        Generative model:
+            logit  = sign(actor) * phi + mood_bias[m][actor]   (neutral)
+            logit  = mood_bias[m][actor] + sign(actor) * phi * pref_weight  (non-neutral)
+            p      = sigmoid(logit)
+            sat    ~ N(2p - 1, sigma_sat^2)
+
+        For non-neutral moods the preference phi is down-weighted (pref_weight < 1)
+        because mood dominates.  The weight is further reduced when satisfaction
+        disagrees with the preference expectation, which is strong evidence that
+        the mood — not the preference — is driving the outcome.
+
+        When recipe-specific phi ≈ 0 (early learning), falls back to the
+        human-level theta to provide a non-zero signal.
         """
+        # Phi with theta fallback for early episodes
         phi = self.phi_mean[recipe_name][spice]
+        if abs(phi) < 1e-6 and spice in self.theta_mean:
+            phi = self.theta_mean[spice]
+        phi = float(np.clip(phi, -self.base_satisfaction_bias, self.base_satisfaction_bias))
+
         sign_actor = +1.0 if actor == "human" else -1.0
 
-        logit = sign_actor * phi + self.mood_bias[m][actor]
+        if m == "neutral":
+            logit = sign_actor * phi + self.mood_bias[m][actor]
+        else:
+            mood_bias_val = self.mood_bias[m][actor]
+            pref_expectation = (sign_actor * phi) > 0
+            matches_preference = pref_expectation == (satisfaction > 0)
+            pref_weight = (
+                self.config.mood.non_neutral_pref_weight_match
+                if matches_preference
+                else self.config.mood.non_neutral_pref_weight_mismatch
+            )
+            logit = mood_bias_val + sign_actor * phi * pref_weight
+
         p = 1.0 / (1.0 + np.exp(-logit))
-
-        # For continuous satisfaction, model it as a scaled Beta distribution
-        # Map satisfaction from [-1, +1] to [0, 1] probability space
-        p_obs = (satisfaction + 1.0) / 2.0  # Map [-1, +1] → [0, 1]
-        p_obs = np.clip(p_obs, 1e-6, 1.0 - 1e-6)  # Avoid log(0)
-        
-        # CRITICAL FIX: Use a more stable likelihood for continuous satisfaction
-        # The Beta likelihood with kappa=10 was too sensitive and caused wild mood swings
-        # Instead, use a Gaussian approximation which is more stable
-        
-        # Map expected probability p to expected satisfaction: p → sat_expected
-        # p = 0.0 → sat = -1.0, p = 0.5 → sat = 0.0, p = 1.0 → sat = +1.0
         sat_expected = 2.0 * p - 1.0
-        
-        # Use Gaussian likelihood: satisfaction ~ N(sat_expected, sigma_sat^2)
-        # This is more stable than Beta and prevents extreme log-likelihoods
         sigma_sat = self.config.mood.satisfaction_sigma
-        log_lik = -0.5 * ((satisfaction - sat_expected) / sigma_sat)**2
-        
-        # Add small constant to prevent extreme values
-        log_lik = np.clip(log_lik, self.config.mood.satisfaction_loglik_min, 
-                         self.config.mood.satisfaction_loglik_max)
-        
-        return float(log_lik)
+        log_lik = -0.5 * ((satisfaction - sat_expected) / sigma_sat) ** 2
+        return float(
+            np.clip(
+                log_lik,
+                self.config.mood.satisfaction_loglik_min,
+                self.config.mood.satisfaction_loglik_max,
+            )
+        )
 
-    def _update_mood_posterior(self, recipe_name: str):
-        """
-        Update mood posterior from all observations in current episode.
-        
-        CRITICAL FIX: Add smoothing to prevent rapid mood swings.
-        """
+    def _update_mood_posterior(self, recipe_name: str) -> None:
+        """Update mood posterior from all episode observations with EMA smoothing."""
         logps = []
         for m in MOODS:
-            # Use stronger prior to prevent wild swings
             prior_weight = self.config.mood.mood_prior_weight
             lp = np.log(self.mood_prior[MOODS.index(m)]) * prior_weight
-            
-            for (actor, spice, sat) in self.episode_data:
+            for actor, spice, sat in self.episode_data:
                 lp += self._loglik_feedback_given_mood(actor, spice, sat, m, recipe_name)
             logps.append(lp)
 
-        # Normalize log probs
-        logps = np.array(logps)
-        logps -= np.max(logps)
-        ps = np.exp(logps)
+        logps_arr = np.array(logps)
+        logps_arr -= np.max(logps_arr)
+        ps = np.exp(logps_arr)
         ps /= ps.sum()
-        
-        # CRITICAL FIX: Smooth with previous posterior to prevent rapid swings
-        # Use exponential moving average with high retention
-        if len(self._mood_posterior_history) > 0:
-            smoothing_alpha = self.config.mood.mood_smoothing_alpha
-            ps = smoothing_alpha * ps + (1 - smoothing_alpha) * self.mood_posterior
-            ps /= ps.sum()  # Renormalize
-        
+
+        smoothing_alpha = self.config.mood.mood_smoothing_alpha
+        ps = smoothing_alpha * ps + (1 - smoothing_alpha) * self.mood_posterior
+        ps /= ps.sum()
+
         self.mood_posterior = ps
-        self._mood_posterior_history.append(ps.copy())
 
     # Recipe level updates ----------------------------------------------------
     def _pseudo_obs_weighted(self, actor: str, satisfaction: float, recipe_name: str, spice: str, neutral_threshold: float = 0.5) -> float:
@@ -395,20 +393,14 @@ class HierarchicalPreferenceModel:
             self.mu_mean[s] = post_mean
             self.mu_var[s] = post_var
 
-    def observe(self, recipe_name: str, spice: str, actor: str, satisfaction: float, neutral_threshold: float = 0.5) -> None:
+    def observe(self, recipe_name: str, spice: str, actor: str, satisfaction: float) -> None:
         """
         Process a transition (s, a, y) from the environment.
-        (Update mood posterior only - DON'T update φ yet, wait until end_episode for batch updates)
-        
-        BATCH UPDATE APPROACH: Collect observations during episode, update preferences
-        at end of episode if confident in neutral mood.
         """
         self.episode_data.append((actor, spice, satisfaction))
-        self._current_recipe_name = recipe_name  # Track recipe for batch updates
+        self._current_recipe_name = recipe_name
         self._update_mood_posterior(recipe_name)
-        self._phi_updated_this_episode = False  # Reset flag at start of episode
-        
-        # DON'T update phi here - wait until end_episode() for batch processing
+        self._phi_updated_this_episode = False
 
     def end_episode(self, neutral_threshold: float = 0.5):
         """
@@ -455,10 +447,10 @@ class HierarchicalPreferenceModel:
         
         # Clear episode buffers
         self.episode_data = []
-        # CRITICAL: Don't reset mood posterior to prior - keep it for next episode
-        # This maintains continuity and prevents wild swings at episode boundaries
-        # Only reset if we want to start fresh (commented out for now)
-        # self.mood_posterior = self.mood_prior.copy()
+        # Reset mood posterior to prior at episode end: each episode samples a fresh mood
+        # independently (SpiceEnv.reset calls MoodModel.sample_mood), so carrying the
+        # posterior forward would contaminate the next episode's inference.
+        self.mood_posterior = self.mood_prior.copy()
         self._current_recipe_name = None
 
     def get_phi(self, recipe_name: str, spice: str) -> float:

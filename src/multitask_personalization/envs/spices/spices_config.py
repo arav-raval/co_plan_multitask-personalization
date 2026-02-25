@@ -62,7 +62,8 @@ class MoodConfig:
     """Configuration for Mood Inference."""
     
     # Mood prior probabilities [all_self, neutral, none_self]
-    mood_prior: Tuple[float, float, float] = (0.25, 0.5, 0.25)
+    # Matches the generation distribution in MoodSpec.priors: 80% neutral, 10% each non-neutral
+    mood_prior: Tuple[float, float, float] = (0.1, 0.8, 0.1)
     
     # Mood inference smoothing
     mood_smoothing_alpha: float = 0.3  # EMA smoothing (30% new info, 70% old)
@@ -95,9 +96,6 @@ class UpdateConfig:
     
     # Confidence weighting
     confidence_weight_min: float = 0.2  # Minimum confidence weight (10%)
-    
-    # Legacy classifier threshold (for non-HBM mode)
-    legacy_learning_threshold: float = 0.3  # Minimum neutral confidence for legacy learning
 
 
 @dataclass(frozen=True)

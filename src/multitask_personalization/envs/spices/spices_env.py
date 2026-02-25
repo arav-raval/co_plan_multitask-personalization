@@ -432,7 +432,6 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
             return {
                 "robot_indicated_done": robot_indicated_done,
                 "satisfaction": 0.0,
-                "expected_mood": self._mood_model.get_expected_mood() if hasattr(self._mood_model, "get_expected_mood") else None,
                 "preferred_actor": None,
                 "current_spice": self._current_spice,
                 "last_spice": None,
@@ -441,7 +440,7 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
                 "average_satisfaction": 0.0,
                 "action_history": self._action_history,
                 "mood": self._current_mood,
-                "recipe_name": self.scene_spec.recipe.name,  # Add recipe name for HBM
+                "recipe_name": self.scene_spec.recipe.name,
             }
 
         # Compute satisfaction
