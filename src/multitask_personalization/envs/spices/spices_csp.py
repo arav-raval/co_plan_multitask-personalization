@@ -15,7 +15,11 @@ from multitask_personalization.csp_generation import (
 )
 from multitask_personalization.envs.spices.spices_config import DEFAULT_CONFIG, SpicesConfig
 from multitask_personalization.envs.spices.spices_env import SpiceAction, SpiceState
-from multitask_personalization.envs.spices.spices_hbm import HierarchicalPreferenceModel, MOODS
+from multitask_personalization.envs.spices.spices_hbm import (
+    DEFAULT_HUMAN,
+    MOODS,
+    HierarchicalPreferenceModel,
+)
 from multitask_personalization.structs import (
     CSP,
     CSPConstraint,
@@ -59,8 +63,8 @@ class _AssignPreferenceGenerator(CSPConstraintGenerator[SpiceState, SpiceAction]
         self,
         spice_list: list[str],
         neutral_confidence_threshold: float,
+        human_id: str = DEFAULT_HUMAN,
         recipe_list: list[str] | None = None,
-        base_satisfaction_bias: float = 3.0,
         seed: int = 0,
         verbose: bool = False,
         config: SpicesConfig | None = None,
@@ -68,15 +72,14 @@ class _AssignPreferenceGenerator(CSPConstraintGenerator[SpiceState, SpiceAction]
         super().__init__(seed)
 
         self.config = config if config is not None else DEFAULT_CONFIG
+        self._human_id = human_id
         self._recipe_list: list[str] = recipe_list if recipe_list is not None else []
-        self._base_satisfaction_bias = base_satisfaction_bias
         self._neutral_confidence_threshold = neutral_confidence_threshold
         self._verbose = verbose
 
         self._hbm = HierarchicalPreferenceModel(
             spices=spice_list,
             recipes=self._recipe_list,
-            base_satisfaction_bias=base_satisfaction_bias,
             mu0=self.config.hbm.mu0,
             sigma0=self.config.hbm.sigma0,
             sigma_h=self.config.hbm.sigma_h,
@@ -88,17 +91,20 @@ class _AssignPreferenceGenerator(CSPConstraintGenerator[SpiceState, SpiceAction]
 
     def get_expected_mood(self) -> float:
         """Return expected mood value: -1.0 (none_self) to +1.0 (all_self)."""
+        mp = self._hbm._mood_posterior[self._human_id]
         mood_values = {"all_self": +1.0, "neutral": 0.0, "none_self": -1.0}
-        return sum(self._hbm.mood_posterior[i] * mood_values[m] for i, m in enumerate(MOODS))
+        return sum(mp[i] * mood_values[m] for i, m in enumerate(MOODS))
 
     def get_mood_posterior_breakdown(self) -> dict[str, float]:
         """Return mood posterior probabilities for each mood."""
-        return {mood: float(self._hbm.mood_posterior[i]) for i, mood in enumerate(MOODS)}
+        mp = self._hbm._mood_posterior[self._human_id]
+        return {mood: float(mp[i]) for i, mood in enumerate(MOODS)}
 
     def get_most_likely_mood(self) -> tuple[str, float]:
         """Return the most likely mood and its probability."""
-        idx = int(np.argmax(self._hbm.mood_posterior))
-        return MOODS[idx], float(self._hbm.mood_posterior[idx])
+        mp = self._hbm._mood_posterior[self._human_id]
+        idx = int(np.argmax(mp))
+        return MOODS[idx], float(mp[idx])
 
     def save(self, model_dir: Path) -> None:
         if self._verbose:
@@ -114,7 +120,9 @@ class _AssignPreferenceGenerator(CSPConstraintGenerator[SpiceState, SpiceAction]
 
         def _logprob(actor: str) -> float:
             if self._current_recipe_name:
-                return self._hbm.log_prob_prefer(self._current_recipe_name, current, actor)
+                return self._hbm.log_prob_prefer(
+                    self._human_id, self._current_recipe_name, current, actor
+                )
             return np.log(0.5)
 
         return LogProbCSPConstraint(name, [actor_var], _logprob, threshold=np.log(0.3))
@@ -142,7 +150,7 @@ class _AssignPreferenceGenerator(CSPConstraintGenerator[SpiceState, SpiceAction]
         satisfaction = float(info["satisfaction"])
 
         if recipe_name:
-            self._hbm.observe(recipe_name, spice, actor, satisfaction)
+            self._hbm.observe(self._human_id, recipe_name, spice, actor, satisfaction)
 
         # Capture mood AFTER the observation update but BEFORE the episode reset
         # so callers always see the inferred mood for the current step.
@@ -158,15 +166,16 @@ class _AssignPreferenceGenerator(CSPConstraintGenerator[SpiceState, SpiceAction]
         end_episode handles batch phi updates, theta/mu propagation, and mood
         posterior reset to prior (since each episode draws a fresh mood).
         """
-        self._hbm.end_episode(neutral_threshold=self._neutral_confidence_threshold)
+        self._hbm.end_episode(self._human_id, neutral_threshold=self._neutral_confidence_threshold)
         if self._verbose:
             logging.info("[Episode] HBM updated hierarchical preferences (θ, μ)")
 
     def get_metrics(self) -> dict[str, float]:
         """Return mood inference metrics."""
+        mp = self._hbm._mood_posterior[self._human_id]
         return {
             "expected_mood": self.get_expected_mood(),
-            "neutral_confidence": float(self._hbm.mood_posterior[MOODS.index("neutral")]),
+            "neutral_confidence": float(mp[MOODS.index("neutral")]),
         }
 
 
@@ -177,8 +186,8 @@ class SpicesAssignCSPGenerator(CSPGenerator[SpiceState, SpiceAction]):
         self,
         spice_list: list[str],
         recipe_list: list[str] | None = None,
-        base_satisfaction_bias: float = 3.0,
         neutral_confidence_threshold: float = 0.75,
+        human_id: str = DEFAULT_HUMAN,
         verbose: bool = False,
         config: SpicesConfig | None = None,
         **kwargs,
@@ -187,9 +196,9 @@ class SpicesAssignCSPGenerator(CSPGenerator[SpiceState, SpiceAction]):
         self._spices = list(spice_list)
         self._pref_gen = _AssignPreferenceGenerator(
             self._spices,
-            recipe_list=recipe_list,
-            base_satisfaction_bias=base_satisfaction_bias,
             neutral_confidence_threshold=neutral_confidence_threshold,
+            human_id=human_id,
+            recipe_list=recipe_list,
             seed=self._seed,
             verbose=verbose,
             config=config,
@@ -204,6 +213,7 @@ class SpicesAssignCSPGenerator(CSPGenerator[SpiceState, SpiceAction]):
 
     def get_pref_snapshot(self) -> dict[str, dict[str, float]]:
         """Return current P(prefer actor) for each spice from HBM."""
+        human_id = self._pref_gen._human_id
         recipe_name = self._pref_gen._current_recipe_name or (
             self._pref_gen._recipe_list[-1] if self._pref_gen._recipe_list else None
         )
@@ -212,7 +222,9 @@ class SpicesAssignCSPGenerator(CSPGenerator[SpiceState, SpiceAction]):
             spice_probs: dict[str, float] = {}
             for actor in ["human", "robot"]:
                 if recipe_name:
-                    logp = self._pref_gen._hbm.log_prob_prefer(recipe_name, spice, actor)
+                    logp = self._pref_gen._hbm.log_prob_prefer(
+                        human_id, recipe_name, spice, actor
+                    )
                     p = float(np.exp(logp))
                 else:
                     p = 0.5
@@ -266,7 +278,10 @@ class SpicesAssignCSPGenerator(CSPGenerator[SpiceState, SpiceAction]):
         def _cost_fn(actor_val: str) -> float:
             if self._pref_gen._current_recipe_name:
                 return -self._pref_gen._hbm.log_prob_prefer(
-                    self._pref_gen._current_recipe_name, current, actor_val
+                    self._pref_gen._human_id,
+                    self._pref_gen._current_recipe_name,
+                    current,
+                    actor_val,
                 )
             return 0.0
 
@@ -283,7 +298,10 @@ class SpicesAssignCSPGenerator(CSPGenerator[SpiceState, SpiceAction]):
             for a in ["human", "robot"]:
                 if self._pref_gen._current_recipe_name:
                     logp = self._pref_gen._hbm.log_prob_prefer(
-                        self._pref_gen._current_recipe_name, current_spice, a
+                        self._pref_gen._human_id,
+                        self._pref_gen._current_recipe_name,
+                        current_spice,
+                        a,
                     )
                     p = float(np.exp(logp))
                 else:

@@ -16,14 +16,15 @@ from recipe import get_recipe, get_profile
 from collections import Counter
 
 from multitask_personalization.envs.spices.spices_hbm import (
+    DEFAULT_HUMAN,
     HierarchicalPreferenceModel,
-    MultiHumanHierarchicalPreferenceModel,
 )
 from hidden_hbm_configs import get_hidden_hbm_config, create_theta_params_from_config, list_hidden_hbm_configs
 
 # ---------------- PARAMETER SETUP ----------------
 PARAMETERS = {
-    "num_episodes": 50,
+    "num_episodes": 100,
+    "num_seeds": 3,  # Number of seeds to run for error bars
     "num_epochs": 2, 
     "profile": "ChefA",
     "recipe_name": "FortyStepFeast",
@@ -31,55 +32,53 @@ PARAMETERS = {
     "csp_seed": 369,
     "logging_level": logging.INFO,
     "train_frac": 0.7,  # 70% train, 30% test for better split
-    "verbose": True,
-    "num_seeds": 1,  # Number of seeds to run for error bars
+    "verbose": False,  # Suppress per-episode reset logs in multi-episode runs
     "use_hidden_hbm": True,  # Whether to use hidden HBM for generating preferences
     "num_humans": 3,  # Number of different humans (hidden HBMs) to test
-    "hidden_hbm_config_name": "SpiceSpecificHuman",  # Name of hidden HBM config to use (see hidden_hbm_configs.py)
+    "hidden_hbm_config_name": "AlternatingHuman",  # Covers all recipe spices with ±1.5 theta
     "hidden_hbm_config_names": None,  # List of config names for multiple humans (if None, auto-generates)
 }
 # --------------------------------------------------
 
 # ---------------- HELPER FUNCTIONS ----------------
-def _create_hidden_hbm(spices: list[str], recipes: list[str], 
+def _create_hidden_hbm(spices: list[str], recipes: list[str],
                        config_name: str | None = None,
-                       theta_params: dict[str, float] | None = None, 
-                       mu0: float = 0.0, sigma0: float = 1.0, sigma_h: float = 1.0, 
-                       sigma_r: float = 1.0, base_satisfaction_bias: float = 3.0) -> HierarchicalPreferenceModel:
+                       theta_params: dict[str, float] | None = None,
+                       mu0: float = 0.0, sigma0: float = 1.0, sigma_h: float = 1.0,
+                       sigma_r: float = 1.0) -> HierarchicalPreferenceModel:
     """
     Create a hidden HBM with fixed parameters for each spice.
-    
+
     Args:
         spices: List of all spices
         recipes: List of all recipes
         config_name: Optional name of config from hidden_hbm_configs.py (takes precedence)
         theta_params: Optional dict mapping spice -> theta_mean (human-level preference).
-                      If None and config_name not provided, will use default mu0 for all spices.
-        mu0: Global mean for spices not in theta_params (only used if config_name not provided)
-        sigma0: Global variance (only used if config_name not provided)
-        sigma_h: Human-level variance (only used if config_name not provided)
-        sigma_r: Recipe-level variance (only used if config_name not provided)
-        base_satisfaction_bias: Base satisfaction bias (only used if config_name not provided)
-    
+                      If None and config_name not provided, mu0 is used for all spices.
+        mu0: Global mean for spices not in theta_params (only when config_name not provided)
+        sigma0: Global variance (only when config_name not provided)
+        sigma_h: Human-level variance (only when config_name not provided)
+        sigma_r: Recipe-level variance (only when config_name not provided)
+
+    Note: base_satisfaction_bias is read from DEFAULT_CONFIG.satisfaction.base_satisfaction_bias
+    inside HierarchicalPreferenceModel and does not need to be passed here.
+
     Returns:
         HierarchicalPreferenceModel with fixed parameters
     """
-    # Load from config if provided
     if config_name is not None:
         config = get_hidden_hbm_config(config_name)
-        theta_params = create_theta_params_from_config(config, spices)
+        theta_params = config.generate_theta(spices)
         sigma0 = config.sigma0
         sigma_h = config.sigma_h
         sigma_r = config.sigma_r
-        base_satisfaction_bias = config.base_satisfaction_bias
         sigma_obs = config.sigma_obs
     else:
         sigma_obs = 1.0
-    
+
     hbm = HierarchicalPreferenceModel(
         spices=spices,
         recipes=recipes,
-        base_satisfaction_bias=base_satisfaction_bias,
         mu0=mu0,
         sigma0=sigma0,
         sigma_h=sigma_h,
@@ -177,7 +176,7 @@ def run_one_episode(
     generator,
     solver_seed: int = 123,
     track_mood_evolution: bool = True,
-    multi_human_hbm: MultiHumanHierarchicalPreferenceModel | None = None,
+    multi_human_hbm: HierarchicalPreferenceModel | None = None,
     human_id: str | None = None,
 ):
     """Run a full episode of a recipe and update the generator (training step).
@@ -251,12 +250,7 @@ def run_one_episode(
             sign = 1.0 if actor == "human" else -1.0
             g = sign * satisfaction * getattr(env, "_base_satisfaction_bias", 1.0)
 
-            try:
-                multi_human_hbm.update_phi(human_id, recipe_name, spice, g)
-            except (AssertionError, KeyError):
-                # If the spice / recipe / human is not registered in the shared HBM,
-                # skip the update rather than failing the episode.
-                pass
+            multi_human_hbm.update_phi(human_id, recipe_name, spice, g)
 
         # Get true mood (should be same throughout episode)
         if true_mood is None and "mood" in info:
@@ -449,7 +443,7 @@ def update_metrics(metrics, info, hbm_info):
     generator, spices, recipe_name = hbm_info
     hbm = generator._pref_gen._hbm
     # Recipe-specific preferences (phi)
-    phi_snapshot = {spice: hbm.get_phi(recipe_name, spice) for spice in spices}
+    phi_snapshot = {spice: hbm.get_phi(DEFAULT_HUMAN, recipe_name, spice) for spice in spices}
     metrics["phi_history"].append(phi_snapshot)
 
     # Human-level preferences (theta)
@@ -1200,7 +1194,7 @@ def visualize_multirecipe_hbm(hbm_history, train_recipes, test_recipes, generato
     for recipe_name in all_recipes:
         recipe_spices = [s for s in all_spices if s in get_recipe(recipe_name).spices]
         final_phi_by_recipe[recipe_name] = {
-            spice: hbm.get_phi(recipe_name, spice) for spice in recipe_spices
+            spice: hbm.get_phi(DEFAULT_HUMAN, recipe_name, spice) for spice in recipe_spices
         }
     
     # Create comprehensive visualization
@@ -1957,7 +1951,7 @@ def visualize_multiple_humans_comparison(all_human_metrics: dict, all_human_aggr
                 )
 
 def visualize_shared_multi_human_hbm_snapshot(
-    multi_human_hbm: MultiHumanHierarchicalPreferenceModel,
+    multi_human_hbm: HierarchicalPreferenceModel,
     recipe_name: str,
     spices: list[str],
     human_names: list[str],
@@ -2222,7 +2216,7 @@ def _run_single_recipe_experiment(
     env_seed: int,
     csp_seed: int,
     hidden_hbm: HierarchicalPreferenceModel | None = None,
-    multi_human_hbm: MultiHumanHierarchicalPreferenceModel | None = None,
+    multi_human_hbm: HierarchicalPreferenceModel | None = None,
     human_id: str | None = None,
     multi_human_histories: dict | None = None,
 ) -> dict:
@@ -2356,7 +2350,9 @@ def _run_single_recipe_experiment(
             # Log HBM preference for first spice as example
             if spices:
                 first_spice = spices[0]
-                phi = csp_generator._pref_gen._hbm.get_phi(recipe_name, first_spice)
+                phi = csp_generator._pref_gen._hbm.get_phi(
+                    csp_generator._pref_gen._human_id, recipe_name, first_spice
+                )
                 theta = csp_generator._pref_gen._hbm.theta_mean[first_spice]
                 mu = csp_generator._pref_gen._hbm.mu_mean[first_spice]
                 logging.info(
@@ -2371,7 +2367,7 @@ def _run_single_recipe_experiment(
     return metrics
 
 @pytest.mark.single_recipe
-def test_spices_csp_single_recipe(num_episodes: int = PARAMETERS["num_episodes"], recipe_name: str = PARAMETERS["recipe_name"]):
+def test_spices_csp_single_recipe_old(num_episodes: int = PARAMETERS["num_episodes"], recipe_name: str = PARAMETERS["recipe_name"]):
     """Test single recipe with optional multiple seeds and hidden HBM."""
     env_seed = PARAMETERS["env_seed"]
     csp_seed = PARAMETERS["csp_seed"]
@@ -2479,11 +2475,7 @@ def test_spices_csp_multiple_humans(num_episodes: int = PARAMETERS["num_episodes
     
     # Shared multi-human HBM that pools across all humans for this recipe.
     human_names = [f"Human_{i + 1}" for i in range(num_humans)]
-    multi_human_hbm = MultiHumanHierarchicalPreferenceModel(
-        spices=spices,
-        recipes=[recipe_name],
-        human_ids=human_names,
-    )
+    multi_human_hbm = HierarchicalPreferenceModel(spices=spices)
     multi_human_histories: dict = {}
 
     # Run experiments for each human
@@ -2617,11 +2609,7 @@ def test_spices_csp_multiple_recipes(num_episodes: int = PARAMETERS["num_episode
 
     # Shared multi-human HBM for cross-recipe structure (single human in this test).
     shared_human_ids = ["Human_1"]
-    multi_human_hbm = MultiHumanHierarchicalPreferenceModel(
-        spices=all_spices,
-        recipes=all_recipes,
-        human_ids=shared_human_ids,
-    )
+    multi_human_hbm = HierarchicalPreferenceModel(spices=all_spices)
 
     # ----------------- TRAINING -----------------
     logging.info(f"\n{'='*60}")
@@ -2666,27 +2654,19 @@ def test_spices_csp_multiple_recipes(num_episodes: int = PARAMETERS["num_episode
             
             for ep in range(num_episodes):
                 total_episodes += 1
-                neutral_examples_before_episode = len(generator._pref_gen._neutral_training_inputs)
-                
+
                 info = run_one_episode(
                     env,
                     generator,
                     multi_human_hbm=multi_human_hbm,
                     human_id=shared_human_ids[0],
                 )
-                
+
                 recipe_sats.append(info.get("average_satisfaction", np.nan))
                 recipe_moods.append(info.get("mood"))
                 recipe_expected_moods.append(info.get("expected_mood", 0.0))
                 recipe_neutral_confs.append(info.get("neutral_confidence", 0.0))
-                
-                # Check if this episode was used for learning (neutral-confident)
-                neutral_examples_after_episode = len(generator._pref_gen._neutral_training_inputs)
-                was_used_for_learning = neutral_examples_after_episode > neutral_examples_before_episode
-                
-                recipe_neutral_episodes.append(was_used_for_learning)
-                if was_used_for_learning:
-                    total_neutral_episodes += 1
+                recipe_neutral_episodes.append(True)  # All episodes contribute
                 
                 if PARAMETERS["verbose"]:
                     logging.info(
@@ -2715,7 +2695,7 @@ def test_spices_csp_multiple_recipes(num_episodes: int = PARAMETERS["num_episode
     logging.info(f"Total epochs: {PARAMETERS['num_epochs']}")
     logging.info(f"Total episodes: {total_episodes} ({len(train_recipes)} recipes × {num_episodes} episodes × {PARAMETERS['num_epochs']} epochs)")
     logging.info(f"Neutral-confident episodes used for learning: {total_neutral_episodes} ({100*total_neutral_episodes/total_episodes:.1f}%)")
-    logging.info(f"Neutral examples collected: {len(generator._pref_gen._neutral_training_inputs)}")
+    logging.info(f"Total neutral-confident episodes used for learning: {total_neutral_episodes}")
     
     # Classifier status
     mood_metrics = generator.get_metrics()
@@ -2876,95 +2856,99 @@ def test_spices_csp_multiple_recipes(num_episodes: int = PARAMETERS["num_episode
     
     # Note: multi-recipe HBM visualization removed for now to keep tests lightweight.
 
+def test_spices_csp_single_recipe():
+    """Single Recipe | Multi-Episode | Multi-Seed learning curves.
 
-def test_spices_csp():
-    """Unit Test:
-        Single Human, Single Recipe"""
-    # Seeds
-    env_seed = PARAMETERS["env_seed"]
-    csp_seed = PARAMETERS["csp_seed"]
-    assert env_seed != csp_seed
+    Tracks:
+        - Stratified satisfaction by mood (neutral / all_self / none_self).
+        - Mood inference accuracy.
+        - Theta-sign accuracy and phi convergence (final seed, signal spices).
+    """
+    num_seeds    = PARAMETERS["num_seeds"]
+    num_episodes = PARAMETERS["num_episodes"]
+    recipe_name  = PARAMETERS["recipe_name"]
+    recipe       = get_recipe(recipe_name)
+    spices       = list(recipe.spices)
 
-    # Recipe
-    recipe_name = PARAMETERS["recipe_name"]
-    recipe = get_recipe(recipe_name)
-    spices = list(recipe.spices)
-
-    # Hidden HBM Model
-    # Use PARAMETER config (if available) else default (AlternatingHuman)
     hidden_hbm = None
     if PARAMETERS["use_hidden_hbm"]:
         config_name = PARAMETERS.get("hidden_hbm_config_name", "AlternatingHuman")
-        hidden_hbm = _create_hidden_hbm(spices, [recipe_name], config_name=config_name)
+        hidden_hbm  = _create_hidden_hbm(spices, [recipe_name], config_name=config_name)
 
-    # Environment (generates SpiceSceneSpec, SpiceHiddenSpec, SpiceEnv)
-    env = _make_env(env_seed, recipe_name, hidden_hbm)
-    obs, _ = env.reset()
-    assert isinstance(obs, SpiceState)
-    assert obs.current_spice in obs.feasible_next
+    # (seed_idx, ep_idx, true_mood, avg_satisfaction, inferred_mood)
+    all_records: list[tuple] = []
 
-    # Create the CSP
-    csp_generator = SpicesAssignCSPGenerator(
-        spice_list=spices,
-        recipe_list=[recipe_name],
-        seed=csp_seed,
+    for i in range(num_seeds):
+        env_seed = PARAMETERS["env_seed"] + i
+        csp_seed = PARAMETERS["csp_seed"] - i
+        assert env_seed != csp_seed
+
+        env           = _make_env(env_seed, recipe_name, hidden_hbm)
+        csp_generator = SpicesAssignCSPGenerator(spice_list=spices, recipe_list=[recipe_name], seed=csp_seed)
+        solver        = RandomWalkCSPSolver(csp_seed, show_progress_bar=False)
+        max_steps     = len(spices) + 5
+
+        for ep in range(num_episodes):
+            obs, _ = env.reset()
+            assert isinstance(obs, SpiceState)
+            assert obs.current_spice in obs.feasible_next
+
+            for _ in range(max_steps):
+                prev_obs = obs
+                csp, samplers, policy, initialization = csp_generator.generate(obs)
+                sol = solver.solve(csp, initialization, samplers)
+                assert sol is not None
+                policy.reset(sol)
+                act = policy.step(obs)
+                obs, reward, done, truncated, info = env.step(act)
+                assert np.isclose(reward, 0.0)
+                csp_generator.observe_transition(prev_obs, act, obs, done, info)
+                if done:
+                    break
+
+            inferred_mood = max(info["mood_posterior"], key=info["mood_posterior"].get)
+            all_records.append((i, ep, info["mood"], info["average_satisfaction"], inferred_mood))
+
+        env.close()
+
+    # Satisfaction separated by mood
+    for mood in ["neutral", "all_self", "none_self"]:
+        ep_sats: dict[int, list[float]] = {}
+        for (_, ep, m, sat, _) in all_records:
+            if m == mood:
+                ep_sats.setdefault(ep, []).append(sat)
+        if not ep_sats:
+            continue
+        logging.info(f"\n---- Learning Curve ({mood}) | {recipe_name} ----")
+        for ep in sorted(ep_sats):
+            sats = ep_sats[ep]
+            logging.info(f"  Ep {ep+1:3d} (n={len(sats)}): avg_sat={np.mean(sats):+.3f}")
+
+    # Mood inference accuracy
+    mood_correct = sum(1 for (_, _, mood, _, inferred) in all_records if mood == inferred)
+    logging.info(
+        f"\n---- Mood Inference: {mood_correct}/{len(all_records)} "
+        f"= {mood_correct / len(all_records):.1%} ----"
     )
 
-    # Create the solver
-    solver = RandomWalkCSPSolver(csp_seed, show_progress_bar = False)
-
-    max_steps = len(spices) + 5
-
-    # Iterate through recipe
-    for _ in range(max_steps):
-        prev_obs = obs
-
-        # Regenerate spice-specific CSP
-        csp, samplers, policy, initialization = csp_generator.generate(obs)    
-        sol = solver.solve(
-            csp, 
-            initialization,
-            samplers
-        )
-        assert sol is not None
-        policy.reset(sol)
-
-        act = policy.step(obs)
-        obs, reward, done, truncated, info = env.step(act)
-
-        assert isinstance(obs, SpiceState)
-        assert np.isclose(reward, 0.0)
-
-        # Update mood posteriors
-        csp_generator.observe_transition(prev_obs, act, obs, done, info)
-
-        if done: 
-            break
-    env.close()
-
-    # Summary statistics
-    logging.info(f"\n---- Summary: {recipe_name} ----")
-    logging.info(f" Average Satisfaction: {info['average_satisfaction']:.4f}")
-
-    inferred_mood = max(info['mood_posterior'], key=info['mood_posterior'].get)
-    true_mood = info['mood']
-    logging.info(f" True Mood: {true_mood} | Inferred Mood: {inferred_mood}")
-
-    logging.info(f"\n---- Hierarchical Bayesian Model Values ----")
-    hbm = csp_generator._pref_gen._hbm
-    # Sample a few spices
-    sample_size = 3
-    for spice in random.sample(spices, sample_size):
-        learned_phi = hbm.phi_mean[recipe_name].get(spice, 0.0)
-        learned_theta = hbm.theta_mean.get(spice, 0.0)
-
-        true_phi = hidden_hbm.phi_mean[recipe_name].get(spice, 0.0) if hidden_hbm else None
-        true_theta = hidden_hbm.theta_mean.get(spice, 0.0) if hidden_hbm else None
-
-        logging.info(f"\n{spice:20s}")
-        logging.info(f" Learned Parameters: phi={learned_phi:+.4f}, theta={learned_theta:+.4f}")
-        if true_phi is not None and true_theta is not None:
-            logging.info(f" Ground Truth Parameters: phi={true_phi:+.4f}, theta={true_theta:+.4f}")
+    # Theta and Phi Convergence
+    if hidden_hbm is not None:
+        hbm           = csp_generator._pref_gen._hbm
+        signal_spices = [s for s in spices if abs(hidden_hbm.theta_mean.get(s, 0.0)) > 0.3]
+        if signal_spices:
+            correct = sum(
+                np.sign(hbm.phi_mean[recipe_name].get(s, 0.0)) == np.sign(hidden_hbm.theta_mean.get(s, 0.0))
+                for s in signal_spices
+            )
+            logging.info(
+                f"\n---- Theta-Sign Accuracy (final seed): "
+                f"{correct}/{len(signal_spices)} = {correct / len(signal_spices):.1%} ----"
+            )
+            logging.info("\n---- Phi Convergence (final seed, first 5 signal spices) ----")
+            for s in signal_spices[:5]:
+                learned = hbm.phi_mean[recipe_name].get(s, 0.0)
+                true    = hidden_hbm.theta_mean.get(s, 0.0)
+                logging.info(f"  {s:20s}: learned={learned:+.3f}  true_theta={true:+.3f}")
 
 def test_mood_inference():
     MOODS = ("all_self", "neutral", "none_self")

@@ -36,15 +36,9 @@ class HBMConfig:
     variance_adaptive_min_scale: float = 0.3  # Minimum LR scale when variance is very low
     variance_adaptive_max_scale: float = 1.0  # Maximum LR scale when variance is high
     variance_converged_threshold: float = 0.3  # Variance below this means "converged" (use more smoothing)
-    
-    # Single recipe case: stronger updates
-    single_recipe_prior_var_multiplier: float = 0.25  # Reduce prior variance by 4x
-    single_recipe_obs_var_multiplier: float = 0.25  # Reduce obs variance by 4x
-    single_recipe_theta_prior_weight: float = 0.3  # Weight current theta in prior (30% current, 70% mu)
-    
+
     # Learning rates for phi updates
     base_learning_rate: float = 0.3  # Base learning rate (increased for faster convergence)
-    max_learning_rate: float = 0.4  # Maximum learning rate (with confidence boost)
     
     # Learning rate annealing (reduce over time for stability)
     use_lr_annealing: bool = True  # Enable learning rate annealing
@@ -89,13 +83,9 @@ class MoodConfig:
 @dataclass(frozen=True)
 class UpdateConfig:
     """Configuration for Update Thresholds and Filtering."""
-    
-    # Neutral confidence threshold for updates
-    neutral_confidence_threshold: float = 0.5 # Minimum confidence to update preferences
-    effective_threshold_min: float = 0.5 # Minimum effective threshold (lowered to allow more updates)
-    
-    # Confidence weighting
-    confidence_weight_min: float = 0.2  # Minimum confidence weight (10%)
+
+    # Confidence weighting for phi updates when mood is neutral-confident
+    confidence_weight_min: float = 0.2  # Minimum confidence weight
 
 
 @dataclass(frozen=True)
