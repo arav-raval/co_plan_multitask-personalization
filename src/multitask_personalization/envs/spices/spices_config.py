@@ -1,5 +1,5 @@
 """
-Centralized configuration for Spices Environment HBM and Mood Inference.
+Centralized configuration for Spices Environment HBM and Mood Inference
 
 This file contains all hyperparameters and configuration values used throughout
 the spices environment, HBM, and mood inference systems. Modify values here to
@@ -18,7 +18,7 @@ class HBMConfig:
     mu0: float = 0.0  # Global prior mean
     sigma0: float = 1.0  # Global variance (σ₀²)
     sigma_h: float = 1.0  # Human-level variance (σₕ²)
-    sigma_r: float = 1.0  # Recipe-level variance (σᵣ²)
+    sigma_r: float = 1.5  # Recipe-level variance (σᵣ²) — moderately high to weaken wrong-theta prior without slowing convergence too much
     sigma_obs: float = 1.0  # Observation variance (σ_obs²)
     
     # Exponential Moving Average (EMA) for phi updates
@@ -46,9 +46,10 @@ class HBMConfig:
     lr_annealing_end: int = 500  # Finish annealing at N observations
     lr_annealing_min: float = 0.1  # Minimum learning rate after annealing
     
-    # Preference mismatch detection
+    # Preference mismatch detection — penalty removed (set to 1.0) so that
+    # contradicting observations have full weight when correcting a wrong-prior phi.
     preference_mismatch_threshold: float = 1.0  # Only check mismatch if |phi| > threshold
-    preference_mismatch_penalty: float = 0.3  # Reduce update to 30% if mismatch detected
+    preference_mismatch_penalty: float = 1.0  # No penalty: full signal even on contradicting obs
 
 
 @dataclass(frozen=True)

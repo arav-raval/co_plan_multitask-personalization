@@ -40,21 +40,105 @@ def _second_half_theta(spices: list[str]) -> dict[str, float]:
     return {s: -2.0 if i < mid else 2.0 for i, s in enumerate(spices)}
 
 
-# Defined here so it can be referenced by the consistent/variable generators below.
+# Comprehensive spice preference mapping covering the full ChefComplex vocabulary
+# and beyond (80+ spices).  Preferences are semantically grounded: the simulated human
+# enjoys aromatic/sweet/citrusy flavours and dislikes sharp heat and bitter ingredients.
+# Unlisted spices default to 0.0 (no preference) in _spice_specific_theta().
 _SPICE_SPECIFIC_THETA: dict[str, float] = {
-    "salt": 2.0,
-    "garlic": 1.5,
-    "onion": 1.0,
-    "ginger": 1.5,
-    "turmeric": 0.5,
-    "pepper": -2.0,
-    "chili": -1.5,
-    "cumin": -1.0,
-    "coriander": -0.5,
-    "sugar": 0.3,
-    "cinnamon": -0.3,
-    "basil": 0.5,
-    "olive_oil": 0.0,
+    # ── Core aromatics (loved) ────────────────────────────────────────────────
+    "salt":            +2.0,
+    "garlic":          +1.5,
+    "onion":           +1.0,
+    "ginger":          +1.5,
+    "saffron":         +1.5,
+    "avocado":         +1.5,
+    "mint":            +1.2,
+    "honey":           +1.0,
+    "tomato":          +1.0,
+    "cumin":           +1.0,
+    "lemongrass":      +1.0,
+    "almonds":         +1.0,
+    "tahini":          +1.0,
+    "coconut":         +1.0,
+    "turmeric":        +0.5,
+    "coriander":       +0.8,
+    "paprika":         +0.8,
+    "ghee":            +0.8,
+    "lemon":           +0.8,
+    "lime":            +0.8,
+    "basil":           +0.8,
+    "kaffir_lime":     +0.8,
+    "coconut_milk":    +0.8,
+    "niter_kibbeh":    +0.8,
+    "apricot":         +0.8,
+    "brown_sugar":     +0.8,
+    "orange_zest":     +0.8,
+    # ── Mild positives ────────────────────────────────────────────────────────
+    "olive_oil":       +0.5,
+    "coconut_oil":     +0.5,
+    "sesame_seeds":    +0.5,
+    "parsley":         +0.5,
+    "lavender":        +0.5,
+    "black_olives":    +0.5,
+    "scallion":        +0.5,
+    "shallot":         +0.5,
+    "raisins":         +0.5,
+    "mirin":           +0.5,
+    "jaggery":         +0.5,
+    "yogurt":          +0.5,
+    "cocoa":           +0.5,
+    "zaatar":          +0.5,
+    "cumin_seed":      +0.5,
+    "pear":            +0.5,
+    "pistachio":       +0.8,   # nutty, rich — loved like almonds
+    "butter":          +0.5,   # rich and creamy, mildly loved
+    "cilantro":        +0.5,
+    "thyme":           +0.5,
+    "rosemary":        +0.3,   # 1 training recipe (MediterraneanComplex) — below signal threshold
+    "marjoram":        +0.3,   # 1 training recipe (HungarianGulash) — below signal threshold
+    "sesame_oil":      +0.3,   # 1 training recipe (AsianFusionBowl) — below signal threshold
+    "soy_sauce":       +0.5,
+    "preserved_lemon": +0.3,   # 1 training recipe (MoroccanTagine) — below signal threshold
+    "palm_sugar":      +0.5,
+    "sumac":           +0.5,
+    "fennel_seed":     +0.5,
+    "curry_leaves":    +0.5,
+    "galangal":        +0.5,
+    "cinnamon":        +0.5,
+    "milk":            +0.3,   # 1 training recipe (KashmiriWazwan) — below signal threshold
+    "advieh":          +0.8,   # 1 training recipe (PersianTahdig) — strengthened so 1 recipe is enough
+    "sugar":           +0.5,
+    "bay_leaf":        +0.5,
+    # ── Neutral / slightly negative ───────────────────────────────────────────
+    "rice_vinegar":    -0.3,   # 1 training recipe (AsianFusionBowl) — below signal threshold
+    "oregano":         -0.5,
+    "capers":          -0.3,   # 1 training recipe (MediterraneanComplex) — below signal threshold
+    "barberries":      -0.8,   # 1 training recipe (PersianTahdig) — strengthened so 1 recipe is enough
+    "allspice":        -0.5,
+    "tamarind":        -0.5,
+    "caraway_seed":    -0.3,   # 1 training recipe (HungarianGulash) — below signal threshold
+    # ── Disliked (heat, bitter, pungent) ──────────────────────────────────────
+    "cayenne":         -0.8,   # hot spice, disliked
+    "harissa":         -1.0,   # fiery chili paste, disliked
+    "garam_masala":    -0.8,
+    "cardamom":        -0.8,
+    "mustard_seed":    -0.8,
+    "fish_sauce":      -0.8,
+    "mustard_oil":     -0.8,
+    "clove":           -1.0,
+    "star_anise":      -1.0,
+    "chipotle":        -1.0,
+    "shrimp_paste":    -1.0,
+    "fenugreek":       -1.2,
+    "jalapeno":        -1.2,
+    "chili":           -1.5,
+    "asafoetida":      -1.5,
+    "gochujang":       -1.5,
+    "gochugaru":       -1.5,
+    "black_pepper":    -1.5,
+    "berbere":         -1.5,
+    "green_chili":     -1.5,
+    "pepper":          -2.0,
 }
 
 
@@ -154,8 +238,8 @@ SPICE_SPECIFIC_HUMAN = HiddenHBMConfig(
 CONSISTENT_HUMAN = HiddenHBMConfig(
     name="ConsistentHuman",
     theta_mean={},
-    sigma_r=0.5,  # Tighter variance → more consistent preferences across recipes
-    sigma_h=0.8,
+    sigma_r=0.1,  # Low noise: P(episode flip | theta=±0.8) < 4% → clean learning signal
+    sigma_h=0.3,  # Low human-level variance: theta is stable across recipes
     theta_generator=_consistent_variable_theta,
 )
 

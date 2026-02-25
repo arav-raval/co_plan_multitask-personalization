@@ -1939,6 +1939,63 @@ CHEF_B = ProfileSpec(
     recipes=("SimpleDal", "BreakingBread", "SpicySalsa", "SweetCurry", "GrandmasSoup", "MediterraneanFeast"),
 )
 
+# Complex-only profile for transfer learning tests.
+# Recipes are ordered train-first (first 80% = 16 train, last 20% = 4 test).
+#
+# Test recipe selection criterion: every spice with |theta| > 0.3 in the test
+# recipe must appear in at least one training recipe, so theta can be learned
+# during training and genuinely warm-starts phi on the held-out recipe.
+#
+# The 4 added training recipes (vs original 12) specifically reinforce the
+# signal spices that were under-represented (appearing in only 1 training recipe):
+#   LebaneseKafta         → zaatar (+0.5), sumac (+0.5), allspice (-0.5)
+#   NorthIndianButterChicken → garam_masala (-0.8), cardamom (-0.8), fenugreek (-1.2), clove (-1.0)
+#   RajasthaniLaalMaas    → ghee (+0.8), curry_leaves (+0.5), mustard_seed (-0.8), asafoetida (-1.5)
+#   ThaiBasilStirfry      → basil (+0.8), fish_sauce (-0.8), galangal (+0.5), lemongrass (+1.0)
+#
+# Added to training to ensure all vocabulary signal spices appear in at least one training recipe:
+#   PersianTahdig         → advieh (+0.5), barberries (-0.5), orange_zest (+0.8), pistachio (+0.8)
+#   HungarianGulash       → carrot (0.0), celery (0.0), red_wine (0.0) [covers ItalianRagu/GreekMoussaka]
+#                           also adds: caraway_seed (-0.5), marjoram (+0.5) to vocabulary
+#   IsraeliShakshuka      → feta (0.0), cayenne (-0.8), harissa (-1.0) [covers GreekMoussaka]
+#
+# Remaining test-only spices with no existing recipe coverage (all theta=0.0, neutral):
+#   GreekMoussaka/ItalianRagu: nutmeg, mushroom, sage, parmesan, eggplant
+#   SpanishPaella: white_wine, pimenton
+#   These carry zero preference signal so cannot affect theta accuracy.
+#
+# Recipes are ordered train-first (first 80% = 19 train, last 20% = 4 test).
+CHEF_COMPLEX = ProfileSpec(
+    name="ChefComplex",
+    recipes=(
+        # ── Train (19 recipes) ──────────────────────────────────────────────
+        "UltraComplexFeast",         # 18 spices — pan-fusion core vocabulary
+        "AsianFusionBowl",           # 18 spices — Asian aromatics + warm spices
+        "MediterraneanComplex",      # 18 spices — Med herbs + warm spices
+        "IndianFeastComplex",        # 18 spices — deep Indian spice set
+        "MexicanFiestaComplex",      # 18 spices — Mexican heat + citrus
+        "MiddleEasternFeast",        # 20 spices — Levantine aromatics
+        "MoroccanTagine",            # 19 spices — North African sweet-spice
+        "ThaiCurryComplex",          # 18 spices — Thai aromatics
+        "KashmiriWazwan",            # 18 spices — Kashmiri warm spices
+        "IndonesianRendang",         # 18 spices — SE Asian bold flavors
+        "SouthIndianCurry",          # 18 spices — South Indian
+        "HyderabadiBiryani",         # 19 spices — Biryani spice set
+        "LebaneseKafta",             # 19 spices — reinforces zaatar/sumac/allspice
+        "NorthIndianButterChicken",  # 19 spices — reinforces garam_masala/fenugreek/clove/cardamom
+        "RajasthaniLaalMaas",        # 18 spices — reinforces ghee/curry_leaves/mustard_seed/asafoetida
+        "ThaiBasilStirfry",          # 18 spices — reinforces basil/fish_sauce/galangal/lemongrass
+        "PersianTahdig",             # 18 spices — covers advieh/barberries/orange_zest/pistachio
+        "HungarianGulash",           # 18 spices — covers carrot/celery/red_wine; adds caraway_seed/marjoram
+        "IsraeliShakshuka",          # 19 spices — covers feta; adds cayenne/harissa
+        # ── Test (4 held-out recipes) ────────────────────────────────────────
+        "SpanishPaella",             # 18 spices — Iberian/Med
+        "GreekMoussaka",             # 18 spices — Greek/Med
+        "ItalianRagu",               # 20 spices — Italian
+        "PersianStew",               # 18 spices — Persian
+    ),
+)
+
 # RECIPE LOOKUP
 # # ---------------------------------------------------------------------------
 
@@ -2026,6 +2083,7 @@ ALL_PROFILES = {
     "ChefA": CHEF_A,
     "ChefAExpanded": CHEF_A_EXPANDED,
     "ChefB": CHEF_B,
+    "ChefComplex": CHEF_COMPLEX,
 }
 
 

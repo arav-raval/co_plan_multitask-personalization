@@ -68,6 +68,7 @@ class _AssignPreferenceGenerator(CSPConstraintGenerator[SpiceState, SpiceAction]
         seed: int = 0,
         verbose: bool = False,
         config: SpicesConfig | None = None,
+        shared_hbm: HierarchicalPreferenceModel | None = None,
     ) -> None:
         super().__init__(seed)
 
@@ -77,16 +78,22 @@ class _AssignPreferenceGenerator(CSPConstraintGenerator[SpiceState, SpiceAction]
         self._neutral_confidence_threshold = neutral_confidence_threshold
         self._verbose = verbose
 
-        self._hbm = HierarchicalPreferenceModel(
-            spices=spice_list,
-            recipes=self._recipe_list,
-            mu0=self.config.hbm.mu0,
-            sigma0=self.config.hbm.sigma0,
-            sigma_h=self.config.hbm.sigma_h,
-            sigma_r=self.config.hbm.sigma_r,
-            sigma_obs=self.config.hbm.sigma_obs,
-            config=self.config,
-        )
+        if shared_hbm is not None:
+            self._hbm = shared_hbm
+            self._hbm.register_human(human_id)
+            for r in self._recipe_list:
+                self._hbm.register_recipe(human_id, r)
+        else:
+            self._hbm = HierarchicalPreferenceModel(
+                spices=spice_list,
+                recipes=self._recipe_list,
+                mu0=self.config.hbm.mu0,
+                sigma0=self.config.hbm.sigma0,
+                sigma_h=self.config.hbm.sigma_h,
+                sigma_r=self.config.hbm.sigma_r,
+                sigma_obs=self.config.hbm.sigma_obs,
+                config=self.config,
+            )
         self._current_recipe_name: str | None = None
 
     def get_expected_mood(self) -> float:
@@ -190,6 +197,7 @@ class SpicesAssignCSPGenerator(CSPGenerator[SpiceState, SpiceAction]):
         human_id: str = DEFAULT_HUMAN,
         verbose: bool = False,
         config: SpicesConfig | None = None,
+        shared_hbm: HierarchicalPreferenceModel | None = None,
         **kwargs,
     ) -> None:
         super().__init__(**kwargs)
@@ -202,6 +210,7 @@ class SpicesAssignCSPGenerator(CSPGenerator[SpiceState, SpiceAction]):
             seed=self._seed,
             verbose=verbose,
             config=config,
+            shared_hbm=shared_hbm,
         )
         self._init_rng = np.random.default_rng(self._seed)
 

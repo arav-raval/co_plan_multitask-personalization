@@ -63,8 +63,13 @@ class HierarchicalPreferenceModel:
 
         # Per-human, per-recipe, per-spice observation counts
         self._obs_count: Dict[str, Dict[str, Dict[str, int]]] = {}
-        # Per-human total observations (for learning-rate annealing).
+        # Per-human total observations (lifetime counter, kept for reference).
         self._total_observations: Dict[str, int] = {}
+        # Per-human, per-recipe total observations.
+        # Used for LR annealing and EMA thresholds instead of the lifetime
+        # counter so that training on many recipes does not exhaust the annealing
+        # schedule before the agent reaches a new (e.g. test) recipe.
+        self._recipe_total_obs: Dict[str, Dict[str, int]] = {}
 
         self.base_satisfaction_bias = self.config.satisfaction.base_satisfaction_bias
         self.mood_prior = np.array(self.config.mood_prior_array, dtype=float)
@@ -100,6 +105,7 @@ class HierarchicalPreferenceModel:
         self._phi_updated[human_id] = False
         self._obs_count[human_id] = {}
         self._total_observations[human_id] = 0
+        self._recipe_total_obs[human_id] = {}
 
     def register_recipe(self, human_id: str, recipe_name: str) -> None:
         """Register a new recipe for a human, deriving φ from current θ"""
@@ -115,6 +121,7 @@ class HierarchicalPreferenceModel:
 
             # Observation Count
             self._obs_count[human_id][recipe_name] = {s: 0 for s in self.spices}
+            self._recipe_total_obs[human_id][recipe_name] = 0
 
     def _ensure_registered(self, human_id: str, recipe_name: str) -> None:
         if human_id not in self._theta_mean:
@@ -316,10 +323,15 @@ class HierarchicalPreferenceModel:
         Early observations (per human+recipe+spice) are applied directly without
         smoothing to break the cold-start dependency on theta.
         """
-        total_obs = self._total_observations[human_id]
         self._total_observations[human_id] += 1
         self._obs_count[human_id][recipe_name][spice] += 1
         obs_count = self._obs_count[human_id][recipe_name][spice]
+
+        # Recipe-local observation count: used for all learning-rate and EMA
+        # decisions so that multi-recipe training does not exhaust the annealing
+        # schedule before the agent reaches a new recipe.
+        recipe_obs = self._recipe_total_obs[human_id].get(recipe_name, 0)
+        self._recipe_total_obs[human_id][recipe_name] = recipe_obs + 1
 
         # Direct initialization for the first few per-recipe observations.
         if obs_count <= 5:
@@ -331,16 +343,16 @@ class HierarchicalPreferenceModel:
         sigma_r2 = self.sigma_r**2
         sigma_obs2 = self.sigma_obs**2 / learning_rate
 
-        # Learning-rate annealing
+        # Learning-rate annealing (per-recipe count, not lifetime total).
         anneal_factor = 1.0
         if self.config.hbm.use_lr_annealing:
-            if total_obs > self.config.hbm.lr_annealing_start:
-                if total_obs >= self.config.hbm.lr_annealing_end:
+            if recipe_obs > self.config.hbm.lr_annealing_start:
+                if recipe_obs >= self.config.hbm.lr_annealing_end:
                     anneal_factor = (
                         self.config.hbm.lr_annealing_min / self.config.hbm.base_learning_rate
                     )
                 else:
-                    progress = (total_obs - self.config.hbm.lr_annealing_start) / (
+                    progress = (recipe_obs - self.config.hbm.lr_annealing_start) / (
                         self.config.hbm.lr_annealing_end - self.config.hbm.lr_annealing_start
                     )
                     anneal_factor = 1.0 - progress * (
@@ -364,13 +376,14 @@ class HierarchicalPreferenceModel:
         post_mean = post_var * (theta_mean / sigma_r2 + g / effective_sigma_obs2)
 
         # Adaptive EMA: skip smoothing on the first real update after registration.
+        # EMA phase thresholds also use per-recipe count (same reasoning as annealing).
         current_phi = self._phi_mean[human_id][recipe_name][spice]
         if current_phi == theta_mean:
             smoothed_mean = post_mean
         else:
-            if total_obs < self.config.hbm.ema_early_threshold:
+            if recipe_obs < self.config.hbm.ema_early_threshold:
                 ema_alpha = self.config.hbm.ema_early_alpha
-            elif total_obs < self.config.hbm.ema_medium_threshold:
+            elif recipe_obs < self.config.hbm.ema_medium_threshold:
                 ema_alpha = self.config.hbm.ema_medium_alpha
             elif is_converged:
                 ema_alpha = self.config.hbm.ema_alpha_converged
@@ -396,14 +409,23 @@ class HierarchicalPreferenceModel:
         registered_humans = list(self._theta_mean.keys())
 
         # Update θ_{h,s} from φ_{h,r,s} precision-weighted over recipes.
+        #
+        # IMPORTANT: only include (recipe, spice) pairs where at least one actual
+        # observation has been made.  Uninitialised pairs carry phi = 0.0 (from
+        # register_recipe) with phi_var = sigma_r².  Including them would inject
+        # spurious zero-valued pseudo-observations that dilute the theta estimate
+        # toward 0, causing sign flips for spices with few training recipes.
+        # E.g. a single-recipe spice with true theta = +0.8 ends up at theta ≈ +0.05
+        # because 18 zero-phi recipes overwhelm the 1 signal recipe.
         for h in registered_humans:
             for s in self.spices:
                 phi_means: List[float] = []
                 phi_precisions: List[float] = []
                 for r in self._phi_var.get(h, {}):
                     if s in self._phi_mean[h][r]:
-                        phi_means.append(self._phi_mean[h][r][s])
-                        phi_precisions.append(1.0 / self._phi_var[h][r][s])
+                        if self._obs_count[h].get(r, {}).get(s, 0) > 0:
+                            phi_means.append(self._phi_mean[h][r][s])
+                            phi_precisions.append(1.0 / self._phi_var[h][r][s])
                 if not phi_means:
                     continue
 

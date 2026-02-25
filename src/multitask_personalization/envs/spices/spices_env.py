@@ -143,6 +143,7 @@ class SpiceHiddenSpec:
     """Hidden Human preference over who should add each spice."""
     preferred_actor: dict[str, str]  # {"Spice": "Actor"}
     hidden_hbm: "HierarchicalPreferenceModel | None" = None
+    force_neutral_mood: bool = False  # If True, all episodes use neutral mood (training mode)
 
 @dataclass(frozen=True)
 class SpiceState:
@@ -250,7 +251,11 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
         self._last_satisfaction = 0.0
         self._satisfaction_history = []
         self._action_history = []
-        self._current_mood: str | None = self._mood_model.sample_mood()
+        if self._hidden_spec is not None and self._hidden_spec.force_neutral_mood:
+            self._current_mood = "neutral"
+            self._mood_model.current_mood = "neutral"
+        else:
+            self._current_mood = self._mood_model.sample_mood()
         self._current_spice = self._pick_current_spice()  # also populates _current_feasible
 
         if self.verbose:
