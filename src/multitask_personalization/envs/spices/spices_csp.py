@@ -50,20 +50,11 @@ class _SpiceCSPPolicy(CSPPolicy[SpiceState, SpiceAction]):
         if (not obs.current_spice) or (len(obs.feasible_next) == 0 and len(obs.remaining_spices) == 0):
             if not self._done_emitted:
                 self._done_emitted = True
-            # If called again after done, keep returning done
             return (1, None)
         
-
-        #Assign the selected actor for the current spice
-        if self._actor in ("human", "robot"):
-            actor = self._actor
-            if self._verbose:
-                logging.info(f"Using pre-assigned actor: {actor}")
-        else:
-            actor = self._rng.choice(["human", "robot"])
-            if self._verbose:
-                logging.info(f"Choosing random actor: {actor}")
-        return (0, actor)
+        # Assign the selected actor for the current spice
+        assert self._actor in ("human", "robot")
+        return (0, self._actor)
 
     def check_termination(self, obs: SpiceState) -> bool:
         return self._done_emitted
@@ -314,18 +305,18 @@ class _AssignPreferenceGenerator(CSPConstraintGenerator[SpiceState, SpiceAction]
         current = obs.current_spice
 
         def _logprob(actor: str) -> float:
+            # Use HBM
             if self._use_hbm and self._hbm is not None and self._current_recipe_name:
-                # Use HBM's log probability
                 return self._hbm.log_prob_prefer(self._current_recipe_name, current, actor)
+            # Fallback to classifier TODO: REMOVE THIS [LEGACY]                
             elif hasattr(self, '_classifier') and self._classifier is not None:
-                # Fallback to classifier
                 x = self._featurize(current, actor)
                 p = self._safe_predict_proba(x)
                 return np.log(p)
             else:
                 return np.log(0.5)  # Uniform prior
 
-        return LogProbCSPConstraint(name, [actor_vars], _logprob, threshold=np.log(1e-6))
+        return LogProbCSPConstraint(name, [actor_vars], _logprob, threshold=np.log(0.3))
 
     def learn_from_transition(
         self, obs: SpiceState, act: SpiceAction, next_obs: SpiceState, done: bool, info: dict[str, Any]
@@ -548,19 +539,8 @@ class SpicesAssignCSPGenerator(CSPGenerator[SpiceState, SpiceAction]):
     def _generate_variables(self, obs: SpiceState) -> tuple[list[CSPVariable], dict[CSPVariable, Any]]:
         actor = CSPVariable("actor", EnumSpace(["human", "robot"]))
         variables = [actor]
+        initialization = {actor: self._init_rng.choice(["human", "robot"])}
 
-        # Check if mood forces a specific actor
-        mood, conf = self._pref_gen.get_most_likely_mood()
-        if mood == "all_self" and conf >= self._pref_gen._neutral_confidence_threshold:
-            # Force human actor
-            initialization = {actor: "human"}
-        elif mood == "none_self" and conf >= self._pref_gen._neutral_confidence_threshold:
-            # Force robot actor
-            initialization = {actor: "robot"}
-        else:
-            # Randomize the initial assignment
-            initialization = {actor: self._init_rng.choice(["human", "robot"])}
-   
         return variables, initialization
 
     def _generate_personal_constraints(self, obs: SpiceState, variables: list[CSPVariable]) -> list[CSPConstraint]:
@@ -571,7 +551,7 @@ class SpicesAssignCSPGenerator(CSPGenerator[SpiceState, SpiceAction]):
         # Check current mood belief
         mood, conf = self._pref_gen.get_most_likely_mood()
         
-        # If confident in all_self mood, force human actor
+        # Force actor if confident on non-neutral mood
         if mood == "all_self" and conf >= self._pref_gen._neutral_confidence_threshold:
             constraints.append(
                 FunctionalCSPConstraint(
@@ -580,11 +560,8 @@ class SpicesAssignCSPGenerator(CSPGenerator[SpiceState, SpiceAction]):
                     lambda actor: actor == "human",
                 )
             )
-            if self._pref_gen._verbose:
-                logging.info(f"[CSP] Confident in all_self mood (P={conf:.3f}), forcing human actor")
             return constraints
         
-        # If confident in none_self mood, force robot actor
         if mood == "none_self" and conf >= self._pref_gen._neutral_confidence_threshold:
             constraints.append(
                 FunctionalCSPConstraint(
@@ -593,11 +570,9 @@ class SpicesAssignCSPGenerator(CSPGenerator[SpiceState, SpiceAction]):
                     lambda actor: actor == "robot",
                 )
             )
-            if self._pref_gen._verbose:
-                logging.info(f"[CSP] Confident in none_self mood (P={conf:.3f}), forcing robot actor")
             return constraints
         
-        # Otherwise, use learned preferences (neutral mood or uncertain)
+        # Use learned preferences (neutral mood)
         user_preference_constraint = self._pref_gen.generate(obs, variables, "user_preference")
         constraints.append(user_preference_constraint)
         return constraints
@@ -611,7 +586,7 @@ class SpicesAssignCSPGenerator(CSPGenerator[SpiceState, SpiceAction]):
         actor = variables[0]
         current = obs.current_spice
 
-        # Check if we have preferences (HBM or classifier)
+        # Check for prefernces
         has_preferences = False
         if self._pref_gen._use_hbm and self._pref_gen._hbm is not None:
             has_preferences = True
@@ -621,14 +596,13 @@ class SpicesAssignCSPGenerator(CSPGenerator[SpiceState, SpiceAction]):
         if not has_preferences:
             return None
 
-        # Get the constraint's log-prob function
         def _cost_fn(actor_val: str) -> float:
+            # Use HBM log probability
             if self._pref_gen._use_hbm and self._pref_gen._hbm is not None and self._pref_gen._current_recipe_name:
-                # Use HBM log probability
                 logp = self._pref_gen._hbm.log_prob_prefer(self._pref_gen._current_recipe_name, current, actor_val)
                 return -logp
+            # Fallback to classifier TODO: REMOVE THIS
             else:
-                # Fallback to classifier
                 x = self._pref_gen._featurize(current, actor_val)
                 p = self._pref_gen._safe_predict_proba(x)
                 return -np.log(p)
@@ -639,43 +613,24 @@ class SpicesAssignCSPGenerator(CSPGenerator[SpiceState, SpiceAction]):
         actor = csp.variables[0]
         current_spice = obs.current_spice
 
-        # Check if mood forces a specific actor
-        mood, conf = self._pref_gen.get_most_likely_mood()
-        forced_actor = None
-        if mood == "all_self" and conf >= self._pref_gen._neutral_confidence_threshold:
-            forced_actor = "human"
-        elif mood == "none_self" and conf >= self._pref_gen._neutral_confidence_threshold:
-            forced_actor = "robot"
-
         def _sample_actor(sol: dict[CSPVariable, Any], rng: np.random.Generator) -> dict[CSPVariable, Any]:
-            # If mood forces a specific actor, always return that
-            if forced_actor is not None:
-                return {actor: forced_actor}
-            
-            # Compute preference probabilities for both actors
+            # Sample according to HBM preference probabilities for this spice
             probs = []
             for a in ["human", "robot"]:
                 if self._pref_gen._use_hbm and self._pref_gen._hbm is not None and self._pref_gen._current_recipe_name:
-                    # Use HBM probability
-                    logp = self._pref_gen._hbm.log_prob_prefer(self._pref_gen._current_recipe_name, current_spice, a)
+                    logp = self._pref_gen._hbm.log_prob_prefer(
+                        self._pref_gen._current_recipe_name, current_spice, a
+                    )
                     p = np.exp(logp)
-                elif hasattr(self._pref_gen, '_classifier') and self._pref_gen._classifier is not None:
-                    # Fallback to classifier
-                    x = self._pref_gen._featurize(current_spice, a)
-                    p = self._pref_gen._safe_predict_proba(x)
                 else:
-                    # No preferences, uniform
-                    p = 0.5
-                probs.append(max(p, 1e-6))  # avoid zero probabilities
+                    p = 0.5 
+                probs.append(max(p, 1e-6))
 
-            # Normalize to sum to 1
             probs = np.array(probs)
             probs /= probs.sum()
-
-            # Sample actor according to learned probabilities (soft sampling)
             chosen = rng.choice(["human", "robot"], p=probs)
-
             return {actor: chosen}
+
         return [FunctionalCSPSampler(_sample_actor, csp, {actor})]
 
     def _generate_policy(self, obs: SpiceState, csp_variables: Collection[CSPVariable]) -> CSPPolicy:
