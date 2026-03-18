@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 import random
 from scipy.spatial.distance import cosine
 
-from multitask_personalization.csp_solvers import RandomWalkCSPSolver
+from multitask_personalization.csp_solvers import EnumerationCSPSolver
 from multitask_personalization.envs.spices.spices_csp import SpicesAssignCSPGenerator
 from multitask_personalization.envs.spices.spices_env import (
     SpiceEnv, SpiceState, SpiceSceneSpec, SpiceHiddenSpec, RecipeSpec
@@ -23,10 +23,10 @@ from hidden_hbm_configs import get_hidden_hbm_config, create_theta_params_from_c
 
 # ---------------- PARAMETER SETUP ----------------
 PARAMETERS = {
-    "num_episodes": 500, # Used for training / single_human
+    "num_episodes": 2000, # Used for training / single_human
     "num_test_episodes": 50,
     "train_frac": 0.80,  # 16/20 = 0.80 keeps exactly 4 test recipes in ChefComplex
-    "num_seeds": 5, 
+    "num_seeds": 1, 
     "num_epochs": 2, 
     "profile": "ChefA",
     "transfer_profile": "ChefComplex", 
@@ -228,7 +228,7 @@ def run_one_episode(
         csp, samplers, policy, initialization = generator.generate(obs)
 
         # Solve CSP
-        solver = RandomWalkCSPSolver(solver_seed, show_progress_bar=False)
+        solver = EnumerationCSPSolver(solver_seed)
         sol = solver.solve(
             csp,
             initialization,
@@ -2869,6 +2869,7 @@ def test_spices_csp_multiple_recipes(num_episodes: int = PARAMETERS["num_episode
     
     # Note: multi-recipe HBM visualization removed for now to keep tests lightweight.
 
+# ---- NEW SECTION OF TESTS ----
 def test_spices_csp_single_recipe():
     """Single Recipe | Multi-Episode | Multi-Seed learning curves
 
@@ -2893,13 +2894,13 @@ def test_spices_csp_single_recipe():
 
     for i in range(num_seeds):
         env_seed = PARAMETERS["env_seed"] + i
-        csp_seed = PARAMETERS["csp_seed"] - i
+        csp_seed = PARAMETERS["csp_seed"] + i
         assert env_seed != csp_seed
 
         env           = _make_env(env_seed, recipe_name, hidden_hbm)
         csp_generator = SpicesAssignCSPGenerator(spice_list=spices, recipe_list=[recipe_name], seed=csp_seed)
-        solver        = RandomWalkCSPSolver(csp_seed, show_progress_bar=False)
-        max_steps     = len(spices) + 5
+        solver        = EnumerationCSPSolver(csp_seed)
+        max_steps     = len(spices) + 1
 
         for ep in range(num_episodes):
             obs, _ = env.reset()
@@ -2937,6 +2938,7 @@ def test_spices_csp_single_recipe():
             sats = ep_sats[ep]
             logging.info(f"  Ep {ep+1:3d} (n={len(sats)}): avg_sat={np.mean(sats):+.3f}")
 
+    
     # Mood inference accuracy
     mood_correct = sum(1 for (_, _, mood, _, inferred) in all_records if mood == inferred)
     logging.info(
@@ -3008,7 +3010,7 @@ def test_spices_csp_cross_transfer():
     for i in range(num_seeds):
         env_seed = PARAMETERS["env_seed"] + i
         csp_seed = PARAMETERS["csp_seed"] - i
-        solver   = RandomWalkCSPSolver(csp_seed, show_progress_bar=False)
+        solver   = EnumerationCSPSolver(csp_seed)
 
         # Only pre-register training recipes so that test recipes are registered
         # lazily on first encounter — at that point theta is post-training, so
@@ -3078,7 +3080,7 @@ def test_spices_csp_cross_transfer():
 
         # Baseline: fresh generator + fresh solver, each test recipe in isolation.
         # Fresh solver avoids RNG contamination from the training + eval steps above.
-        baseline_solver = RandomWalkCSPSolver(csp_seed, show_progress_bar=False)
+        baseline_solver = EnumerationCSPSolver(csp_seed)
         for recipe_name in test_recipes:
             test_spices = sorted(get_recipe(recipe_name).spices)
             baseline_gen = SpicesAssignCSPGenerator(
@@ -3209,7 +3211,7 @@ def test_spices_csp_multi_human():
     for i in range(num_seeds):
         env_seed = PARAMETERS["env_seed"] + i
         csp_seed = PARAMETERS["csp_seed"] - i
-        solver   = RandomWalkCSPSolver(csp_seed, show_progress_bar=False)
+        solver   = EnumerationCSPSolver(csp_seed)
 
         shared_hbm = HierarchicalPreferenceModel(spices=all_spices)
 
@@ -3299,7 +3301,7 @@ def test_spices_csp_multi_human():
                 env.close()
 
         # Baseline
-        baseline_solver = RandomWalkCSPSolver(csp_seed, show_progress_bar=False)
+        baseline_solver = EnumerationCSPSolver(csp_seed)
         for h in all_human_ids:
             for recipe_name in test_recipes:
                 test_spices  = sorted(get_recipe(recipe_name).spices)
@@ -3416,7 +3418,7 @@ def test_mood_inference():
         )
 
         # Create the solver
-        solver = RandomWalkCSPSolver(csp_seed, show_progress_bar = False)
+        solver = EnumerationCSPSolver(csp_seed)
 
         max_steps = len(spices) + 5
 

@@ -1,9 +1,11 @@
 """Different methods for solving CSPs."""
 
 import abc
+import itertools
 from collections import defaultdict, deque
 from typing import Any
 
+import gymnasium as gym
 import numpy as np
 from tqdm import tqdm
 
@@ -14,6 +16,20 @@ from multitask_personalization.structs import (
     CSPVariable,
     FunctionalCSPSampler,
 )
+
+
+def _get_domain_values(space: gym.Space, var: CSPVariable) -> list[Any] | None:
+    """Get enumerable values from a space, or None if not enumerable."""
+    if isinstance(space, gym.spaces.Discrete):
+        return list(range(space.n))
+    # EnumSpace from tomsutils stores options
+    if hasattr(space, "options"):
+        return list(space.options)
+    if hasattr(space, "choices"):
+        return list(space.choices)
+    if hasattr(space, "elements"):
+        return list(space.elements)
+    return None
 
 
 class CSPSolver(abc.ABC):
@@ -119,6 +135,55 @@ class RandomWalkCSPSolver(CSPSolver):
             sol = sol.copy()
             sol.update(partial_sol)
         return best_satisfying_sol
+
+
+class EnumerationCSPSolver(CSPSolver):
+    """Solve CSPs by enumerating all combinations when variables have finite
+    discrete domains (for binary choice domains like spices)
+    Returns None if the CSP cannot be enumerated
+    """
+
+    def __init__(self, seed: int, max_enumeration_size: int = 10_000) -> None:
+        super().__init__(seed)
+        self._max_enumeration_size = max_enumeration_size
+
+    def solve(
+        self,
+        csp: CSP,
+        initialization: dict[CSPVariable, Any],
+        samplers: list[CSPSampler],
+    ) -> dict[CSPVariable, Any] | None:
+        # Get domain values for each variable
+        domain_values: list[list[Any]] = []
+        for var in csp.variables:
+            vals = _get_domain_values(var.domain, var)
+            if vals is None:
+                return None
+            domain_values.append(vals)
+
+        # Check enumeration size
+        total = 1
+        for vals in domain_values:
+            total *= len(vals)
+        if total > self._max_enumeration_size:
+            return None
+
+        # Enumerate all combinations and find best valid solution
+        best_sol: dict[CSPVariable, Any] | None = None
+        best_cost: float = np.inf
+
+        for values in itertools.product(*domain_values):
+            sol = {var: val for var, val in zip(csp.variables, values)}
+            if not csp.check_solution(sol):
+                continue
+            if csp.cost is None:
+                return sol
+            cost = csp.get_cost(sol)
+            if cost < best_cost:
+                best_cost = cost
+                best_sol = sol
+
+        return best_sol
 
 
 class LifelongCSPSolverWrapper(CSPSolver):

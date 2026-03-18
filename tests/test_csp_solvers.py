@@ -4,11 +4,13 @@ import gymnasium as gym
 import numpy as np
 
 from multitask_personalization.csp_solvers import (
+    EnumerationCSPSolver,
     LifelongCSPSolverWrapper,
     RandomWalkCSPSolver,
 )
 from multitask_personalization.structs import (
     CSP,
+    CSPCost,
     CSPVariable,
     FunctionalCSPConstraint,
     FunctionalCSPSampler,
@@ -64,3 +66,32 @@ def test_solve_csp():
     csp, initialization, samplers = _create_test_csp()
     sol = lifelong_solver.solve(csp, initialization, [])
     assert sol is not None
+
+
+def test_enumeration_csp_solver():
+    """Test EnumerationCSPSolver on a trivial binary CSP (like spices)."""
+    # Binary choice: x in {0, 1}, constraint x == 1, cost = -x (minimize -x = maximize x)
+    x = CSPVariable("x", gym.spaces.Discrete(2))
+    c = FunctionalCSPConstraint("c", [x], lambda x_val: x_val == 1)
+    cost = CSPCost("max", [x], lambda x_val: -float(x_val))
+    csp = CSP([x], [c], cost)
+    initialization = {x: 0}
+    samplers = []  # Not used by EnumerationCSPSolver
+
+    solver = EnumerationCSPSolver(seed=123)
+    sol = solver.solve(csp, initialization, samplers)
+    assert sol is not None
+    assert sol[x] == 1
+
+
+def test_enumeration_csp_solver_returns_none_for_continuous():
+    """EnumerationCSPSolver returns None when variables have continuous domains."""
+    x = CSPVariable("x", gym.spaces.Box(0, 1, dtype=np.float_))
+    c = FunctionalCSPConstraint("c", [x], lambda x_val: x_val > 0.5)
+    csp = CSP([x], [c], cost=None)
+    initialization = {x: 0.0}
+    samplers = []
+
+    solver = EnumerationCSPSolver(seed=123)
+    sol = solver.solve(csp, initialization, samplers)
+    assert sol is None

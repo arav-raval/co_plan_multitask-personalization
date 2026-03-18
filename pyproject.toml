@@ -27,10 +27,10 @@ dependencies = [
    "wandb",
    "cachetools",
    "pybullet==3.2.7",
-   "pybullet_helpers@git+https://github.com/tomsilver/pybullet-helpers.git",
+   "pybullet_helpers>=0.1.0",
    "gymnasium==1.0.0",
    "tomsutils@git+https://github.com/tomsilver/toms-utils.git",
-   "tomsgeoms2d@git+https://github.com/tomsilver/toms-geoms-2d.git",
+   "tomsgeoms2d>=0.0.1",
    "task_then_motion_planning@git+https://github.com/tomsilver/task-then-motion-planning.git",
 ]
 
