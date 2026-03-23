@@ -7,14 +7,14 @@ from typing import Any, TypeAlias, TYPE_CHECKING
 import logging
 import gymnasium as gym
 import numpy as np
-from gymnasium.core import RenderFrame
-from tomsutils.spaces import EnumSpace
 import networkx as nx
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
+from gymnasium.core import RenderFrame
+from tomsutils.spaces import EnumSpace
 from multitask_personalization.structs import PublicSceneSpec
-from multitask_personalization.envs.spices.spices_config import DEFAULT_CONFIG
-from multitask_personalization.envs.spices.spices_hbm import MOODS
+from multitask_personalization.envs.spices.config.spices_config import DEFAULT_CONFIG
+from multitask_personalization.envs.spices.spices_hbm import MoodModel, compute_mood_bias
 
 if TYPE_CHECKING:
     from multitask_personalization.envs.spices.spices_hbm import HierarchicalPreferenceModel
@@ -32,52 +32,52 @@ class RecipeSpec:
     # Partial order: predecessor map: for spice s, all spices that must be added before s.
     predecessors: dict[str, tuple[str, ...]]
 
-    def build_dag(self) -> nx.DiGraph:
-        """Build a directed acyclic graph (DAG) from the recipe."""
-        dag = nx.DiGraph()
-        for spice in self.spices:
-            dag.add_node(spice)
-        for spice, predecessors in self.predecessors.items():
-            for predecessor in predecessors:
-                dag.add_edge(predecessor, spice)
-        if not nx.is_directed_acyclic_graph(dag):
-            raise ValueError("The recipe is not a valid DAG")
-        return dag
-
     def get_topological_sort(self) -> list[str]:
-        """Get a topological sort of the recipe."""
-        return list(nx.topological_sort(self.build_dag()))
+        """Kahn's algorithm for topological sort. Raises ValueError if graph has a cycle."""
+        pred_count = {s: len(self.predecessors.get(s, ())) for s in self.spices}
+        frontier = [s for s in self.spices if pred_count[s] == 0]
+        order: list[str] = []
+        while frontier:
+            node = frontier.pop()
+            order.append(node)
+            for s in self.spices:
+                if node in self.predecessors.get(s, ()):
+                    pred_count[s] -= 1
+                    if pred_count[s] == 0:
+                        frontier.append(s)
+        if len(order) != len(self.spices):
+            raise ValueError("The recipe is not a valid DAG (cycle detected)")
+        return order
 
-    def layers(self, dag: nx.DiGraph | None = None) -> list[list[str]]:
-        """
-        Get the topological layers of the recipe.
-
-        Accepts an already-built DAG to avoid redundant construction when the
-        caller already holds one.
-        """
-        G = dag if dag is not None else self.build_dag()
+    def layers(self) -> list[list[str]]:
+        """Get the topological layers of the recipe."""
         layers: list[list[str]] = []
-        current_layer = [n for n in G.nodes if G.in_degree(n) == 0]
-        visited = set(current_layer)
-        while current_layer:
+        visited: set[str] = set()
+        remaining = set(self.spices)
+        while remaining:
+            current_layer = [s for s in remaining if set(self.predecessors.get(s, ())).issubset(visited)]
+            if not current_layer:
+                raise ValueError("The recipe is not a valid DAG (cycle detected)")
             layers.append(current_layer)
-            next_layer = []
-            for node in current_layer:
-                for succ in G.successors(node):
-                    if all(pred in visited for pred in G.predecessors(succ)):
-                        next_layer.append(succ)
-            visited.update(next_layer)
-            current_layer = next_layer
+            visited.update(current_layer)
+            remaining -= set(current_layer)
         return layers
 
     def visualize_dag(self) -> None:
         """
         Visualize the recipe DAG using a multipartite layout based on its layers.
-        Each layer corresponds to a topological level.
+        Each layer corresponds to a topological level. Requires networkx and matplotlib.
         """
-        G = self.build_dag()
-        layers = self.layers(G)  # reuse the DAG already built above
+        G = nx.DiGraph()
+        for spice in self.spices:
+            G.add_node(spice)
+        for spice, preds in self.predecessors.items():
+            for p in preds:
+                G.add_edge(p, spice)
+        if not nx.is_directed_acyclic_graph(G):
+            raise ValueError("The recipe is not a valid DAG")
 
+        layers = self.layers()
         layer_index = {s: i for i, layer in enumerate(layers) for s in layer}
         nx.set_node_attributes(G, layer_index, "layer")
 
@@ -111,28 +111,6 @@ class RecipeSpec:
         plt.tight_layout(pad=1.0)
         plt.show()
 
-
-# --- MOOD MODEL ---
-class MoodModel:
-    """
-    Handles sampling the current episode's mood.
-
-    Moods and prior probabilities are taken from the shared MOODS constant and
-    MoodConfig so that the generative distribution and the HBM's inference prior
-    are always in sync.
-    """
-    def __init__(self, rng: np.random.Generator) -> None:
-        self.rng = rng
-        self.current_mood: str | None = None
-
-    def sample_mood(self) -> str:
-        """Sample a mood for the current episode."""
-        mood = self.rng.choice(MOODS, p=DEFAULT_CONFIG.mood.mood_prior)
-        self.current_mood = str(mood)
-        return self.current_mood
-
-
-# --- SPICES ENVIRONMENT SPECIFICATIONS ---
 @dataclass(frozen=True)
 class SpiceSceneSpec(PublicSceneSpec):
     """A scene specification for the spices environment."""
@@ -154,7 +132,6 @@ class SpiceState:
     feasible_next: tuple[str, ...]
     current_spice: str | None
 
-
 # --- ACTION SPECIFICATIONS ---
 """
 Action: (flag, payload)
@@ -162,7 +139,6 @@ flag = 0: add, flag = 1: done
 payload: the name of the actor assigned to add the next spice (only if flag = 0)
 """
 SpiceAction: TypeAlias = tuple[int, str | None]
-
 
 # --- SPICES ENVIRONMENT ---
 class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
@@ -180,7 +156,6 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
         scene_spec: SpiceSceneSpec,
         hidden_spec: SpiceHiddenSpec,
         seed: int = 0,
-        eval_mode: bool = False,
         verbose: bool = False,
     ) -> None:
 
@@ -195,12 +170,10 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
         )
         self._mood_model = MoodModel(self._rng)
 
-        # Build the DAG once and reuse it for all derived structures.
-        self._dag = self.scene_spec.recipe.build_dag()
-        self._topo_order = list(nx.topological_sort(self._dag))
-        self._layers = self.scene_spec.recipe.layers(self._dag)
+        # Precompute topological order and layers
+        self._topo_order = self.scene_spec.recipe.get_topological_sort()
+        self._layers = self.scene_spec.recipe.layers()
 
-        # Cached O(1) lookup structures (constant for the lifetime of the env).
         self._layer_index: dict[str, int] = {
             spice: idx
             for idx, layer in enumerate(self._layers)
@@ -215,13 +188,12 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
         self._t = 0
         self._added: list[str] = []
         self._current_spice: str | None = None
-        self._current_feasible: list[str] = []  # cached by _pick_current_spice
+        self._current_feasible: list[str] = [] 
         self._last_actor: str | None = None
         self._last_satisfaction: float = 0.0
         self._satisfaction_history: list[float] = []
         self._action_history: list[SpiceAction] = []
 
-        self.eval_mode = eval_mode
         self.verbose = verbose
 
         if verbose:
@@ -238,11 +210,14 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
         if seed is not None:
             self._rng = np.random.default_rng(seed)
 
-        # Create hidden preferences.
-        if self.eval_mode or self._hidden_spec is None:
-            self.__randomize_hidden_preferences()
-        elif self._hidden_spec.hidden_hbm is not None:
-            self.__sample_preferences_from_hbm()
+        # Sample hidden preferences from HBM when available; otherwise use fixed preferences.
+        if self._hidden_spec.hidden_hbm is not None:
+            self._hidden_spec.preferred_actor = (
+                self._hidden_spec.hidden_hbm.sample_episode_preferences(
+                    list(self.scene_spec.recipe.spices),
+                    self._rng,
+                )
+            )
 
         # Reset episode state.
         self._t = 0
@@ -251,12 +226,14 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
         self._last_satisfaction = 0.0
         self._satisfaction_history = []
         self._action_history = []
-        if self._hidden_spec is not None and self._hidden_spec.force_neutral_mood:
+
+        if self._hidden_spec.force_neutral_mood:
             self._current_mood = "neutral"
             self._mood_model.current_mood = "neutral"
         else:
             self._current_mood = self._mood_model.sample_mood()
-        self._current_spice = self._pick_current_spice()  # also populates _current_feasible
+
+        self._current_spice = self._pick_current_spice()
 
         if self.verbose:
             logging.info("[SpiceEnv] Resetting environment")
@@ -273,7 +250,7 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
         self._action_history.append(action)
 
         # Robot indicated done without adding a spice.
-        if np.isclose(status, 1):
+        if status:
             info = self._get_info(robot_indicated_done=True)
             return self._get_state(), 0.0, True, False, info
 
@@ -291,7 +268,7 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
         self._last_satisfaction = self._compute_satisfaction(preferred)
         self._satisfaction_history.append(self._last_satisfaction)
 
-        # Advance to the next spice (also refreshes _current_feasible).
+        # Advance to the next spice
         self._current_spice = self._pick_current_spice()
 
         terminated = not self._current_spice
@@ -336,26 +313,6 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
             current_spice=self._current_spice,
         )
 
-    def _compute_mood_bias(self, mood: str, actor: str) -> float:
-        """
-        Compute mood bias that overrides base preferences.
-
-        Mood semantics:
-            "all_self"  — human wants to do everything; satisfaction only when human acts.
-            "none_self" — human doesn't want to do anything; satisfaction only when robot acts.
-            "neutral"   — no mood override; base preferences apply.
-
-        With phi = ±base_satisfaction_bias, bias_strength = base_satisfaction_bias * 2.0
-        ensures the mood signal always overrides the base preference.
-        """
-        bias_strength = self._base_satisfaction_bias * 2.0
-        if mood == "all_self":
-            return +bias_strength if actor == "human" else -bias_strength
-        elif mood == "none_self":
-            return -bias_strength if actor == "human" else +bias_strength
-        else:  # "neutral"
-            return 0.0
-
     def _compute_satisfaction(self, preferred: str) -> float:
         """
         Compute satisfaction for the most recently assigned spice.
@@ -375,7 +332,7 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
             if preferred == self._last_actor
             else -self._base_satisfaction_bias
         )
-        mood_adj = self._compute_mood_bias(self._current_mood, self._last_actor)
+        mood_adj = compute_mood_bias(self._current_mood, self._last_actor)
         logit = phi + mood_adj
 
         p = 1.0 / (1.0 + np.exp(-logit))
@@ -385,52 +342,47 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
         return float(np.clip(2.0 * p_sampled - 1.0, -1.0, 1.0))
 
     def _get_info(self, robot_indicated_done: bool = False) -> dict[str, Any]:
-        # Empty case: no spice has been assigned yet this episode.
-        if not self._added:
-            return {
-                "robot_indicated_done": robot_indicated_done,
-                "satisfaction": 0.0,
-                "preferred_actor": None,
-                "current_spice": self._current_spice,
-                "last_spice": None,
-                "last_actor": None,
-                "feasible_next": tuple(self._current_feasible),
-                "average_satisfaction": 0.0,
-                "satisfaction_history": [],
-                "satisfaction_variance": 0.0,
-                "action_history": list(self._action_history),
-                "mood": self._current_mood,
-                "recipe_name": self.scene_spec.recipe.name,
-            }
-
-        # Satisfaction was already computed in step() and appended to history.
-        last_spice = self._added[-1]
-        preferred = self._hidden_spec.preferred_actor[last_spice]
-
-        return {
+        info: dict[str, Any] = {
             "robot_indicated_done": robot_indicated_done,
-            "satisfaction": self._last_satisfaction,
-            "preferred_actor": preferred,
             "current_spice": self._current_spice,
-            "last_spice": last_spice,
-            "recipe_name": self.scene_spec.recipe.name,
-            "last_actor": self._last_actor,
-            "satisfaction_history": list(self._satisfaction_history),
-            "average_satisfaction": float(np.mean(self._satisfaction_history)),
-            "satisfaction_variance": float(np.var(self._satisfaction_history)),
             "feasible_next": tuple(self._current_feasible),
             "action_history": list(self._action_history),
             "mood": self._current_mood,
+            "recipe_name": self.scene_spec.recipe.name,
+            "force_neutral_mood": self._hidden_spec.force_neutral_mood,
         }
+        if not self._added:
+            info.update({
+                "satisfaction": 0.0,
+                "preferred_actor": None,
+                "last_spice": None,
+                "last_actor": None,
+                "average_satisfaction": 0.0,
+                "satisfaction_history": [],
+                "satisfaction_variance": 0.0,
+            })
+        else:
+            last_spice = self._added[-1]
+            info.update({
+                "satisfaction": self._last_satisfaction,
+                "preferred_actor": self._hidden_spec.preferred_actor[last_spice],
+                "last_spice": last_spice,
+                "last_actor": self._last_actor,
+                "average_satisfaction": float(np.mean(self._satisfaction_history)),
+                "satisfaction_history": list(self._satisfaction_history),
+                "satisfaction_variance": float(np.var(self._satisfaction_history)),
+            })
+        return info
 
     def __feasible_next(self) -> list[str]:
         """Return feasible spices sorted by (layer, topological position)."""
         added = set(self._added)
+        recipe = self.scene_spec.recipe
         feasible = [
-            node
-            for node in self._dag.nodes
-            if node not in added
-            and set(self._dag.predecessors(node)).issubset(added)
+            s
+            for s in recipe.spices
+            if s not in added
+            and set(recipe.predecessors.get(s, ())).issubset(added)
         ]
         feasible.sort(key=lambda s: (
             self._layer_index.get(s, float("inf")),
@@ -441,46 +393,6 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
     def _pick_current_spice(self) -> str | None:
         """
         Return the next spice to assign (first in the feasible ordering).
-
-        Caches the full feasible list in self._current_feasible so that
-        _get_state() and _get_info() can reuse it without a second traversal.
         """
         self._current_feasible = self.__feasible_next()
         return self._current_feasible[0] if self._current_feasible else None
-
-    def __randomize_hidden_preferences(self) -> None:
-        """Randomize the hidden preferences uniformly over actors."""
-        preferences = {
-            spice: self._rng.choice(["human", "robot"])
-            for spice in self.scene_spec.recipe.spices
-        }
-        self._hidden_spec = SpiceHiddenSpec(preferred_actor=preferences)
-
-    def __sample_preferences_from_hbm(self) -> None:
-        """
-        Sample episode preferences from the hidden HBM for this recipe.
-
-        For each spice, samples phi ~ N(theta_mean, theta_var + sigma_r²), which
-        marginalises out the posterior uncertainty in the human-level preference theta.
-        A positive phi means the human prefers to add the spice themselves.
-        """
-        hidden_hbm = self._hidden_spec.hidden_hbm
-        preferences = {}
-
-        for spice in self.scene_spec.recipe.spices:
-            if spice in hidden_hbm.theta_mean:
-                theta_mean = hidden_hbm.theta_mean[spice]
-                theta_var = hidden_hbm.theta_var.get(
-                    spice, hidden_hbm.sigma_h**2 + hidden_hbm.sigma_r**2
-                )
-                # Marginalise theta uncertainty: phi ~ N(theta_mean, theta_var + sigma_r²)
-                phi_std = float(np.sqrt(theta_var + hidden_hbm.sigma_r**2))
-                phi = self._rng.normal(theta_mean, phi_std)
-                p_human = 1.0 / (1.0 + np.exp(-phi))
-                preferred_actor = "human" if self._rng.random() < p_human else "robot"
-            else:
-                preferred_actor = self._rng.choice(["human", "robot"])
-
-            preferences[spice] = preferred_actor
-
-        self._hidden_spec.preferred_actor = preferences

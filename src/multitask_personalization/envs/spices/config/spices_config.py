@@ -51,6 +51,11 @@ class HBMConfig:
     preference_mismatch_threshold: float = 1.0  # Only check mismatch if |phi| > threshold
     preference_mismatch_penalty: float = 1.0  # No penalty: full signal even on contradicting obs
 
+    # Batch θ/μ updates: call update_theta_and_mu every N episodes instead of every episode.
+    # Reduces cost when update_theta_and_mu is the bottleneck (e.g. multi-human training).
+    # 1 = current behavior (every episode); 10 = 10x fewer updates.
+    update_theta_mu_every_n_episodes: int = 25
+
 
 @dataclass(frozen=True)
 class MoodConfig:

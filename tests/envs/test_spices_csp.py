@@ -12,36 +12,49 @@ from multitask_personalization.envs.spices.spices_csp import SpicesAssignCSPGene
 from multitask_personalization.envs.spices.spices_env import (
     SpiceEnv, SpiceState, SpiceSceneSpec, SpiceHiddenSpec, RecipeSpec
 )
-from recipe import get_recipe, get_profile
+from multitask_personalization.envs.spices.recipes import get_recipe, get_profile
 from collections import Counter
 
 from multitask_personalization.envs.spices.spices_hbm import (
     DEFAULT_HUMAN,
     HierarchicalPreferenceModel,
 )
-from hidden_hbm_configs import get_hidden_hbm_config, create_theta_params_from_config, list_hidden_hbm_configs
+from multitask_personalization.envs.spices.config import (
+    get_hidden_hbm_config,
+    create_theta_params_from_config,
+    list_hidden_hbm_configs,
+    PARAMETERS,
+)
 
-# ---------------- PARAMETER SETUP ----------------
-PARAMETERS = {
-    "num_episodes": 2000, # Used for training / single_human
-    "num_test_episodes": 50,
-    "train_frac": 0.80,  # 16/20 = 0.80 keeps exactly 4 test recipes in ChefComplex
-    "num_seeds": 1, 
-    "num_epochs": 2, 
-    "profile": "ChefA",
-    "transfer_profile": "ChefComplex", 
-    "recipe_name": "FortyStepFeast",
-    "env_seed": 123,
-    "csp_seed": 369,
-    "logging_level": logging.INFO,
-      
-    "verbose": False,  # Suppress per-episode reset logs in multi-episode runs
-    "use_hidden_hbm": True,  # Whether to use hidden HBM for generating preferences
-    "num_humans": 3,  # Number of different humans (hidden HBMs) to test
-    "hidden_hbm_config_name": "ConsistentHuman",  # Covers all recipe spices with ±1.5 theta
-    "hidden_hbm_config_names": None,  # List of config names for multiple humans (if None, auto-generates)
-}
+# ---- Helper functions ----
+def _create_hidden_hbm(spices: list, recipes: list, config_name: str):
+    """Build an HBM from a hidden config for testing."""
+    cfg = get_hidden_hbm_config(config_name)
+    theta_mean = create_theta_params_from_config(cfg, spices)
+    hbm = HierarchicalPreferenceModel(
+        spices=spices,
+        recipes=recipes,
+        sigma_r=cfg.sigma_r,
+        sigma_h=cfg.sigma_h,
+        sigma0=cfg.sigma0,
+        sigma_obs=cfg.sigma_obs,
+    )
+    hbm._theta_mean[DEFAULT_HUMAN] = theta_mean
+    hbm._theta_var[DEFAULT_HUMAN] = {s: cfg.sigma_h**2 for s in spices}
+    return hbm
 
+def _make_env(env_seed: int, recipe_name: str, hidden_hbm, training: bool = False):
+    """Build a SpiceEnv for testing."""
+    recipe = get_recipe(recipe_name)
+    scene_spec = SpiceSceneSpec(recipe=recipe)
+    hidden_spec = SpiceHiddenSpec(
+        preferred_actor={},
+        hidden_hbm=hidden_hbm,
+        force_neutral_mood=training,
+    )
+    return SpiceEnv(scene_spec, hidden_spec, seed=env_seed)
+
+# ---- Test Functions
 def test_spices_csp_single_recipe():
     """Single Recipe | Multi-Episode | Multi-Seed learning curves
 
@@ -56,10 +69,8 @@ def test_spices_csp_single_recipe():
     recipe       = get_recipe(recipe_name)
     spices       = list(recipe.spices)
 
-    hidden_hbm = None
-    if PARAMETERS["use_hidden_hbm"]:
-        config_name = PARAMETERS.get("hidden_hbm_config_name", "AlternatingHuman")
-        hidden_hbm  = _create_hidden_hbm(spices, [recipe_name], config_name=config_name)
+    config_name = PARAMETERS.get("hidden_hbm_config_name", "AlternatingHuman")
+    hidden_hbm  = _create_hidden_hbm(spices, [recipe_name], config_name=config_name)
 
     # (seed_idx, ep_idx, true_mood, avg_satisfaction, inferred_mood)
     all_records: list[tuple] = []
@@ -110,7 +121,10 @@ def test_spices_csp_single_recipe():
             sats = ep_sats[ep]
             logging.info(f"  Ep {ep+1:3d} (n={len(sats)}): avg_sat={np.mean(sats):+.3f}")
 
-    
+    # Average Satisfaction
+    average_satisfaction = np.mean([r[3] for r in all_records]) 
+    logging.info(f"\n---- Average Satisfaction (All Moods): {average_satisfaction:+.3f}")
+
     # Mood inference accuracy
     mood_correct = sum(1 for (_, _, mood, _, inferred) in all_records if mood == inferred)
     logging.info(
@@ -149,11 +163,11 @@ def test_spices_csp_cross_transfer():
         - Theta-sign accuracy on test recipes (final seed)
     """
     num_seeds       = PARAMETERS["num_seeds"]
-    num_train_eps   = PARAMETERS["num_episodes"]   # episodes per train recipe per seed
+    num_train_eps   = PARAMETERS["num_episodes"] 
     num_test_eps    = PARAMETERS["num_test_episodes"]
     train_frac      = PARAMETERS["train_frac"]
 
-    profile_spec  = get_profile(PARAMETERS["transfer_profile"])
+    profile_spec  = get_profile(PARAMETERS["profile"])
     all_recipes   = list(profile_spec.recipes)
     n_train       = int(np.ceil(len(all_recipes) * train_frac))
     train_recipes = all_recipes[:n_train]
@@ -167,11 +181,9 @@ def test_spices_csp_cross_transfer():
     logging.info(f"  Test  ({len(test_recipes)}):  {test_recipes}")
     logging.info(f"  Vocabulary: {len(all_spices)} spices")
 
-    hidden_hbm = None
-    if PARAMETERS["use_hidden_hbm"]:
-        config_name = PARAMETERS["hidden_hbm_config_name"]
-        hidden_hbm  = _create_hidden_hbm(all_spices, all_recipes, config_name=config_name)
-        logging.info(f"  Preference Configuration: {config_name}")
+    config_name = PARAMETERS.get("hidden_hbm_config_name", "AlternatingHuman")
+    hidden_hbm  = _create_hidden_hbm(all_spices, all_recipes, config_name=config_name)
+    logging.info(f"  Preference Configuration: {config_name}")
 
     trained_sats         = {r: [] for r in test_recipes}
     baseline_sats        = {r: [] for r in test_recipes}
@@ -184,9 +196,6 @@ def test_spices_csp_cross_transfer():
         csp_seed = PARAMETERS["csp_seed"] - i
         solver   = EnumerationCSPSolver(csp_seed)
 
-        # Only pre-register training recipes so that test recipes are registered
-        # lazily on first encounter — at that point theta is post-training, so
-        # phi initialises to the learned theta rather than theta=0 (cold start).
         trained_gen = SpicesAssignCSPGenerator(
             spice_list=all_spices, recipe_list=train_recipes, seed=csp_seed
         )
@@ -209,13 +218,10 @@ def test_spices_csp_cross_transfer():
                         break
             env.close()
 
-        # Snapshot post-training theta accuracy (before eval can update theta further).
-        # Only measured over spices present in at least one training recipe — spices
-        # unique to test recipes cannot be learned during training, so including them
-        # would conflate "unlearnable" spices with actual learning quality.
-        # Stored on each seed; the last seed's value is reported below.
+        # Post-training theta accuracy (spices seen in training)
         if hidden_hbm is not None:
-            post_train_hbm  = trained_gen._pref_gen._hbm
+            post_train_hbm = trained_gen._pref_gen._hbm
+            post_train_hbm.flush_theta_mu()
             train_vocab     = {s for r in train_recipes for s in get_recipe(r).spices}
             train_signal    = [
                 s for s in train_vocab
@@ -230,7 +236,7 @@ def test_spices_csp_cross_transfer():
                 len(train_signal),
             )
 
-        # Evaluation: real mood, record neutral episodes only
+        # Evaluation (all moods); only neutral episodes reported
         for recipe_name in test_recipes:
             env = _make_env(env_seed, recipe_name, hidden_hbm, training=False)
             for _ in range(num_test_eps):
@@ -301,9 +307,7 @@ def test_spices_csp_cross_transfer():
     if hidden_hbm is not None:
         hbm = trained_gen._pref_gen._hbm
 
-        # ── Post-training θ accuracy (final seed, all spices in vocabulary) ──
-        # Measures how well training on K recipes moved θ toward the true preferences.
-        # This is the direct measure of what "transferred" to the test recipe.
+        # ── Post-training theta accuracy (per-human preference) ---
         if post_train_theta_acc is not None:
             correct_t, total_t = post_train_theta_acc
             logging.info(
@@ -311,8 +315,7 @@ def test_spices_csp_cross_transfer():
                 f"{correct_t}/{total_t} = {correct_t / total_t:.1%}"
             )
 
-        # ── Post-eval φ accuracy per test recipe (final seed) ─────────────────
-        # Measures φ convergence after both warm-start AND recipe-specific learning.
+        # ── Post-eval accuracy per test recipe  ---
         logging.info(f"\n  Post-Eval Phi Accuracy per test recipe (final seed):")
         for recipe_name in test_recipes:
             r_spices      = list(get_recipe(recipe_name).spices)
@@ -344,21 +347,22 @@ def test_spices_csp_multi_human():
         - Satisfaction on test recipes: h3 vs. cold baseline.
     """
     num_seeds     = PARAMETERS["num_seeds"]
-    # Halve per-human episodes so total training work ≈ single-human test.
-    num_train_eps = max(1, PARAMETERS["num_episodes"] // 2)
-    num_test_eps  = PARAMETERS["num_test_episodes"]
 
-    profile_spec  = get_profile(PARAMETERS["transfer_profile"])
+    profile_spec  = get_profile(PARAMETERS["profile"])
     all_recipes   = list(profile_spec.recipes)
     n_train       = int(np.ceil(len(all_recipes) * PARAMETERS["train_frac"]))
     train_recipes = all_recipes[:n_train]
     test_recipes  = all_recipes[n_train:]
     all_spices    = sorted({s for r in all_recipes for s in get_recipe(r).spices})
 
-    # Two trained humans, 1 new human
-    train_human_ids = ["h1", "h2"]
-    new_human_id    = "h3"
+    num_humans = PARAMETERS["num_humans"]
+    train_human_ids = [f"h{i + 1}" for i in range(num_humans - 1)]
+    new_human_id    = f"h{num_humans}"
     all_human_ids   = train_human_ids + [new_human_id]
+
+    # Scale to number of humans 
+    num_train_eps = max(1, PARAMETERS["num_episodes"] // len(train_human_ids))
+    num_test_eps  = max(1, PARAMETERS["num_test_episodes"] // len(all_human_ids))
 
     config_name = PARAMETERS["hidden_hbm_config_name"]
     hidden_hbms = {
@@ -416,6 +420,8 @@ def test_spices_csp_multi_human():
                         if done:
                             break
                 env.close()
+
+        shared_hbm.flush_theta_mu()
 
         train_vocab  = {s for r in train_recipes for s in get_recipe(r).spices}
         train_signal = [
@@ -522,12 +528,12 @@ def test_spices_csp_multi_human():
     if new_human_theta_acc is not None:
         c, tot = new_human_theta_acc
         logging.info(
-            f"\n  h3 Initial Theta Accuracy (μ warm-start, zero episodes): "
+            f"\n  h{num_humans} Initial Theta Accuracy (μ warm-start, zero episodes): "
             f"{c}/{tot} = {c/tot:.1%}"
         )
 
     mu_correct = sum(
-        np.sign(shared_hbm.get_mu(s)) == np.sign(hidden_hbms["h1"].theta_mean.get(s, 0.0))
+        np.sign(shared_hbm.get_mu(s)) == np.sign(hidden_hbms[train_human_ids[0]].theta_mean.get(s, 0.0))
         for s in train_signal
     )
     logging.info(
@@ -569,11 +575,8 @@ def test_mood_inference():
     spices = list(recipe.spices)
 
     # Hidden HBM Model
-    # Use PARAMETER config (if available) else default (AlternatingHuman)
-    hidden_hbm = None
-    if PARAMETERS["use_hidden_hbm"]:
-        config_name = PARAMETERS.get("hidden_hbm_config_name", "AlternatingHuman")
-        hidden_hbm = _create_hidden_hbm(spices, [recipe_name], config_name=config_name)
+    config_name = PARAMETERS.get("hidden_hbm_config_name", "AlternatingHuman")
+    hidden_hbm = _create_hidden_hbm(spices, [recipe_name], config_name=config_name)
 
     while set(mood_outcomes.keys()) != set(MOODS):
         # Environment (generates SpiceSceneSpec, SpiceHiddenSpec, SpiceEnv)

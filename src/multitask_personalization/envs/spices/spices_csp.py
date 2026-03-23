@@ -13,7 +13,7 @@ from multitask_personalization.csp_generation import (
     CSPConstraintGenerator,
     CSPGenerator,
 )
-from multitask_personalization.envs.spices.spices_config import DEFAULT_CONFIG, SpicesConfig
+from multitask_personalization.envs.spices.config.spices_config import DEFAULT_CONFIG, SpicesConfig
 from multitask_personalization.envs.spices.spices_env import SpiceAction, SpiceState
 from multitask_personalization.envs.spices.spices_hbm import (
     DEFAULT_HUMAN,
@@ -157,7 +157,11 @@ class _AssignPreferenceGenerator(CSPConstraintGenerator[SpiceState, SpiceAction]
         satisfaction = float(info["satisfaction"])
 
         if recipe_name:
-            self._hbm.observe(self._human_id, recipe_name, spice, actor, satisfaction)
+            force_neutral = info.get("force_neutral_mood", False)
+            self._hbm.observe(
+                self._human_id, recipe_name, spice, actor, satisfaction,
+                force_neutral_mood=force_neutral,
+            )
 
         # Capture mood AFTER the observation update but BEFORE the episode reset
         # so callers always see the inferred mood for the current step.

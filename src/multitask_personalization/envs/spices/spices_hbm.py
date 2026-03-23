@@ -4,10 +4,54 @@ import numpy as np
 from typing import Any, Dict, List, Tuple
 from collections import defaultdict
 
-from .spices_config import DEFAULT_CONFIG, SpicesConfig
+from .config.spices_config import DEFAULT_CONFIG, SpicesConfig
 
 MOODS = ("all_self", "neutral", "none_self")
 DEFAULT_HUMAN = "human"
+
+
+# ----- Mood utilities (single source of truth for generation and inference) -----
+
+
+def sample_episode_mood(
+    rng: np.random.Generator,
+    prior: np.ndarray | None = None,
+) -> str:
+    """Sample a mood for the current episode. Uses DEFAULT_CONFIG prior if not specified."""
+    if prior is None:
+        prior = np.array(DEFAULT_CONFIG.mood.mood_prior, dtype=float)
+    mood = rng.choice(MOODS, p=prior)
+    return str(mood)
+
+
+def compute_mood_bias(mood: str, actor: str) -> float:
+    """
+    Compute mood bias that overrides base preferences (generative model).
+
+    Mood semantics:
+        "all_self"  — human wants to do everything; satisfaction only when human acts.
+        "none_self" — human doesn't want to do anything; satisfaction only when robot acts.
+        "neutral"   — no mood override; base preferences apply.
+    """
+    bias_dict = DEFAULT_CONFIG.get_mood_bias()
+    return bias_dict.get(mood, {}).get(actor, 0.0)
+
+
+class MoodModel:
+    """
+    Handles sampling the current episode's mood.
+
+    Moods and prior probabilities are taken from MOODS and MoodConfig so that
+    the generative distribution and the HBM's inference prior are always in sync.
+    """
+    def __init__(self, rng: np.random.Generator) -> None:
+        self.rng = rng
+        self.current_mood: str | None = None
+
+    def sample_mood(self) -> str:
+        """Sample a mood for the current episode."""
+        self.current_mood = sample_episode_mood(self.rng)
+        return self.current_mood
 
 
 class HierarchicalPreferenceModel:
@@ -70,6 +114,8 @@ class HierarchicalPreferenceModel:
         # counter so that training on many recipes does not exhaust the annealing
         # schedule before the agent reaches a new (e.g. test) recipe.
         self._recipe_total_obs: Dict[str, Dict[str, int]] = {}
+        # Per-human episode count for batch update_theta_and_mu.
+        self._episode_count: Dict[str, int] = {}
 
         self.base_satisfaction_bias = self.config.satisfaction.base_satisfaction_bias
         self.mood_prior = np.array(self.config.mood_prior_array, dtype=float)
@@ -106,6 +152,7 @@ class HierarchicalPreferenceModel:
         self._obs_count[human_id] = {}
         self._total_observations[human_id] = 0
         self._recipe_total_obs[human_id] = {}
+        self._episode_count[human_id] = 0
 
     def register_recipe(self, human_id: str, recipe_name: str) -> None:
         """Register a new recipe for a human, deriving φ from current θ"""
@@ -161,11 +208,12 @@ class HierarchicalPreferenceModel:
         actor: str,
         spice: str,
         satisfaction: float,
-        m: str,
         recipe_name: str,
-    ) -> float:
+    ) -> np.ndarray:
         """
-        Compute log P(satisfaction | mood, actor, spice) under a Gaussian model
+        Compute log P(satisfaction | mood, actor, spice) for each mood.
+
+        Returns array of length 3: [all_self, neutral, none_self] matching MOODS order.
 
         Generative model:
             logit  = sign(actor) * phi + mood_bias[m][actor]          (neutral)
@@ -185,32 +233,29 @@ class HierarchicalPreferenceModel:
             phi = self._theta_mean[human_id][spice]
         phi = float(np.clip(phi, -self.base_satisfaction_bias, self.base_satisfaction_bias))
 
-        sign_actor = +1.0 if actor == "human" else -1.0
+        sign_actor = 1.0 if actor == "human" else -1.0
+        pref_expectation = (sign_actor * phi) > 0
+        matches_preference = pref_expectation == (satisfaction > 0)
+        pref_weight_match = self.config.mood.non_neutral_pref_weight_match
+        pref_weight_mismatch = self.config.mood.non_neutral_pref_weight_mismatch
 
-        if m == "neutral":
-            logit = sign_actor * phi + self.mood_bias[m][actor]
-        else:
-            mood_bias_val = self.mood_bias[m][actor]
-            pref_expectation = (sign_actor * phi) > 0
-            matches_preference = pref_expectation == (satisfaction > 0)
-            pref_weight = (
-                self.config.mood.non_neutral_pref_weight_match
-                if matches_preference
-                else self.config.mood.non_neutral_pref_weight_mismatch
-            )
-            logit = mood_bias_val + sign_actor * phi * pref_weight
-
-        p = 1.0 / (1.0 + np.exp(-logit))
-        sat_expected = 2.0 * p - 1.0
         sigma_sat = self.config.mood.satisfaction_sigma
+        loglik_min = self.config.mood.satisfaction_loglik_min
+        loglik_max = self.config.mood.satisfaction_loglik_max
+
+        logits = np.zeros(3)
+        for i, m in enumerate(MOODS):
+            if m == "neutral":
+                logits[i] = sign_actor * phi + self.mood_bias[m][actor]
+            else:
+                mood_bias_val = self.mood_bias[m][actor]
+                pref_weight = pref_weight_match if matches_preference else pref_weight_mismatch
+                logits[i] = mood_bias_val + sign_actor * phi * pref_weight
+
+        p = 1.0 / (1.0 + np.exp(-logits))
+        sat_expected = 2.0 * p - 1.0
         log_lik = -0.5 * ((satisfaction - sat_expected) / sigma_sat) ** 2
-        return float(
-            np.clip(
-                log_lik,
-                self.config.mood.satisfaction_loglik_min,
-                self.config.mood.satisfaction_loglik_max,
-            )
-        )
+        return np.clip(log_lik, loglik_min, loglik_max)
 
     def _update_mood_posterior(
         self,
@@ -229,10 +274,9 @@ class HierarchicalPreferenceModel:
         identical to the batch computation.
         """
         # Accumulate per-mood log-likelihood contribution of the new observation.
-        delta = np.array([
-            self._loglik_feedback_given_mood(human_id, actor, spice, satisfaction, m, recipe_name)
-            for m in MOODS
-        ])
+        delta = self._loglik_feedback_given_mood(
+            human_id, actor, spice, satisfaction, recipe_name
+        )
         self._log_lik_accum[human_id] += delta
 
         # Full log-posterior = weighted log-prior + accumulated log-likelihoods.
@@ -463,6 +507,13 @@ class HierarchicalPreferenceModel:
             self.mu_mean[s] = post_mean
             self.mu_var[s] = post_var
 
+    def flush_theta_mu(self) -> None:
+        """
+        Force an immediate θ/μ update. Call before eval (or at training end) to ensure
+        θ and μ reflect all accumulated φ updates, including those in the last partial batch.
+        """
+        self.update_theta_and_mu()
+
     # ----- Episode Interface -----
     def observe(
         self,
@@ -471,27 +522,36 @@ class HierarchicalPreferenceModel:
         spice: str,
         actor: str,
         satisfaction: float,
+        force_neutral_mood: bool = False,
     ) -> None:
         """
         Process a single transition for the given human and recipe.
 
         Registers the human and recipe lazily on first call.
         Updates the mood posterior incrementally; defers φ updates until end_episode().
+        When force_neutral_mood is True, skips mood inference and sets posterior to neutral.
         """
         self._ensure_registered(human_id, recipe_name)
         self._episode_data[human_id].append((actor, spice, satisfaction))
         self._current_recipe[human_id] = recipe_name
-        self._update_mood_posterior(human_id, recipe_name, actor, spice, satisfaction)
+
+        if force_neutral_mood:
+            neutral_idx = MOODS.index("neutral")
+            self._mood_posterior[human_id] = np.zeros(3)
+            self._mood_posterior[human_id][neutral_idx] = 1.0
+        else:
+            self._update_mood_posterior(human_id, recipe_name, actor, spice, satisfaction)
 
     def end_episode(self, human_id: str, neutral_threshold: float = 0.5) -> None:
         """
         Batch-update φ for this human if confident in neutral mood, propagate
-        updates to θ and μ, then reset episode state.
+        updates to θ and μ (every N episodes when batching), then reset episode state.
 
-        Each episode samples a fresh mood (SpiceEnv.MoodModel.sample_mood), so
+        Each episode samples a fresh mood (sample_episode_mood), so
         the mood posterior and log-likelihood accumulator are reset to the prior at end.
         """
         self._phi_updated[human_id] = False
+        self._episode_count[human_id] = self._episode_count.get(human_id, 0) + 1
 
         neutral_idx = MOODS.index("neutral")
         neutral_conf = self._mood_posterior[human_id][neutral_idx]
@@ -514,7 +574,10 @@ class HierarchicalPreferenceModel:
                 )
             self._phi_updated[human_id] = True
 
-        if self._phi_updated[human_id]:
+        batch_size = self.config.hbm.update_theta_mu_every_n_episodes
+        if self._phi_updated[human_id] and (
+            batch_size <= 1 or self._episode_count[human_id] % batch_size == 0
+        ):
             self.update_theta_and_mu()
 
         # Reset all episode state and mood posterior to prior.
@@ -542,6 +605,7 @@ class HierarchicalPreferenceModel:
 
         self._phi_mean[human_id][recipe_name][spice] = post_mean
         self._phi_var[human_id][recipe_name][spice] = post_var
+        self._obs_count[human_id][recipe_name][spice] += 1
 
     # ----- Getters ----- 
     def get_phi(self, human_id: str, recipe_name: str, spice: str) -> float:
@@ -563,6 +627,34 @@ class HierarchicalPreferenceModel:
     def preferred_actor(self, human_id: str, recipe_name: str, spice: str) -> str:
         phi = self.get_phi(human_id, recipe_name, spice)
         return "human" if phi >= 0 else "robot"
+
+    def sample_episode_preferences(
+        self,
+        recipe_spices: List[str],
+        rng: np.random.Generator,
+        human_id: str = DEFAULT_HUMAN,
+    ) -> Dict[str, str]:
+        """
+        Sample episode-level preferred_actor for each spice from the HBM's θ posterior.
+
+        For each spice: φ ~ N(θ_mean, θ_var + σ_r²), then p_human = sigmoid(φ),
+        preferred_actor ~ Bernoulli(p_human). Spices not in θ fall back to uniform.
+        """
+        preferences: Dict[str, str] = {}
+        for spice in recipe_spices:
+            if spice in self._theta_mean.get(human_id, {}):
+                theta_mean = self._theta_mean[human_id][spice]
+                theta_var = self._theta_var[human_id].get(
+                    spice, self.sigma_h**2 + self.sigma_r**2
+                )
+                phi_std = float(np.sqrt(theta_var + self.sigma_r**2))
+                phi = rng.normal(theta_mean, phi_std)
+                p_human = 1.0 / (1.0 + np.exp(-phi))
+                preferred_actor = "human" if rng.random() < p_human else "robot"
+            else:
+                preferred_actor = str(rng.choice(["human", "robot"]))
+            preferences[spice] = preferred_actor
+        return preferences
 
     def log_prob_prefer(
         self, human_id: str, recipe_name: str, spice: str, actor: str
