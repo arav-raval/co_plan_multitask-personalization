@@ -14,7 +14,7 @@ from gymnasium.core import RenderFrame
 from tomsutils.spaces import EnumSpace
 from multitask_personalization.structs import PublicSceneSpec
 from multitask_personalization.envs.spices.config.spices_config import DEFAULT_CONFIG
-from multitask_personalization.envs.spices.spices_hbm import MoodModel, compute_mood_bias
+from multitask_personalization.envs.spices.spices_hbm import MoodModel
 
 if TYPE_CHECKING:
     from multitask_personalization.envs.spices.spices_hbm import HierarchicalPreferenceModel
@@ -188,11 +188,13 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
         self._t = 0
         self._added: list[str] = []
         self._current_spice: str | None = None
-        self._current_feasible: list[str] = [] 
+        self._current_feasible: list[str] = []
         self._last_actor: str | None = None
         self._last_satisfaction: float = 0.0
         self._satisfaction_history: list[float] = []
         self._action_history: list[SpiceAction] = []
+        # Stage 2: true session offset sampled once per episode (replaces per-step mood_adj)
+        self._current_psi_true: float = 0.0
 
         self.verbose = verbose
 
@@ -232,6 +234,10 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
             self._mood_model.current_mood = "neutral"
         else:
             self._current_mood = self._mood_model.sample_mood()
+
+        # Stage 2: sample true session psi once per episode from mood-conditioned distribution.
+        # The HBM infers a scalar psi to explain within-episode deviations from phi.
+        self._current_psi_true = self._sample_psi_from_mood(self._current_mood)
 
         self._current_spice = self._pick_current_spice()
 
@@ -322,24 +328,47 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
              0.0 — neutral
             -1.0 — maximum negative satisfaction
 
-        The generative model mirrors the HBM's likelihood:
-            logit = sign(actor) * phi + mood_bias
-            p     = sigmoid(logit)
-            sat   ~ Beta(p*kappa+1, (1-p)*kappa+1) rescaled to [-1, +1]
-        """
-        phi = (
-            +self._base_satisfaction_bias
-            if preferred == self._last_actor
-            else -self._base_satisfaction_bias
-        )
-        mood_adj = compute_mood_bias(self._current_mood, self._last_actor)
-        logit = phi + mood_adj
+        The generative model mirrors the HBM's Stage 2 likelihood:
+            logit    = sign(actor==preferred) * phi + psi_true
+            expected = tanh(logit)    ← matches HBM: tanh(sign*(phi+psi))
+            p        = (expected+1)/2 ← map [-1,+1] → [0,1] for Beta params
+            sat      ~ Beta(p*kappa+1, (1-p)*kappa+1) rescaled to [-1, +1]
 
-        p = 1.0 / (1.0 + np.exp(-logit))
+        psi_true is sampled once per episode from a mood-conditioned distribution
+        (see _sample_psi_from_mood). This replaces the old per-step actor-dependent
+        compute_mood_bias call, aligning the generative model with the HBM's scalar psi.
+        """
+        sign = 1.0 if self._last_actor == preferred else -1.0
+        phi = sign * self._base_satisfaction_bias
+        logit = phi + self._current_psi_true   # psi_true is fixed for the whole episode
+
+        expected = float(np.tanh(logit))
+        p = (expected + 1.0) / 2.0
         alpha = p * self._satisfaction_kappa + 1.0
         beta = (1.0 - p) * self._satisfaction_kappa + 1.0
         p_sampled = self._rng.beta(alpha, beta)
         return float(np.clip(2.0 * p_sampled - 1.0, -1.0, 1.0))
+
+    def _sample_psi_from_mood(self, mood: str) -> float:
+        """
+        Sample the true session offset psi_true from a mood-conditioned distribution.
+
+        Maps the 3-category mood to a scalar psi_true sampled once per episode.
+        The HBM's prior N(0, sigma_mood²) is centered at 0; non-neutral moods shift
+        the mean to ±base_satisfaction_bias. The within-category std is sigma_mood/2
+        so the distribution is concentrated enough to test mood separation.
+
+        Stage 2: replaces per-step compute_mood_bias. The HBM infers a latent scalar
+        psi without knowing the mood category.
+        """
+        sigma_mood = DEFAULT_CONFIG.hbm.sigma_mood
+        mood_means = {
+            "all_self":  +self._base_satisfaction_bias,
+            "neutral":    0.0,
+            "none_self": -self._base_satisfaction_bias,
+        }
+        mean = mood_means.get(mood, 0.0)
+        return float(self._rng.normal(mean, sigma_mood * 0.5))
 
     def _get_info(self, robot_indicated_done: bool = False) -> dict[str, Any]:
         info: dict[str, Any] = {

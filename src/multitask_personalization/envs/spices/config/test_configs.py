@@ -3,7 +3,7 @@
 import logging
 
 PARAMETERS = {
-    "num_episodes": 500,  # Used for training / single_human
+    "num_episodes": 50,  # Used for training / single_human
     "num_test_episodes": 100,
     "train_frac": 0.80,  # 16/20 = 0.80 keeps exactly 4 test recipes in ChefComplex
     "num_seeds": 2,

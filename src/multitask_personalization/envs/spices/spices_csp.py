@@ -157,11 +157,7 @@ class _AssignPreferenceGenerator(CSPConstraintGenerator[SpiceState, SpiceAction]
         satisfaction = float(info["satisfaction"])
 
         if recipe_name:
-            force_neutral = info.get("force_neutral_mood", False)
-            self._hbm.observe(
-                self._human_id, recipe_name, spice, actor, satisfaction,
-                force_neutral_mood=force_neutral,
-            )
+            self._hbm.observe(self._human_id, recipe_name, spice, actor, satisfaction)
 
         # Capture mood AFTER the observation update but BEFORE the episode reset
         # so callers always see the inferred mood for the current step.
@@ -256,30 +252,84 @@ class SpicesAssignCSPGenerator(CSPGenerator[SpiceState, SpiceAction]):
     def _generate_personal_constraints(
         self, obs: SpiceState, variables: list[CSPVariable]
     ) -> list[CSPConstraint]:
-        """Hard mood constraints when confident; HBM preference constraint otherwise."""
-        actor_var = variables[0]
-        mood, conf = self._pref_gen.get_most_likely_mood()
-        threshold = self._pref_gen._neutral_confidence_threshold
+        """
+        Soft preference constraint using phi + running_psi as the effective logit.
 
-        if mood == "all_self" and conf >= threshold:
-            return [
-                FunctionalCSPConstraint(
-                    "respect_all_self_mood", [actor_var], lambda a: a == "human"
-                )
-            ]
-        if mood == "none_self" and conf >= threshold:
-            return [
-                FunctionalCSPConstraint(
-                    "respect_none_self_mood", [actor_var], lambda a: a == "robot"
-                )
-            ]
-
+        Stage 3: the old hard mood gate (force human/robot when mood posterior is
+        confident) is replaced by the psi-adjusted log_prob_prefer. The HBM's
+        log_prob_prefer now uses phi + running_psi, so mid-episode mood signals
+        automatically shift the soft constraint without any explicit threshold check.
+        A strong mood (large |psi|) pushes log_prob_prefer strongly in one direction,
+        achieving the same effect as the old hard constraint but in a principled way.
+        """
         return [self._pref_gen.generate(obs, variables, "user_preference")]
 
     def _generate_nonpersonal_constraints(
         self, obs: SpiceState, variables: list[CSPVariable]
     ) -> list[CSPConstraint]:
         return []
+
+    def _generate_cost(
+        self, obs: SpiceState, variables: list[CSPVariable]
+    ) -> CSPCost | None:
+        """
+        Stage 3: variance-weighted combined cost for max-entropy training mode.
+
+        In max-entropy training mode, replaces the base class's variance-blind
+        entropy cost with a combined exploit + explore cost:
+
+            cost(actor) = exploit_cost(actor) + explore_cost(actor)
+
+        where:
+            exploit_cost(actor) = -log_prob_prefer(actor)
+                                  (lower for the preferred actor — pure exploitation)
+            explore_cost(actor) = 0                         if actor == preferred
+                                = -get_phi_entropy(spice)   if actor != preferred
+                                  (reward for trying the unexpected actor, scaled
+                                   by H(B(sigmoid(phi_mean))) * phi_var)
+
+        This naturally transitions from exploration to exploitation:
+          - Large phi_var (few observations): explore_cost dominates → unexpected
+            actor gets negative cost bonus → CSP explores.
+          - Small phi_var (many observations): explore_cost ≈ 0 → exploit_cost
+            dominates → CSP picks the preferred actor.
+
+        No explicit annealing schedule is needed; the posterior variance provides
+        the signal automatically. This implements the CBTL entropy criterion from
+        the migration plan: H(Bernoulli(sigma(mean))) scaled by var.
+
+        In eval mode or non-max-entropy methods, falls back to exploit_cost only.
+        """
+        if self._train_or_eval != "train" or self._explore_method != "max-entropy":
+            return self._generate_exploit_cost(obs, variables)
+
+        actor_var = variables[0]
+        current = obs.current_spice
+        hbm = self._pref_gen._hbm
+        human_id = self._pref_gen._human_id
+
+        def _combined_cost(actor_val: str) -> float:
+            recipe = self._pref_gen._current_recipe_name
+            if not recipe or not current:
+                return 0.0
+
+            # Exploit component: lower cost for the actor the model prefers
+            log_p = hbm.log_prob_prefer(human_id, recipe, current, actor_val)
+            exploit_cost = -log_p
+
+            # Explore component: bonus for the unexpected actor, scaled by
+            # variance-weighted entropy (large early, shrinks as phi converges)
+            phi = hbm.get_phi(human_id, recipe, current)
+            preferred = "human" if phi >= 0 else "robot"
+            if actor_val != preferred:
+                explore_val = hbm.get_phi_entropy(human_id, recipe, current)
+                explore_cost = -explore_val
+            else:
+                explore_cost = 0.0
+
+            return exploit_cost + explore_cost
+
+        return CSPCost("variance_weighted_entropy", [actor_var], _combined_cost)
 
     def _generate_exploit_cost(
         self, obs: SpiceState, variables: list[CSPVariable]

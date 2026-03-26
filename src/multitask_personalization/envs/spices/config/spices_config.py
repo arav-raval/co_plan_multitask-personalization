@@ -6,8 +6,10 @@ the spices environment, HBM, and mood inference systems. Modify values here to
 tune the learning behavior.
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Dict, Tuple
 
 
 @dataclass(frozen=True)
@@ -53,8 +55,21 @@ class HBMConfig:
 
     # Batch θ/μ updates: call update_theta_and_mu every N episodes instead of every episode.
     # Reduces cost when update_theta_and_mu is the bottleneck (e.g. multi-human training).
-    # 1 = current behavior (every episode); 10 = 10x fewer updates.
-    update_theta_mu_every_n_episodes: int = 25
+    # 1 = every episode (correct Stage 1 behavior); higher values trade correctness for speed.
+    update_theta_mu_every_n_episodes: int = 1
+
+    # Stage 2: session-level psi latent variable (transient offset).
+    # psi ~ N(0, sigma_mood²) — prior std for the per-episode session offset.
+    # Smaller than base_satisfaction_bias (3.0) because psi only needs to cover
+    # deviations around phi, not the full preference magnitude. sigma_mood=2.0
+    # means a mood-shifted psi_true of ±3.0 is within 1.5 std of the prior.
+    # Note: q(psi) variance is fixed at sigma_mood² (not learned) to prevent
+    # psi's uncertainty from inflating phi's variance through the theta optimizer.
+    sigma_mood: float = 2.0
+
+    # Stage 2: psi decay factor at episode end (aggressive reset toward 0).
+    # 0.05 means 95% of psi mean is discarded between episodes.
+    psi_decay: float = 0.05
 
 
 @dataclass(frozen=True)
@@ -124,7 +139,7 @@ class SpicesConfig:
         """Compute mood bias strength from satisfaction bias."""
         return self.satisfaction.base_satisfaction_bias * self.mood.mood_bias_multiplier
     
-    def get_mood_bias(self) -> dict[str, dict[str, float]]:
+    def get_mood_bias(self) -> Dict[str, Dict[str, float]]:
         """Get mood bias dictionary."""
         bias_strength = self.mood_bias_strength
         return {

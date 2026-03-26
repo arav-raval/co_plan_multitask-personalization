@@ -27,6 +27,110 @@ from multitask_personalization.envs.spices.config import (
 )
 
 # ---- Helper functions ----
+def _log_hbm_variance_metrics(
+    hbm: HierarchicalPreferenceModel,
+    hidden_hbm: HierarchicalPreferenceModel | None = None,
+    spices: list[str] | None = None,
+    recipe_name: str | None = None,
+    human_id: str = DEFAULT_HUMAN,
+    title: str = "HBM Variance Metrics",
+) -> None:
+    """Log learned hyperparameters and posterior variances for a compact diagnostics snapshot."""
+    sigmas = hbm.get_learned_sigmas()
+    logging.info(f"\n---- {title} ----")
+    logging.info(
+        "  Learned sigmas: "
+        f"sigma_h={sigmas['sigma_h']:.4f}  "
+        f"sigma_r={sigmas['sigma_r']:.4f}  "
+        f"sigma_obs={sigmas['sigma_obs']:.4f}"
+    )
+
+    if not spices:
+        return
+
+    if hidden_hbm is not None:
+        ranked_spices = sorted(
+            spices,
+            key=lambda s: abs(hidden_hbm.theta_mean.get(s, 0.0)),
+            reverse=True,
+        )
+        signal_spices = [s for s in ranked_spices if abs(hidden_hbm.theta_mean.get(s, 0.0)) > 0.3]
+    else:
+        signal_spices = list(spices)
+
+    if not signal_spices:
+        return
+
+    report_spices = signal_spices[:5]
+    logging.info("  Posterior variances (top signal spices):")
+    for s in report_spices:
+        theta_var = hbm.get_theta_var(human_id, s)
+        mu_var = hbm.get_mu_var(s)
+        msg = f"    {s:20s}: theta_var={theta_var:.4f}  mu_var={mu_var:.4f}"
+        if recipe_name is not None:
+            phi_var = hbm.get_phi_var(human_id, recipe_name, s)
+            msg += f"  phi_var={phi_var:.4f}"
+        logging.info(msg)
+
+
+def _seed_report_indices(num_seeds: int, max_reports: int = 3) -> list[int]:
+    """Pick representative seeds to keep logs readable."""
+    if num_seeds <= 0:
+        return []
+    candidates = [0, num_seeds // 2, num_seeds - 1]
+    ordered_unique: list[int] = []
+    for idx in candidates:
+        if 0 <= idx < num_seeds and idx not in ordered_unique:
+            ordered_unique.append(idx)
+    return ordered_unique[:max_reports]
+
+
+def _log_signal_spice_comparison_table(
+    learned_hbm: HierarchicalPreferenceModel,
+    hidden_hbm: HierarchicalPreferenceModel,
+    signal_spices: list[str],
+    recipe_name: str,
+    seed_idx: int,
+    human_id: str = DEFAULT_HUMAN,
+    top_k: int = 10,
+) -> None:
+    """ASCII table: true vs learned means and variances for signal spices."""
+    if not signal_spices:
+        return
+
+    spices_to_report = sorted(
+        signal_spices,
+        key=lambda s: abs(hidden_hbm.theta_mean.get(s, 0.0)),
+        reverse=True,
+    )[:top_k]
+
+    logging.info(f"\n---- Signal Spice Comparison Table (seed={seed_idx}, recipe={recipe_name}) ----")
+    logging.info(
+        "  "
+        f"{'spice':<20} | {'true_theta':>10} | {'learned_theta':>13} | "
+        f"{'true_t_var':>10} | {'learned_t_var':>13} | "
+        f"{'true_phi':>9} | {'learned_phi':>11} | {'true_p_var':>10} | {'learned_p_var':>13}"
+    )
+    logging.info("  " + "-" * 134)
+
+    for s in spices_to_report:
+        true_theta = hidden_hbm.get_theta(human_id, s)
+        learned_theta = learned_hbm.get_theta(human_id, s)
+        true_theta_var = hidden_hbm.get_theta_var(human_id, s)
+        learned_theta_var = learned_hbm.get_theta_var(human_id, s)
+        true_phi = hidden_hbm.get_phi(human_id, recipe_name, s)
+        learned_phi = learned_hbm.get_phi(human_id, recipe_name, s)
+        true_phi_var = hidden_hbm.get_phi_var(human_id, recipe_name, s)
+        learned_phi_var = learned_hbm.get_phi_var(human_id, recipe_name, s)
+        logging.info(
+            "  "
+            f"{s:<20} | "
+            f"{true_theta:+10.3f} | {learned_theta:+13.3f} | "
+            f"{true_theta_var:10.4f} | {learned_theta_var:13.4f} | "
+            f"{true_phi:+9.3f} | {learned_phi:+11.3f} | "
+            f"{true_phi_var:10.4f} | {learned_phi_var:13.4f}"
+        )
+
 def _create_hidden_hbm(spices: list, recipes: list, config_name: str):
     """Build an HBM from a hidden config for testing."""
     cfg = get_hidden_hbm_config(config_name)
@@ -39,8 +143,7 @@ def _create_hidden_hbm(spices: list, recipes: list, config_name: str):
         sigma0=cfg.sigma0,
         sigma_obs=cfg.sigma_obs,
     )
-    hbm._theta_mean[DEFAULT_HUMAN] = theta_mean
-    hbm._theta_var[DEFAULT_HUMAN] = {s: cfg.sigma_h**2 for s in spices}
+    hbm.set_theta(DEFAULT_HUMAN, theta_mean, sigma_h=cfg.sigma_h)
     return hbm
 
 def _make_env(env_seed: int, recipe_name: str, hidden_hbm, training: bool = False):
@@ -71,9 +174,11 @@ def test_spices_csp_single_recipe():
 
     config_name = PARAMETERS.get("hidden_hbm_config_name", "AlternatingHuman")
     hidden_hbm  = _create_hidden_hbm(spices, [recipe_name], config_name=config_name)
+    report_seed_indices = set(_seed_report_indices(num_seeds))
 
     # (seed_idx, ep_idx, true_mood, avg_satisfaction, inferred_mood)
     all_records: list[tuple] = []
+    seed_model_snapshots: dict[int, HierarchicalPreferenceModel] = {}
 
     for i in range(num_seeds):
         env_seed = PARAMETERS["env_seed"] + i
@@ -107,6 +212,7 @@ def test_spices_csp_single_recipe():
             all_records.append((i, ep, info["mood"], info["average_satisfaction"], inferred_mood))
 
         env.close()
+        seed_model_snapshots[i] = csp_generator._pref_gen._hbm
 
     # Satisfaction separated by mood
     for mood in ["neutral", "all_self", "none_self"]:
@@ -150,6 +256,25 @@ def test_spices_csp_single_recipe():
                 learned = hbm.phi_mean[recipe_name].get(s, 0.0)
                 true    = hidden_hbm.theta_mean.get(s, 0.0)
                 logging.info(f"  {s:20s}: learned={learned:+.3f}  true_theta={true:+.3f}")
+            _log_hbm_variance_metrics(
+                hbm=hbm,
+                hidden_hbm=hidden_hbm,
+                spices=spices,
+                recipe_name=recipe_name,
+                title=f"Learned Variances | {recipe_name}",
+            )
+
+            for seed_idx in sorted(report_seed_indices):
+                seed_hbm = seed_model_snapshots.get(seed_idx)
+                if seed_hbm is None:
+                    continue
+                _log_signal_spice_comparison_table(
+                    learned_hbm=seed_hbm,
+                    hidden_hbm=hidden_hbm,
+                    signal_spices=signal_spices,
+                    recipe_name=recipe_name,
+                    seed_idx=seed_idx,
+                )
 
 def test_spices_csp_cross_transfer():
     """Single Human | Train on K recipes | Evaluate on M held-out recipes vs. cold-start baseline.
@@ -330,6 +455,13 @@ def test_spices_csp_cross_transfer():
                     f"    {recipe_name:28s}: "
                     f"{correct}/{len(signal_spices)} = {correct / len(signal_spices):.1%}"
                 )
+                _log_hbm_variance_metrics(
+                    hbm=hbm,
+                    hidden_hbm=hidden_hbm,
+                    spices=signal_spices,
+                    recipe_name=recipe_name,
+                    title=f"Learned Variances | {recipe_name}",
+                )
 
 def test_spices_csp_multi_human():
     """Multi-Human | Shared HBM | Population pooling.
@@ -431,7 +563,7 @@ def test_spices_csp_multi_human():
         for h in train_human_ids:
             post_train_theta_acc[h] = (
                 sum(
-                    np.sign(shared_hbm._theta_mean[h].get(s, 0.0))
+                    np.sign(shared_hbm.get_theta(h, s))
                     == np.sign(hidden_hbms[h].theta_mean.get(s, 0.0))
                     for s in train_signal
                 ),
@@ -450,7 +582,7 @@ def test_spices_csp_multi_human():
 
         new_human_theta_acc = (
             sum(
-                np.sign(shared_hbm._theta_mean[new_human_id].get(s, 0.0))
+                np.sign(shared_hbm.get_theta(new_human_id, s))
                 == np.sign(hidden_hbms[new_human_id].theta_mean.get(s, 0.0))
                 for s in train_signal
             ),
@@ -552,9 +684,18 @@ def test_spices_csp_multi_human():
     for s in top_signal:
         true_val = hidden_hbms["h1"].theta_mean.get(s, 0.0)
         mu_val   = shared_hbm.get_mu(s)
-        theta_vals = [shared_hbm._theta_mean[h].get(s, 0.0) for h in all_human_ids]
+        theta_vals = [shared_hbm.get_theta(h, s) for h in all_human_ids]
         theta_str = " | ".join(f"{v:+.2f}" for v in theta_vals)
         logging.info(f"  {s:<18} | {true_val:+.2f} | {mu_val:+.2f} | {theta_str}")
+
+    _log_hbm_variance_metrics(
+        hbm=shared_hbm,
+        hidden_hbm=hidden_hbms["h1"],
+        spices=train_signal,
+        recipe_name=None,
+        human_id=train_human_ids[0],
+        title="Learned Variances | Shared Multi-Human HBM",
+    )
 
 def test_mood_inference():
     """
