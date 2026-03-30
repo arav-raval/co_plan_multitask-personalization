@@ -329,8 +329,9 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
             -1.0 — maximum negative satisfaction
 
         The generative model mirrors the HBM's Stage 2 likelihood:
-            logit    = sign(actor==preferred) * phi + psi_true
-            expected = tanh(logit)    ← matches HBM: tanh(sign*(phi+psi))
+            phi_latent = pref_sign * base_satisfaction_bias
+            logit      = actor_sign * (phi_latent + psi_true)
+            expected   = tanh(logit)    ← matches HBM: tanh(sign_actor*(phi+psi))
             p        = (expected+1)/2 ← map [-1,+1] → [0,1] for Beta params
             sat      ~ Beta(p*kappa+1, (1-p)*kappa+1) rescaled to [-1, +1]
 
@@ -338,9 +339,10 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
         (see _sample_psi_from_mood). This replaces the old per-step actor-dependent
         compute_mood_bias call, aligning the generative model with the HBM's scalar psi.
         """
-        sign = 1.0 if self._last_actor == preferred else -1.0
-        phi = sign * self._base_satisfaction_bias
-        logit = phi + self._current_psi_true   # psi_true is fixed for the whole episode
+        actor_sign = 1.0 if self._last_actor == "human" else -1.0
+        pref_sign = 1.0 if preferred == "human" else -1.0
+        phi_latent = pref_sign * self._base_satisfaction_bias
+        logit = actor_sign * (phi_latent + self._current_psi_true)
 
         expected = float(np.tanh(logit))
         p = (expected + 1.0) / 2.0

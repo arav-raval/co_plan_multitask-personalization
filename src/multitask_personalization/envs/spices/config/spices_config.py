@@ -65,7 +65,7 @@ class HBMConfig:
     # means a mood-shifted psi_true of ±3.0 is within 1.5 std of the prior.
     # Note: q(psi) variance is fixed at sigma_mood² (not learned) to prevent
     # psi's uncertainty from inflating phi's variance through the theta optimizer.
-    sigma_mood: float = 2.0
+    sigma_mood: float = 0.5
 
     # Stage 2: psi decay factor at episode end (aggressive reset toward 0).
     # 0.05 means 95% of psi mean is discarded between episodes.

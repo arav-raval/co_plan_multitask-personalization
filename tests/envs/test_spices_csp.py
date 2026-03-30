@@ -2,19 +2,13 @@
 
 import logging
 import numpy as np
-import pytest
-import matplotlib.pyplot as plt
-import random
-from scipy.spatial.distance import cosine
 
 from multitask_personalization.csp_solvers import EnumerationCSPSolver
 from multitask_personalization.envs.spices.spices_csp import SpicesAssignCSPGenerator
 from multitask_personalization.envs.spices.spices_env import (
-    SpiceEnv, SpiceState, SpiceSceneSpec, SpiceHiddenSpec, RecipeSpec
+    SpiceEnv, SpiceState, SpiceSceneSpec, SpiceHiddenSpec,
 )
 from multitask_personalization.envs.spices.recipes import get_recipe, get_profile
-from collections import Counter
-
 from multitask_personalization.envs.spices.spices_hbm import (
     DEFAULT_HUMAN,
     HierarchicalPreferenceModel,
@@ -22,117 +16,15 @@ from multitask_personalization.envs.spices.spices_hbm import (
 from multitask_personalization.envs.spices.config import (
     get_hidden_hbm_config,
     create_theta_params_from_config,
-    list_hidden_hbm_configs,
     PARAMETERS,
 )
 
-# ---- Helper functions ----
-def _log_hbm_variance_metrics(
-    hbm: HierarchicalPreferenceModel,
-    hidden_hbm: HierarchicalPreferenceModel | None = None,
-    spices: list[str] | None = None,
-    recipe_name: str | None = None,
-    human_id: str = DEFAULT_HUMAN,
-    title: str = "HBM Variance Metrics",
-) -> None:
-    """Log learned hyperparameters and posterior variances for a compact diagnostics snapshot."""
-    sigmas = hbm.get_learned_sigmas()
-    logging.info(f"\n---- {title} ----")
-    logging.info(
-        "  Learned sigmas: "
-        f"sigma_h={sigmas['sigma_h']:.4f}  "
-        f"sigma_r={sigmas['sigma_r']:.4f}  "
-        f"sigma_obs={sigmas['sigma_obs']:.4f}"
-    )
 
-    if not spices:
-        return
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
 
-    if hidden_hbm is not None:
-        ranked_spices = sorted(
-            spices,
-            key=lambda s: abs(hidden_hbm.theta_mean.get(s, 0.0)),
-            reverse=True,
-        )
-        signal_spices = [s for s in ranked_spices if abs(hidden_hbm.theta_mean.get(s, 0.0)) > 0.3]
-    else:
-        signal_spices = list(spices)
-
-    if not signal_spices:
-        return
-
-    report_spices = signal_spices[:5]
-    logging.info("  Posterior variances (top signal spices):")
-    for s in report_spices:
-        theta_var = hbm.get_theta_var(human_id, s)
-        mu_var = hbm.get_mu_var(s)
-        msg = f"    {s:20s}: theta_var={theta_var:.4f}  mu_var={mu_var:.4f}"
-        if recipe_name is not None:
-            phi_var = hbm.get_phi_var(human_id, recipe_name, s)
-            msg += f"  phi_var={phi_var:.4f}"
-        logging.info(msg)
-
-
-def _seed_report_indices(num_seeds: int, max_reports: int = 3) -> list[int]:
-    """Pick representative seeds to keep logs readable."""
-    if num_seeds <= 0:
-        return []
-    candidates = [0, num_seeds // 2, num_seeds - 1]
-    ordered_unique: list[int] = []
-    for idx in candidates:
-        if 0 <= idx < num_seeds and idx not in ordered_unique:
-            ordered_unique.append(idx)
-    return ordered_unique[:max_reports]
-
-
-def _log_signal_spice_comparison_table(
-    learned_hbm: HierarchicalPreferenceModel,
-    hidden_hbm: HierarchicalPreferenceModel,
-    signal_spices: list[str],
-    recipe_name: str,
-    seed_idx: int,
-    human_id: str = DEFAULT_HUMAN,
-    top_k: int = 10,
-) -> None:
-    """ASCII table: true vs learned means and variances for signal spices."""
-    if not signal_spices:
-        return
-
-    spices_to_report = sorted(
-        signal_spices,
-        key=lambda s: abs(hidden_hbm.theta_mean.get(s, 0.0)),
-        reverse=True,
-    )[:top_k]
-
-    logging.info(f"\n---- Signal Spice Comparison Table (seed={seed_idx}, recipe={recipe_name}) ----")
-    logging.info(
-        "  "
-        f"{'spice':<20} | {'true_theta':>10} | {'learned_theta':>13} | "
-        f"{'true_t_var':>10} | {'learned_t_var':>13} | "
-        f"{'true_phi':>9} | {'learned_phi':>11} | {'true_p_var':>10} | {'learned_p_var':>13}"
-    )
-    logging.info("  " + "-" * 134)
-
-    for s in spices_to_report:
-        true_theta = hidden_hbm.get_theta(human_id, s)
-        learned_theta = learned_hbm.get_theta(human_id, s)
-        true_theta_var = hidden_hbm.get_theta_var(human_id, s)
-        learned_theta_var = learned_hbm.get_theta_var(human_id, s)
-        true_phi = hidden_hbm.get_phi(human_id, recipe_name, s)
-        learned_phi = learned_hbm.get_phi(human_id, recipe_name, s)
-        true_phi_var = hidden_hbm.get_phi_var(human_id, recipe_name, s)
-        learned_phi_var = learned_hbm.get_phi_var(human_id, recipe_name, s)
-        logging.info(
-            "  "
-            f"{s:<20} | "
-            f"{true_theta:+10.3f} | {learned_theta:+13.3f} | "
-            f"{true_theta_var:10.4f} | {learned_theta_var:13.4f} | "
-            f"{true_phi:+9.3f} | {learned_phi:+11.3f} | "
-            f"{true_phi_var:10.4f} | {learned_phi_var:13.4f}"
-        )
-
-def _create_hidden_hbm(spices: list, recipes: list, config_name: str):
-    """Build an HBM from a hidden config for testing."""
+def _create_hidden_hbm(spices: list, recipes: list, config_name: str) -> HierarchicalPreferenceModel:
     cfg = get_hidden_hbm_config(config_name)
     theta_mean = create_theta_params_from_config(cfg, spices)
     hbm = HierarchicalPreferenceModel(
@@ -146,8 +38,9 @@ def _create_hidden_hbm(spices: list, recipes: list, config_name: str):
     hbm.set_theta(DEFAULT_HUMAN, theta_mean, sigma_h=cfg.sigma_h)
     return hbm
 
-def _make_env(env_seed: int, recipe_name: str, hidden_hbm, training: bool = False):
-    """Build a SpiceEnv for testing."""
+
+def _make_env(env_seed: int, recipe_name: str, hidden_hbm: HierarchicalPreferenceModel,
+              training: bool = False) -> SpiceEnv:
     recipe = get_recipe(recipe_name)
     scene_spec = SpiceSceneSpec(recipe=recipe)
     hidden_spec = SpiceHiddenSpec(
@@ -157,164 +50,220 @@ def _make_env(env_seed: int, recipe_name: str, hidden_hbm, training: bool = Fals
     )
     return SpiceEnv(scene_spec, hidden_spec, seed=env_seed)
 
-# ---- Test Functions
-def test_spices_csp_single_recipe():
-    """Single Recipe | Multi-Episode | Multi-Seed learning curves
 
-    Tracks:
-        - Split satisfaction by mood (neutral / all_self / none_self).
-        - Mood inference accuracy
-        - Theta-sign accuracy and phi convergence (final seed, signal spices)
+def _signal_spices(hidden_hbm: HierarchicalPreferenceModel, spices: list,
+                   threshold: float = 0.3) -> list[str]:
+    return sorted(
+        [s for s in spices if abs(hidden_hbm.theta_mean.get(s, 0.0)) > threshold],
+        key=lambda s: abs(hidden_hbm.theta_mean.get(s, 0.0)),
+        reverse=True,
+    )
+
+
+def _theta_sign_accuracy(hbm: HierarchicalPreferenceModel,
+                         hidden_hbm: HierarchicalPreferenceModel,
+                         signal_spices: list,
+                         human_id: str = DEFAULT_HUMAN) -> tuple[int, int]:
+    correct = sum(
+        np.sign(hbm.get_theta(human_id, s)) == np.sign(hidden_hbm.theta_mean.get(s, 0.0))
+        for s in signal_spices
+    )
+    return correct, len(signal_spices)
+
+
+def _phi_sign_accuracy(hbm: HierarchicalPreferenceModel,
+                       hidden_hbm: HierarchicalPreferenceModel,
+                       signal_spices: list,
+                       recipe_name: str,
+                       human_id: str = DEFAULT_HUMAN) -> tuple[int, int]:
+    correct = sum(
+        np.sign(hbm.phi_mean.get(recipe_name, {}).get(s, 0.0))
+        == np.sign(hidden_hbm.theta_mean.get(s, 0.0))
+        for s in signal_spices
+    )
+    return correct, len(signal_spices)
+
+
+def _psi_alignment(batch_psi_m: float, mood: str) -> bool:
+    """True if batch_psi_m sign matches the mood's expected direction."""
+    if mood == "neutral":
+        return True  # neutral is always aligned — psi near 0 is correct
+    if mood == "all_self":
+        return batch_psi_m > 0.0
+    if mood == "none_self":
+        return batch_psi_m < 0.0
+    return True
+
+
+# ---------------------------------------------------------------------------
+# test_spices_csp_single_recipe
+# ---------------------------------------------------------------------------
+
+def test_spices_csp_single_recipe():
+    """Single Recipe | Multi-Episode | Multi-Seed.
+
+    Metrics logged:
+        - Psi/mood alignment rate by episode quartile (all seeds)
+        - Running_psi trajectory for mood episodes (last seed, first 10 eps)
+        - Average satisfaction by mood
+        - Phi sign accuracy and learned vs. true theta (top spices, final seed)
+        - Learned hyperparameters (sigma_h, sigma_r, sigma_obs)
     """
     num_seeds    = PARAMETERS["num_seeds"]
     num_episodes = PARAMETERS["num_episodes"]
     recipe_name  = PARAMETERS["recipe_name"]
     recipe       = get_recipe(recipe_name)
     spices       = list(recipe.spices)
+    config_name  = PARAMETERS.get("hidden_hbm_config_name", "AlternatingHuman")
+    hidden_hbm   = _create_hidden_hbm(spices, [recipe_name], config_name=config_name)
+    sig_spices   = _signal_spices(hidden_hbm, spices)
 
-    config_name = PARAMETERS.get("hidden_hbm_config_name", "AlternatingHuman")
-    hidden_hbm  = _create_hidden_hbm(spices, [recipe_name], config_name=config_name)
-    report_seed_indices = set(_seed_report_indices(num_seeds))
-
-    # (seed_idx, ep_idx, true_mood, avg_satisfaction, inferred_mood)
+    # (seed, ep, mood, avg_sat, inferred_mood, batch_psi_m)
     all_records: list[tuple] = []
-    seed_model_snapshots: dict[int, HierarchicalPreferenceModel] = {}
+    final_hbm: HierarchicalPreferenceModel | None = None
+
+    num_psi_log_eps = min(num_episodes, 10)
 
     for i in range(num_seeds):
         env_seed = PARAMETERS["env_seed"] + i
         csp_seed = PARAMETERS["csp_seed"] + i
         assert env_seed != csp_seed
 
-        env           = _make_env(env_seed, recipe_name, hidden_hbm)
-        csp_generator = SpicesAssignCSPGenerator(spice_list=spices, recipe_list=[recipe_name], seed=csp_seed)
-        solver        = EnumerationCSPSolver(csp_seed)
-        max_steps     = len(spices) + 1
+        env     = _make_env(env_seed, recipe_name, hidden_hbm)
+        csp_gen = SpicesAssignCSPGenerator(spice_list=spices, recipe_list=[recipe_name], seed=csp_seed)
+        solver  = EnumerationCSPSolver(csp_seed)
+        hbm     = csp_gen._pref_gen._hbm
+        max_steps = len(spices) + 1
+        log_this_seed = (i == num_seeds - 1)
+
+        if log_this_seed:
+            logging.info(f"\n{'='*60}")
+            logging.info(f"[SingleRecipe] recipe={recipe_name}  config={config_name}  seed={i}")
+            logging.info(f"  Signal spices: {len(sig_spices)} / {len(spices)}")
+            logging.info(f"\n  --- Psi Trajectory (first {num_psi_log_eps} eps) ---")
+            logging.info(f"  {'Ep':>4}  {'mood':10}  {'exp':>4}  {'aligned':>7}  "
+                         f"{'psi_m':>8}  {'peak':>8}  trajectory")
 
         for ep in range(num_episodes):
             obs, _ = env.reset()
             assert isinstance(obs, SpiceState)
-            assert obs.current_spice in obs.feasible_next
 
+            step_psi: list[float] = []
             for _ in range(max_steps):
                 prev_obs = obs
-                csp, samplers, policy, initialization = csp_generator.generate(obs)
-                sol = solver.solve(csp, initialization, samplers)
+                csp, samplers, policy, init = csp_gen.generate(obs)
+                sol = solver.solve(csp, init, samplers)
                 assert sol is not None
                 policy.reset(sol)
                 act = policy.step(obs)
-                obs, reward, done, truncated, info = env.step(act)
+                obs, reward, done, _, info = env.step(act)
                 assert np.isclose(reward, 0.0)
-                csp_generator.observe_transition(prev_obs, act, obs, done, info)
+                csp_gen.observe_transition(prev_obs, act, obs, done, info)
+                step_psi.append(hbm.get_running_psi(DEFAULT_HUMAN))
                 if done:
                     break
 
-            inferred_mood = max(info["mood_posterior"], key=info["mood_posterior"].get)
-            all_records.append((i, ep, info["mood"], info["average_satisfaction"], inferred_mood))
+            mood       = info["mood"]
+            psi_m      = hbm.get_psi_m(DEFAULT_HUMAN)
+            inferred   = max(info["mood_posterior"], key=info["mood_posterior"].get)
+            all_records.append((i, ep, mood, info["average_satisfaction"], inferred, psi_m))
+
+            if log_this_seed and ep < num_psi_log_eps:
+                in_ep  = [v for v in step_psi if v != 0.0] or step_psi[:1]
+                peak   = max(in_ep, key=abs)
+                exp    = "+" if mood == "all_self" else ("-" if mood == "none_self" else "~")
+                ok     = "✓" if _psi_alignment(psi_m, mood) else "✗"
+                traj   = "  ".join(f"{v:+.2f}" for v in step_psi)
+                logging.info(f"  {ep+1:4d}  {mood:10}  {exp:>4}  {ok:>7}  "
+                             f"{psi_m:+8.4f}  {peak:+8.4f}  [{traj}]")
 
         env.close()
-        seed_model_snapshots[i] = csp_generator._pref_gen._hbm
+        if log_this_seed:
+            final_hbm = hbm
 
-    # Satisfaction separated by mood
-    for mood in ["neutral", "all_self", "none_self"]:
-        ep_sats: dict[int, list[float]] = {}
-        for (_, ep, m, sat, _) in all_records:
-            if m == mood:
-                ep_sats.setdefault(ep, []).append(sat)
-        if not ep_sats:
+    # ── Psi/mood alignment by episode quartile ──────────────────────────────
+    q = num_episodes // 4
+    quartile_labels = [f"Q1(1-{q})", f"Q2({q+1}-{2*q})", f"Q3({2*q+1}-{3*q})", f"Q4({3*q+1}-{num_episodes})"]
+    quartile_ranges = [(0, q), (q, 2*q), (2*q, 3*q), (3*q, num_episodes)]
+
+    mood_records = [(ep, mood, psi_m) for (_, ep, mood, _, _, psi_m) in all_records if mood != "neutral"]
+    logging.info(f"\n  --- Psi/Mood Alignment by Quartile (non-neutral eps, all {num_seeds} seeds) ---")
+    for label, (lo, hi) in zip(quartile_labels, quartile_ranges):
+        subset = [(mood, psi_m) for (ep, mood, psi_m) in mood_records if lo <= ep < hi]
+        if not subset:
+            logging.info(f"  {label}: no mood episodes")
             continue
-        logging.info(f"\n---- Learning Curve ({mood}) | {recipe_name} ----")
-        for ep in sorted(ep_sats):
-            sats = ep_sats[ep]
-            logging.info(f"  Ep {ep+1:3d} (n={len(sats)}): avg_sat={np.mean(sats):+.3f}")
+        aligned = sum(_psi_alignment(psi_m, mood) for mood, psi_m in subset)
+        logging.info(f"  {label}: {aligned}/{len(subset)} = {aligned/len(subset):.0%} aligned")
 
-    # Average Satisfaction
-    average_satisfaction = np.mean([r[3] for r in all_records]) 
-    logging.info(f"\n---- Average Satisfaction (All Moods): {average_satisfaction:+.3f}")
+    # ── Average satisfaction by mood ────────────────────────────────────────
+    logging.info(f"\n  --- Average Satisfaction by Mood ---")
+    for mood in ["neutral", "all_self", "none_self"]:
+        sats = [sat for (_, _, m, sat, _, _) in all_records if m == mood]
+        if sats:
+            logging.info(f"  {mood:10}: avg={np.mean(sats):+.3f}  (n={len(sats)})")
+    overall = np.mean([r[3] for r in all_records])
+    logging.info(f"  {'overall':10}: avg={overall:+.3f}  (n={len(all_records)})")
 
-    # Mood inference accuracy
-    mood_correct = sum(1 for (_, _, mood, _, inferred) in all_records if mood == inferred)
-    logging.info(
-        f"\n---- Mood Inference: {mood_correct}/{len(all_records)} "
-        f"= {mood_correct / len(all_records):.1%} ----"
-    )
+    # ── Phi sign accuracy + learned vs. true (final seed) ───────────────────
+    if final_hbm is not None and sig_spices:
+        c, tot = _phi_sign_accuracy(final_hbm, hidden_hbm, sig_spices, recipe_name)
+        sigmas = final_hbm.get_learned_sigmas()
+        logging.info(f"\n  --- Learned Preferences (final seed) ---")
+        logging.info(f"  Phi sign accuracy: {c}/{tot} = {c/tot:.0%}")
+        logging.info(f"  Learned sigmas: sigma_h={sigmas['sigma_h']:.3f}  "
+                     f"sigma_r={sigmas['sigma_r']:.3f}  sigma_obs={sigmas['sigma_obs']:.3f}")
+        logging.info(f"\n  {'spice':<20} {'true_theta':>10} {'learned_phi':>12} {'phi_var':>8}")
+        logging.info(f"  {'-'*54}")
+        for s in sig_spices[:10]:
+            true_t  = hidden_hbm.theta_mean.get(s, 0.0)
+            learned = final_hbm.phi_mean.get(recipe_name, {}).get(s, 0.0)
+            phi_var = final_hbm.get_phi_var(DEFAULT_HUMAN, recipe_name, s)
+            correct = "✓" if np.sign(learned) == np.sign(true_t) else "✗"
+            logging.info(f"  {s:<20} {true_t:+10.3f} {learned:+12.3f} {phi_var:8.4f} {correct}")
 
-    # Theta and Phi Convergence
-    if hidden_hbm is not None:
-        hbm           = csp_generator._pref_gen._hbm
-        signal_spices = [s for s in spices if abs(hidden_hbm.theta_mean.get(s, 0.0)) > 0.3]
-        if signal_spices:
-            correct = sum(
-                np.sign(hbm.phi_mean[recipe_name].get(s, 0.0)) == np.sign(hidden_hbm.theta_mean.get(s, 0.0))
-                for s in signal_spices
-            )
-            logging.info(
-                f"\n---- Theta-Sign Accuracy (final seed): "
-                f"{correct}/{len(signal_spices)} = {correct / len(signal_spices):.1%} ----"
-            )
-            logging.info("\n---- Phi Convergence (final seed, first 5 signal spices) ----")
-            for s in signal_spices[:5]:
-                learned = hbm.phi_mean[recipe_name].get(s, 0.0)
-                true    = hidden_hbm.theta_mean.get(s, 0.0)
-                logging.info(f"  {s:20s}: learned={learned:+.3f}  true_theta={true:+.3f}")
-            _log_hbm_variance_metrics(
-                hbm=hbm,
-                hidden_hbm=hidden_hbm,
-                spices=spices,
-                recipe_name=recipe_name,
-                title=f"Learned Variances | {recipe_name}",
-            )
 
-            for seed_idx in sorted(report_seed_indices):
-                seed_hbm = seed_model_snapshots.get(seed_idx)
-                if seed_hbm is None:
-                    continue
-                _log_signal_spice_comparison_table(
-                    learned_hbm=seed_hbm,
-                    hidden_hbm=hidden_hbm,
-                    signal_spices=signal_spices,
-                    recipe_name=recipe_name,
-                    seed_idx=seed_idx,
-                )
+# ---------------------------------------------------------------------------
+# test_spices_csp_cross_transfer
+# ---------------------------------------------------------------------------
 
 def test_spices_csp_cross_transfer():
-    """Single Human | Train on K recipes | Evaluate on M held-out recipes vs. cold-start baseline.
+    """Single Human | Train on K recipes | Evaluate on M held-out recipes vs. cold-start.
 
-    Training uses forced-neutral mood (100% learning efficiency).
-    Evaluation uses real mood; satisfaction is recorded only for neutral episodes so the
-    comparison is uncontaminated by mood overrides.
+    Training: forced-neutral mood.
+    Evaluation: real mood; only neutral episodes counted for fair comparison.
 
-    Metrics:
-        - Per-test-recipe and aggregate average satisfaction: trained vs. baseline
-        - Theta-sign accuracy on test recipes (final seed)
+    Metrics logged:
+        - Theta sign accuracy (post-training, signal spices)
+        - Per-test-recipe satisfaction: trained vs. baseline + delta
+        - Aggregate satisfaction delta
+        - Learned hyperparameters
     """
-    num_seeds       = PARAMETERS["num_seeds"]
-    num_train_eps   = PARAMETERS["num_episodes"] 
-    num_test_eps    = PARAMETERS["num_test_episodes"]
-    train_frac      = PARAMETERS["train_frac"]
+    num_seeds     = PARAMETERS["num_seeds"]
+    num_train_eps = PARAMETERS["num_episodes"]
+    num_test_eps  = PARAMETERS["num_test_episodes"]
+    train_frac    = PARAMETERS["train_frac"]
+    config_name   = PARAMETERS.get("hidden_hbm_config_name", "AlternatingHuman")
 
     profile_spec  = get_profile(PARAMETERS["profile"])
     all_recipes   = list(profile_spec.recipes)
     n_train       = int(np.ceil(len(all_recipes) * train_frac))
     train_recipes = all_recipes[:n_train]
     test_recipes  = all_recipes[n_train:]
+    all_spices    = sorted({s for r in all_recipes for s in get_recipe(r).spices})
 
-    all_spices = sorted({s for r in all_recipes for s in get_recipe(r).spices})
+    hidden_hbm  = _create_hidden_hbm(all_spices, all_recipes, config_name=config_name)
+    sig_spices  = _signal_spices(hidden_hbm, all_spices)
+    max_steps   = max(len(get_recipe(r).spices) for r in all_recipes) + 5
 
     logging.info(f"\n{'='*60}")
-    logging.info(f"[Cross-Transfer] profile={profile_spec.name}")
-    logging.info(f"  Train ({len(train_recipes)}): {train_recipes}")
-    logging.info(f"  Test  ({len(test_recipes)}):  {test_recipes}")
-    logging.info(f"  Vocabulary: {len(all_spices)} spices")
+    logging.info(f"[CrossTransfer] profile={profile_spec.name}  config={config_name}")
+    logging.info(f"  Train: {len(train_recipes)} recipes  |  Test: {len(test_recipes)} recipes  "
+                 f"|  Vocab: {len(all_spices)} spices  |  Signal: {len(sig_spices)} spices")
 
-    config_name = PARAMETERS.get("hidden_hbm_config_name", "AlternatingHuman")
-    hidden_hbm  = _create_hidden_hbm(all_spices, all_recipes, config_name=config_name)
-    logging.info(f"  Preference Configuration: {config_name}")
-
-    trained_sats         = {r: [] for r in test_recipes}
-    baseline_sats        = {r: [] for r in test_recipes}
-    post_train_theta_acc = None  # (correct, total) snapshotted after training, before eval
-
-    max_steps = max(len(get_recipe(r).spices) for r in all_recipes) + 5
+    trained_sats  = {r: [] for r in test_recipes}
+    baseline_sats = {r: [] for r in test_recipes}
+    post_train_theta_acc: tuple[int, int] | None = None
 
     for i in range(num_seeds):
         env_seed = PARAMETERS["env_seed"] + i
@@ -325,7 +274,6 @@ def test_spices_csp_cross_transfer():
             spice_list=all_spices, recipe_list=train_recipes, seed=csp_seed
         )
 
-        # Training (mood = False)
         for recipe_name in train_recipes:
             env = _make_env(env_seed, recipe_name, hidden_hbm, training=True)
             for _ in range(num_train_eps):
@@ -343,25 +291,10 @@ def test_spices_csp_cross_transfer():
                         break
             env.close()
 
-        # Post-training theta accuracy (spices seen in training)
-        if hidden_hbm is not None:
-            post_train_hbm = trained_gen._pref_gen._hbm
-            post_train_hbm.flush_theta_mu()
-            train_vocab     = {s for r in train_recipes for s in get_recipe(r).spices}
-            train_signal    = [
-                s for s in train_vocab
-                if abs(hidden_hbm.theta_mean.get(s, 0.0)) > 0.3
-            ]
-            post_train_theta_acc = (
-                sum(
-                    np.sign(post_train_hbm.theta_mean.get(s, 0.0))
-                    == np.sign(hidden_hbm.theta_mean.get(s, 0.0))
-                    for s in train_signal
-                ),
-                len(train_signal),
-            )
+        post_train_hbm = trained_gen._pref_gen._hbm
+        post_train_hbm.flush_theta_mu()
+        post_train_theta_acc = _theta_sign_accuracy(post_train_hbm, hidden_hbm, sig_spices)
 
-        # Evaluation (all moods); only neutral episodes reported
         for recipe_name in test_recipes:
             env = _make_env(env_seed, recipe_name, hidden_hbm, training=False)
             for _ in range(num_test_eps):
@@ -381,8 +314,6 @@ def test_spices_csp_cross_transfer():
                     trained_sats[recipe_name].append(info["average_satisfaction"])
             env.close()
 
-        # Baseline: fresh generator + fresh solver, each test recipe in isolation.
-        # Fresh solver avoids RNG contamination from the training + eval steps above.
         baseline_solver = EnumerationCSPSolver(csp_seed)
         for recipe_name in test_recipes:
             test_spices = sorted(get_recipe(recipe_name).spices)
@@ -407,78 +338,55 @@ def test_spices_csp_cross_transfer():
                     baseline_sats[recipe_name].append(info["average_satisfaction"])
             env.close()
 
-    # Log metrics
-    logging.info(f"\n{'='*60}")
-    logging.info(f"[Results] trained vs. baseline (neutral episodes only)")
+    # ── Theta sign accuracy ──────────────────────────────────────────────────
+    if post_train_theta_acc is not None:
+        c, tot = post_train_theta_acc
+        logging.info(f"\n  --- Theta Sign Accuracy (post-training, {tot} signal spices) ---")
+        logging.info(f"  {c}/{tot} = {c/tot:.0%}")
+
+    # ── Satisfaction: trained vs. baseline ──────────────────────────────────
+    logging.info(f"\n  --- Satisfaction: Trained vs. Baseline (neutral episodes only) ---")
+    logging.info(f"  {'recipe':<28} {'trained':>8} {'baseline':>9} {'delta':>7}")
+    logging.info(f"  {'-'*56}")
     trained_all, baseline_all = [], []
     for recipe_name in test_recipes:
         t = trained_sats[recipe_name]
         b = baseline_sats[recipe_name]
         trained_all.extend(t)
         baseline_all.extend(b)
-        logging.info(
-            f"  {recipe_name:28s}: "
-            f"trained={np.mean(t) if t else float('nan'):+.3f} (n={len(t)})  "
-            f"baseline={np.mean(b) if b else float('nan'):+.3f} (n={len(b)})  "
-            f"delta={np.mean(t) - np.mean(b) if t and b else float('nan'):+.3f}"
-        )
+        t_mean = np.mean(t) if t else float("nan")
+        b_mean = np.mean(b) if b else float("nan")
+        delta  = t_mean - b_mean if t and b else float("nan")
+        logging.info(f"  {recipe_name:<28} {t_mean:+8.3f} {b_mean:+9.3f} {delta:+7.3f}")
     if trained_all and baseline_all:
-        logging.info(
-            f"\n  AGGREGATE: trained={np.mean(trained_all):+.3f}  "
-            f"baseline={np.mean(baseline_all):+.3f}  "
-            f"delta={np.mean(trained_all) - np.mean(baseline_all):+.3f}"
-        )
+        agg_t = np.mean(trained_all)
+        agg_b = np.mean(baseline_all)
+        logging.info(f"  {'-'*56}")
+        logging.info(f"  {'AGGREGATE':<28} {agg_t:+8.3f} {agg_b:+9.3f} {agg_t-agg_b:+7.3f}")
 
-    if hidden_hbm is not None:
-        hbm = trained_gen._pref_gen._hbm
+    # ── Learned hyperparameters ──────────────────────────────────────────────
+    hbm = trained_gen._pref_gen._hbm
+    sigmas = hbm.get_learned_sigmas()
+    logging.info(f"\n  Learned sigmas: sigma_h={sigmas['sigma_h']:.3f}  "
+                 f"sigma_r={sigmas['sigma_r']:.3f}  sigma_obs={sigmas['sigma_obs']:.3f}")
 
-        # ── Post-training theta accuracy (per-human preference) ---
-        if post_train_theta_acc is not None:
-            correct_t, total_t = post_train_theta_acc
-            logging.info(
-                f"\n  Post-Training Theta Accuracy (final seed, {total_t} signal spices): "
-                f"{correct_t}/{total_t} = {correct_t / total_t:.1%}"
-            )
 
-        # ── Post-eval accuracy per test recipe  ---
-        logging.info(f"\n  Post-Eval Phi Accuracy per test recipe (final seed):")
-        for recipe_name in test_recipes:
-            r_spices      = list(get_recipe(recipe_name).spices)
-            signal_spices = [s for s in r_spices if abs(hidden_hbm.theta_mean.get(s, 0.0)) > 0.3]
-            if signal_spices:
-                correct = sum(
-                    np.sign(hbm.phi_mean.get(recipe_name, {}).get(s, 0.0))
-                    == np.sign(hidden_hbm.theta_mean.get(s, 0.0))
-                    for s in signal_spices
-                )
-                logging.info(
-                    f"    {recipe_name:28s}: "
-                    f"{correct}/{len(signal_spices)} = {correct / len(signal_spices):.1%}"
-                )
-                _log_hbm_variance_metrics(
-                    hbm=hbm,
-                    hidden_hbm=hidden_hbm,
-                    spices=signal_spices,
-                    recipe_name=recipe_name,
-                    title=f"Learned Variances | {recipe_name}",
-                )
+# ---------------------------------------------------------------------------
+# test_spices_csp_multi_human
+# ---------------------------------------------------------------------------
 
 def test_spices_csp_multi_human():
-    """Multi-Human | Shared HBM | Population pooling.
+    """Multi-Human | Shared HBM | Population pooling + new-human cold-start.
 
-    Two humans (h1, h2) train on the same K recipes using a single shared
-    HierarchicalPreferenceModel.  Their observations jointly update a shared
-    population mean μ.  After training, a third human (h3) is registered from
-    the learned mu
-
-    Metrics:
-        - Per-trained-human theta accuracy after training (h1, h2).
-        - Population sign accuracy vs. true preferences.
-        - h3 initial theta accuracy
-        - Satisfaction on test recipes: h1/h2 trained vs. cold baseline.
-        - Satisfaction on test recipes: h3 vs. cold baseline.
+    Metrics logged:
+        - Per-trained-human theta sign accuracy
+        - New human (μ warm-start) theta accuracy at zero episodes
+        - Population μ sign accuracy
+        - Satisfaction: trained humans + new human vs. cold baseline
+        - Learned μ and θ for top signal spices
     """
-    num_seeds     = PARAMETERS["num_seeds"]
+    num_seeds   = PARAMETERS["num_seeds"]
+    config_name = PARAMETERS["hidden_hbm_config_name"]
 
     profile_spec  = get_profile(PARAMETERS["profile"])
     all_recipes   = list(profile_spec.recipes)
@@ -487,34 +395,32 @@ def test_spices_csp_multi_human():
     test_recipes  = all_recipes[n_train:]
     all_spices    = sorted({s for r in all_recipes for s in get_recipe(r).spices})
 
-    num_humans = PARAMETERS["num_humans"]
+    num_humans      = PARAMETERS["num_humans"]
     train_human_ids = [f"h{i + 1}" for i in range(num_humans - 1)]
     new_human_id    = f"h{num_humans}"
     all_human_ids   = train_human_ids + [new_human_id]
 
-    # Scale to number of humans 
     num_train_eps = max(1, PARAMETERS["num_episodes"] // len(train_human_ids))
     num_test_eps  = max(1, PARAMETERS["num_test_episodes"] // len(all_human_ids))
+    max_steps     = max(len(get_recipe(r).spices) for r in all_recipes) + 5
 
-    config_name = PARAMETERS["hidden_hbm_config_name"]
     hidden_hbms = {
         h: _create_hidden_hbm(all_spices, all_recipes, config_name=config_name)
         for h in all_human_ids
     }
+    sig_spices = _signal_spices(hidden_hbms["h1"], all_spices)
 
     logging.info(f"\n{'='*60}")
-    logging.info(f"[Multi-Human] profile={profile_spec.name}  config={config_name}")
-    logging.info(f"  Train ({len(train_recipes)}): {train_recipes}")
-    logging.info(f"  Test  ({len(test_recipes)}):  {test_recipes}")
-    logging.info(f"  Trained humans: {train_human_ids}  New human: {new_human_id}")
-    logging.info(f"  Vocabulary: {len(all_spices)} spices")
+    logging.info(f"[MultiHuman] profile={profile_spec.name}  config={config_name}")
+    logging.info(f"  Train: {len(train_recipes)} recipes  |  Test: {len(test_recipes)} recipes  "
+                 f"|  Humans: {train_human_ids} + new={new_human_id}  "
+                 f"|  Signal spices: {len(sig_spices)}")
 
     trained_sats  = {h: {r: [] for r in test_recipes} for h in all_human_ids}
     baseline_sats = {h: {r: [] for r in test_recipes} for h in all_human_ids}
-    post_train_theta_acc = {h: None for h in train_human_ids}
-    new_human_theta_acc  = None  
-
-    max_steps = max(len(get_recipe(r).spices) for r in all_recipes) + 5
+    post_train_theta_acc: dict[str, tuple[int, int]] = {}
+    new_human_theta_acc: tuple[int, int] | None = None
+    shared_hbm: HierarchicalPreferenceModel | None = None
 
     for i in range(num_seeds):
         env_seed = PARAMETERS["env_seed"] + i
@@ -522,19 +428,14 @@ def test_spices_csp_multi_human():
         solver   = EnumerationCSPSolver(csp_seed)
 
         shared_hbm = HierarchicalPreferenceModel(spices=all_spices)
-
         gens = {
             h: SpicesAssignCSPGenerator(
-                spice_list=all_spices,
-                recipe_list=train_recipes,
-                seed=csp_seed,
-                human_id=h,
-                shared_hbm=shared_hbm,
+                spice_list=all_spices, recipe_list=train_recipes,
+                seed=csp_seed, human_id=h, shared_hbm=shared_hbm,
             )
             for h in train_human_ids
         }
 
-        # Training
         for recipe_name in train_recipes:
             for h in train_human_ids:
                 env = _make_env(env_seed, recipe_name, hidden_hbms[h], training=True)
@@ -555,41 +456,16 @@ def test_spices_csp_multi_human():
 
         shared_hbm.flush_theta_mu()
 
-        train_vocab  = {s for r in train_recipes for s in get_recipe(r).spices}
-        train_signal = [
-            s for s in train_vocab
-            if abs(hidden_hbms["h1"].theta_mean.get(s, 0.0)) > 0.3
-        ]
         for h in train_human_ids:
-            post_train_theta_acc[h] = (
-                sum(
-                    np.sign(shared_hbm.get_theta(h, s))
-                    == np.sign(hidden_hbms[h].theta_mean.get(s, 0.0))
-                    for s in train_signal
-                ),
-                len(train_signal),
-            )
+            post_train_theta_acc[h] = _theta_sign_accuracy(shared_hbm, hidden_hbms[h], sig_spices, h)
 
-        # Register h3
         shared_hbm.register_human(new_human_id)
         gens[new_human_id] = SpicesAssignCSPGenerator(
-            spice_list=all_spices,
-            recipe_list=train_recipes,
-            seed=csp_seed,
-            human_id=new_human_id,
-            shared_hbm=shared_hbm,
+            spice_list=all_spices, recipe_list=train_recipes,
+            seed=csp_seed, human_id=new_human_id, shared_hbm=shared_hbm,
         )
+        new_human_theta_acc = _theta_sign_accuracy(shared_hbm, hidden_hbms[new_human_id], sig_spices, new_human_id)
 
-        new_human_theta_acc = (
-            sum(
-                np.sign(shared_hbm.get_theta(new_human_id, s))
-                == np.sign(hidden_hbms[new_human_id].theta_mean.get(s, 0.0))
-                for s in train_signal
-            ),
-            len(train_signal),
-        )
-
-        # Evaluation
         for h in all_human_ids:
             for recipe_name in test_recipes:
                 env = _make_env(env_seed, recipe_name, hidden_hbms[h], training=False)
@@ -610,7 +486,6 @@ def test_spices_csp_multi_human():
                         trained_sats[h][recipe_name].append(info["average_satisfaction"])
                 env.close()
 
-        # Baseline
         baseline_solver = EnumerationCSPSolver(csp_seed)
         for h in all_human_ids:
             for recipe_name in test_recipes:
@@ -636,142 +511,105 @@ def test_spices_csp_multi_human():
                         baseline_sats[h][recipe_name].append(info["average_satisfaction"])
                 env.close()
 
-    # Metrics Summary
-    logging.info(f"\n{'='*60}")
-    logging.info(f"[Results] trained vs. baseline (neutral episodes only)")
+    # ── Theta sign accuracy ──────────────────────────────────────────────────
+    logging.info(f"\n  --- Theta Sign Accuracy (post-training, {len(sig_spices)} signal spices) ---")
+    for h in train_human_ids:
+        if h in post_train_theta_acc:
+            c, tot = post_train_theta_acc[h]
+            logging.info(f"  {h} (trained):     {c}/{tot} = {c/tot:.0%}")
+    if new_human_theta_acc is not None:
+        c, tot = new_human_theta_acc
+        logging.info(f"  {new_human_id} (μ warm-start): {c}/{tot} = {c/tot:.0%}  (zero episodes)")
 
+    if shared_hbm is not None:
+        mu_correct = sum(
+            np.sign(shared_hbm.get_mu(s)) == np.sign(hidden_hbms["h1"].theta_mean.get(s, 0.0))
+            for s in sig_spices
+        )
+        logging.info(f"  μ population sign accuracy: {mu_correct}/{len(sig_spices)} = {mu_correct/len(sig_spices):.0%}")
+
+    # ── Satisfaction ─────────────────────────────────────────────────────────
+    logging.info(f"\n  --- Satisfaction vs. Baseline (neutral episodes only) ---")
+    logging.info(f"  {'human':<6} {'type':<14} {'trained':>8} {'baseline':>9} {'delta':>7}")
+    logging.info(f"  {'-'*48}")
     for h in all_human_ids:
         label = "μ-warm (new)" if h == new_human_id else "trained"
         t_all = [s for r in test_recipes for s in trained_sats[h][r]]
         b_all = [s for r in test_recipes for s in baseline_sats[h][r]]
-        logging.info(
-            f"  {h} ({label:14s}): "
-            f"trained={np.mean(t_all) if t_all else float('nan'):+.3f} (n={len(t_all)})  "
-            f"baseline={np.mean(b_all) if b_all else float('nan'):+.3f} (n={len(b_all)})  "
-            f"delta={np.mean(t_all) - np.mean(b_all) if t_all and b_all else float('nan'):+.3f}"
-        )
+        t_mean = np.mean(t_all) if t_all else float("nan")
+        b_mean = np.mean(b_all) if b_all else float("nan")
+        delta  = t_mean - b_mean if t_all and b_all else float("nan")
+        logging.info(f"  {h:<6} {label:<14} {t_mean:+8.3f} {b_mean:+9.3f} {delta:+7.3f}")
 
-    logging.info(f"\n  Post-Training Theta Accuracy (final seed, {len(train_signal)} signal spices):")
-    for h in train_human_ids:
-        if post_train_theta_acc[h] is not None:
-            c, tot = post_train_theta_acc[h]
-            logging.info(f"    {h}: {c}/{tot} = {c/tot:.1%}")
+    # ── Learned μ and θ (top 10 signal spices) ──────────────────────────────
+    if shared_hbm is not None:
+        top_sig = sig_spices[:10]
+        logging.info(f"\n  --- Learned μ and θ (top {len(top_sig)} signal spices) ---")
+        header = f"  {'spice':<20} {'true':>6} {'μ':>6}" + "".join(f" {'  '+h:>7}" for h in all_human_ids)
+        logging.info(header)
+        logging.info(f"  {'-'*(len(header)-2)}")
+        for s in top_sig:
+            true_val = hidden_hbms["h1"].theta_mean.get(s, 0.0)
+            mu_val   = shared_hbm.get_mu(s)
+            theta_str = "".join(f" {shared_hbm.get_theta(h, s):+7.2f}" for h in all_human_ids)
+            logging.info(f"  {s:<20} {true_val:+6.2f} {mu_val:+6.2f}{theta_str}")
 
-    if new_human_theta_acc is not None:
-        c, tot = new_human_theta_acc
-        logging.info(
-            f"\n  h{num_humans} Initial Theta Accuracy (μ warm-start, zero episodes): "
-            f"{c}/{tot} = {c/tot:.1%}"
-        )
+        sigmas = shared_hbm.get_learned_sigmas()
+        logging.info(f"\n  Learned sigmas: sigma_h={sigmas['sigma_h']:.3f}  "
+                     f"sigma_r={sigmas['sigma_r']:.3f}  sigma_obs={sigmas['sigma_obs']:.3f}")
 
-    mu_correct = sum(
-        np.sign(shared_hbm.get_mu(s)) == np.sign(hidden_hbms[train_human_ids[0]].theta_mean.get(s, 0.0))
-        for s in train_signal
-    )
-    logging.info(
-        f"\n  Population μ Sign Accuracy (final seed): "
-        f"{mu_correct}/{len(train_signal)} = {mu_correct/len(train_signal):.1%}"
-    )
 
-    # Report global μ and θ for each human (top 12 signal spices by |true θ|).
-    top_signal = sorted(
-        train_signal,
-        key=lambda s: abs(hidden_hbms["h1"].theta_mean.get(s, 0.0)),
-        reverse=True,
-    )[:12]
-    logging.info(f"\n  Learned μ and θ (final seed, top 12 signal spices):")
-    logging.info(f"  {'spice':<18} | {'true':>6} | {'μ':>6} | " + " | ".join(f"{h:>6}" for h in all_human_ids))
-    for s in top_signal:
-        true_val = hidden_hbms["h1"].theta_mean.get(s, 0.0)
-        mu_val   = shared_hbm.get_mu(s)
-        theta_vals = [shared_hbm.get_theta(h, s) for h in all_human_ids]
-        theta_str = " | ".join(f"{v:+.2f}" for v in theta_vals)
-        logging.info(f"  {s:<18} | {true_val:+.2f} | {mu_val:+.2f} | {theta_str}")
-
-    _log_hbm_variance_metrics(
-        hbm=shared_hbm,
-        hidden_hbm=hidden_hbms["h1"],
-        spices=train_signal,
-        recipe_name=None,
-        human_id=train_human_ids[0],
-        title="Learned Variances | Shared Multi-Human HBM",
-    )
+# ---------------------------------------------------------------------------
+# test_mood_inference
+# ---------------------------------------------------------------------------
 
 def test_mood_inference():
-    """
-    Basic unit test for correct mood inference by end of episode for each mood type
-    """
+    """Unit test: verify correct mood inference by episode end for each mood type."""
     MOODS = ("all_self", "neutral", "none_self")
-    mood_outcomes = {}
+    recipe_name = PARAMETERS["recipe_name"]
+    recipe      = get_recipe(recipe_name)
+    spices      = list(recipe.spices)
+    config_name = PARAMETERS.get("hidden_hbm_config_name", "AlternatingHuman")
+    hidden_hbm  = _create_hidden_hbm(spices, [recipe_name], config_name=config_name)
 
-    # Seeds
     env_seed = PARAMETERS["env_seed"]
     csp_seed = PARAMETERS["csp_seed"]
-    offset = 0
     assert env_seed != csp_seed
 
-    # Recipe
-    recipe_name = PARAMETERS["recipe_name"]
-    recipe = get_recipe(recipe_name)
-    spices = list(recipe.spices)
-
-    # Hidden HBM Model
-    config_name = PARAMETERS.get("hidden_hbm_config_name", "AlternatingHuman")
-    hidden_hbm = _create_hidden_hbm(spices, [recipe_name], config_name=config_name)
+    mood_outcomes: dict[str, str] = {}
+    offset = 0
 
     while set(mood_outcomes.keys()) != set(MOODS):
-        # Environment (generates SpiceSceneSpec, SpiceHiddenSpec, SpiceEnv)
-        env = _make_env(env_seed + offset, recipe_name, hidden_hbm)
+        env         = _make_env(env_seed + offset, recipe_name, hidden_hbm)
+        csp_gen     = SpicesAssignCSPGenerator(spice_list=spices, recipe_list=[recipe_name], seed=csp_seed)
+        solver      = EnumerationCSPSolver(csp_seed)
+        max_steps   = len(spices) + 5
+
         obs, _ = env.reset()
         assert isinstance(obs, SpiceState)
-        assert obs.current_spice in obs.feasible_next
 
-        # Create the CSP
-        csp_generator = SpicesAssignCSPGenerator(
-            spice_list=spices,
-            recipe_list=[recipe_name],
-            seed=csp_seed,
-        )
-
-        # Create the solver
-        solver = EnumerationCSPSolver(csp_seed)
-
-        max_steps = len(spices) + 5
-
-        # Iterate through recipe
         for _ in range(max_steps):
             prev_obs = obs
-
-            # Regenerate spice-specific CSP
-            csp, samplers, policy, initialization = csp_generator.generate(obs)    
-            sol = solver.solve(
-                csp, 
-                initialization,
-                samplers
-            )
+            csp, samplers, policy, init = csp_gen.generate(obs)
+            sol = solver.solve(csp, init, samplers)
             assert sol is not None
             policy.reset(sol)
-
             act = policy.step(obs)
-            obs, reward, done, truncated, info = env.step(act)
-
-            assert isinstance(obs, SpiceState)
+            obs, reward, done, _, info = env.step(act)
             assert np.isclose(reward, 0.0)
-
-            # Update mood posteriors
-            csp_generator.observe_transition(prev_obs, act, obs, done, info)
-
-            if done: 
+            csp_gen.observe_transition(prev_obs, act, obs, done, info)
+            if done:
                 break
         env.close()
 
-        inferred_mood = max(info['mood_posterior'], key=info['mood_posterior'].get)
-        true_mood = info['mood']
-        
-        if true_mood not in mood_outcomes.keys():
+        true_mood     = info["mood"]
+        inferred_mood = max(info["mood_posterior"], key=info["mood_posterior"].get)
+        if true_mood not in mood_outcomes:
             mood_outcomes[true_mood] = inferred_mood
-
         offset += 1
 
-    logging.info("\n --- Testing Mood Inference ---")
-    logging.info(mood_outcomes)
+    logging.info(f"\n  --- Mood Inference Results ---")
+    for mood in MOODS:
+        inferred = mood_outcomes.get(mood, "N/A")
+        ok = "✓" if inferred == mood else "✗"
+        logging.info(f"  {mood:10}: inferred={inferred:10}  {ok}")

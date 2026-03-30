@@ -218,7 +218,7 @@ def _elbo_phi_step(
 def _elbo_psi_step(
     signs: torch.Tensor,
     sats: torch.Tensor,
-    m_phi_fixed: torch.Tensor,    # detached — phi held at its current mean
+    phi_anchors: torch.Tensor,    # [T] — per-observation phi, detached
     m_psi: torch.Tensor,
     log_sigma_mood: torch.Tensor, # fixed (no grad)
     log_sigma_obs: torch.Tensor,
@@ -226,21 +226,35 @@ def _elbo_psi_step(
     """
     ELBO for the psi update step (coordinate ascent Phase 2).
 
-    Phi is held deterministic at m_phi_fixed. Only m_psi is optimized.
+    phi_anchors is a [T] tensor of the actual phi posterior mean for each
+    observation's spice. Using per-observation phi (rather than a blended
+    average) ensures psi only explains the residual deviation that phi alone
+    cannot, which is the correct interpretation of psi as a session offset.
+
     Since log_v_psi is fixed at sigma_mood², the KL simplifies to a
     quadratic penalty: 0.5 * m_psi² / sigma_mood².
 
-    ELBO_psi = E_psi[sum_t log p(y_t | phi=m_phi, psi)] - KL(q(psi) || N(0, sigma_mood²))
+    ELBO_psi = E_psi[sum_t log p(y_t | phi_t, psi)] - KL(q(psi) || N(0, sigma_mood²))
     """
     if signs.numel() == 0:
         return torch.tensor(0.0)
 
     sigma_mood = torch.exp(log_sigma_mood)
+    sigma_obs = torch.exp(log_sigma_obs)
     eps_psi = torch.randn(N_MC_SAMPLES)
-    psi_samples = m_psi + sigma_mood * eps_psi  # [N_MC] — fixed variance = sigma_mood²
+    psi_samples = m_psi + sigma_mood * eps_psi  # [N_MC]
 
-    ell = _ell_phi_psi(signs, sats, m_phi_fixed.expand(N_MC_SAMPLES), psi_samples, log_sigma_obs)
-    # KL(N(m_psi, sigma_mood²) || N(0, sigma_mood²)) = 0.5 * m_psi² / sigma_mood²
+    # logit[t, k] = sign_t * (phi_t + psi_k): shape [T, N_MC]
+    logits = signs.unsqueeze(1) * (phi_anchors.unsqueeze(1) + psi_samples.unsqueeze(0))
+    log_p_actor = torch.nn.functional.logsigmoid(logits)
+    expected_sat = torch.tanh(logits)
+    log_p_sat = (
+        -0.5 * ((sats.unsqueeze(1) - expected_sat) / sigma_obs) ** 2
+        - log_sigma_obs
+        - 0.5 * math.log(2 * math.pi)
+    )
+    ell = (log_p_actor + log_p_sat).sum(dim=0).mean()
+
     kl_psi = 0.5 * (m_psi / sigma_mood) ** 2
     return ell - kl_psi
 
@@ -410,10 +424,17 @@ class HierarchicalPreferenceModel:
         self.n_theta_steps = n_theta_steps
         self.lr_phi = lr_phi
         self.lr_theta = lr_theta
-        # Note: lr_hyper is intentionally not used here.
-        # log_sigma_obs is optimized inside _update_phi_elbo (phi optimizer).
-        # log_sigma_h and log_sigma_r are optimized inside update_theta_and_mu (theta optimizer).
-        # A separate hyper optimizer would step these tensors twice per update, which is incorrect.
+        self.lr_hyper = lr_hyper
+
+        # Shared hyperparameter optimizer for log_sigma_h, log_sigma_r, log_sigma_obs.
+        # Stepped ONCE per update_theta_and_mu call (after all per-spice theta loops),
+        # so each shared scalar receives one gradient step per episode regardless of
+        # how many (human, spice) pairs were processed. This prevents sigma_h and
+        # sigma_r from collapsing due to over-accumulation of gradient steps.
+        self._hyper_optimizer = optim.Adam(
+            [self.log_sigma_h, self.log_sigma_r, self.log_sigma_obs],
+            lr=self.lr_hyper,
+        )
 
         # --- Global mu (not variational in Stage 2; updated analytically) ---
         # Will become variational in Stage 4+ when we add the full hierarchy.
@@ -694,6 +715,10 @@ class HierarchicalPreferenceModel:
         # psi never saturates the phi gradient within an episode.
         m_psi_fixed = self._psi_m[human_id].detach()
 
+        # log_sigma_obs is included here so the likelihood curvature flows into log_v_phi,
+        # which is the mechanism by which phi_var shrinks with more data. It is also
+        # included in _hyper_optimizer (stepped once per episode in update_theta_and_mu)
+        # so the global obs noise level is updated at the right cadence.
         optimizer_phi = optim.Adam(
             [m_phi, log_v_phi, self.log_sigma_obs],
             lr=self.lr_phi,
@@ -742,6 +767,21 @@ class HierarchicalPreferenceModel:
         """
         registered_humans = list(self._theta_m.keys())
 
+        # Count observed (human, spice) pairs for gradient normalization below.
+        n_active = sum(
+            1
+            for h in registered_humans
+            for s in self.spices
+            if any(
+                self._obs_count[h].get(r, {}).get(s, 0) > 0
+                for r in self._phi_logv.get(h, {})
+            )
+        )
+        # Avoid division by zero; fall back to 1 if nothing observed yet.
+        n_active = max(n_active, 1)
+
+        self._hyper_optimizer.zero_grad()
+
         for h in registered_humans:
             for s in self.spices:
                 # Collect phi posteriors from recipes with actual observations
@@ -759,7 +799,7 @@ class HierarchicalPreferenceModel:
                 log_v_theta = self._theta_logv[h][s]
 
                 optimizer = optim.Adam(
-                    [m_theta, log_v_theta, self.log_sigma_h, self.log_sigma_r],
+                    [m_theta, log_v_theta],
                     lr=self.lr_theta,
                 )
 
@@ -776,11 +816,19 @@ class HierarchicalPreferenceModel:
                         log_sigma_h=self.log_sigma_h,
                         log_sigma_r=self.log_sigma_r,
                     )
-                    (-elbo).backward()
+                    # Normalize by number of active (human, spice) pairs so the
+                    # gradient magnitude on shared log_sigma_h / log_sigma_r is
+                    # independent of vocabulary size. Without this, a 94-spice
+                    # vocabulary produces ~94x larger hyperparameter gradients than
+                    # a 5-spice vocabulary, causing sigma_r to collapse.
+                    (-elbo / n_active).backward()
                     optimizer.step()
 
                 self._theta_m[h][s] = m_theta
                 self._theta_logv[h][s] = log_v_theta
+
+        # Single hyperparameter step after all (human, spice) theta updates.
+        self._hyper_optimizer.step()
 
         # Update mu analytically (precision-weighted mean of theta posteriors)
         # This is the same as the original implementation.
@@ -903,16 +951,17 @@ class HierarchicalPreferenceModel:
             return
 
         signs, sats = _obs_to_tensors(all_obs)
-        phi_vals: List[float] = []
-        seen: set = {(act, sp) for act, sp, _ in self._episode_data[human_id]}
-        for _act, sp in seen:
+        # Build per-observation phi anchor: look up actual phi for each spice seen.
+        # Falls back to 0.0 for spices not yet registered.
+        phi_anchor_list: List[float] = []
+        for _act, sp, _sat in self._episode_data[human_id]:
+            phi_val = 0.0
             for r in self._phi_m.get(human_id, {}):
                 if sp in self._phi_m[human_id][r]:
-                    phi_vals.append(self._phi_m[human_id][r][sp].item())
-        m_phi_fixed = torch.tensor(
-            float(np.mean(phi_vals)) if phi_vals else 0.0,
-            dtype=torch.float32,
-        )
+                    phi_val = self._phi_m[human_id][r][sp].item()
+                    break
+            phi_anchor_list.append(phi_val)
+        phi_anchors = torch.tensor(phi_anchor_list, dtype=torch.float32)
 
         m_psi_running = self._running_psi_m[human_id]
         n_steps = max(1, self.n_phi_steps // 2)
@@ -922,7 +971,7 @@ class HierarchicalPreferenceModel:
             elbo = _elbo_psi_step(
                 signs=signs,
                 sats=sats,
-                m_phi_fixed=m_phi_fixed,
+                phi_anchors=phi_anchors,
                 m_psi=m_psi_running,
                 log_sigma_mood=self.log_sigma_mood,
                 log_sigma_obs=self.log_sigma_obs,
@@ -948,19 +997,16 @@ class HierarchicalPreferenceModel:
             return
 
         signs, sats = _obs_to_tensors(all_obs)
-        # Use average phi posterior mean across all (recipe, spice) pairs seen this
-        # episode as a fixed scalar anchor for psi inference.
-        phi_vals: List[float] = []
-        seen: set = {(act, sp) for act, sp, _ in self._episode_data[human_id]}
-        for _act, sp in seen:
+        # Build per-observation phi anchor: look up actual phi for each spice.
+        phi_anchor_list: List[float] = []
+        for _act, sp, _sat in self._episode_data[human_id]:
+            phi_val = 0.0
             for r in self._phi_m.get(human_id, {}):
                 if sp in self._phi_m[human_id][r]:
-                    phi_vals.append(self._phi_m[human_id][r][sp].item())
-
-        m_phi_fixed = torch.tensor(
-            float(np.mean(phi_vals)) if phi_vals else 0.0,
-            dtype=torch.float32,
-        )
+                    phi_val = self._phi_m[human_id][r][sp].item()
+                    break
+            phi_anchor_list.append(phi_val)
+        phi_anchors = torch.tensor(phi_anchor_list, dtype=torch.float32)
 
         m_psi = self._psi_m[human_id]
         optimizer_psi = optim.Adam([m_psi], lr=self.lr_phi)
@@ -969,7 +1015,7 @@ class HierarchicalPreferenceModel:
             elbo = _elbo_psi_step(
                 signs=signs,
                 sats=sats,
-                m_phi_fixed=m_phi_fixed,
+                phi_anchors=phi_anchors,
                 m_psi=m_psi,
                 log_sigma_mood=self.log_sigma_mood,
                 log_sigma_obs=self.log_sigma_obs,
@@ -1122,6 +1168,13 @@ class HierarchicalPreferenceModel:
 
     def get_mu_var(self, spice: str) -> float:
         return self.mu_var[spice]
+
+    def get_psi_m(self, human_id: str) -> float:
+        """Return the batch psi posterior mean (inferred at episode end, decays between episodes)."""
+        try:
+            return self._psi_m[human_id].item()
+        except KeyError:
+            return 0.0
 
     def get_running_psi(self, human_id: str) -> float:
         """
