@@ -95,6 +95,28 @@ def _psi_alignment(batch_psi_m: float, mood: str) -> bool:
     return True
 
 
+# --- TEMP DEBUG: set True locally, or delete this block + dbg_* uses in test_spices_csp_single_recipe ---
+_SINGLE_RECIPE_DEBUG = True
+
+
+def _psi_running_convergence_step(psi_trace: list[float], eps: float = 0.02) -> str:
+    """
+    First 1-based timestep where running_psi changes by less than eps for two steps in a row.
+    Returns '--' if not reached (or trace too short).
+    """
+    if len(psi_trace) < 3:
+        return "--"
+    for k in range(2, len(psi_trace)):
+        if abs(psi_trace[k] - psi_trace[k - 1]) < eps and abs(
+            psi_trace[k - 1] - psi_trace[k - 2]
+        ) < eps:
+            return str(k + 1)
+    return "--"
+
+
+# --- end TEMP DEBUG ---
+
+
 # ---------------------------------------------------------------------------
 # test_spices_csp_single_recipe
 # ---------------------------------------------------------------------------
@@ -108,6 +130,14 @@ def test_spices_csp_single_recipe():
         - Average satisfaction by mood
         - Phi sign accuracy and learned vs. true theta (top spices, final seed)
         - Learned hyperparameters (sigma_h, sigma_r, sigma_obs)
+
+    Why average_satisfaction is often small (e.g. 0.1–0.2):
+        Per step, the env maps logit -> tanh(logit) in [-1,1], then samples a Beta
+        around p=(tanh+1)/2 with concentration kappa, then maps to [-1,1]. That
+        adds noise and shrinks extremes toward 0. Episode average_satisfaction
+        is the mean over steps; mixing neutral and non-neutral moods, partial
+        episodes, and policies that do not always match the latent optimum all
+        pull the aggregate toward a modest positive or near-zero mean.
     """
     num_seeds    = PARAMETERS["num_seeds"]
     num_episodes = PARAMETERS["num_episodes"]
@@ -120,6 +150,8 @@ def test_spices_csp_single_recipe():
 
     # (seed, ep, mood, avg_sat, inferred_mood, batch_psi_m)
     all_records: list[tuple] = []
+    neutral_match_rates: list[float] = []
+    neutral_oracle_gaps: list[float] = []
     final_hbm: HierarchicalPreferenceModel | None = None
 
     num_psi_log_eps = min(num_episodes, 10)
@@ -144,11 +176,22 @@ def test_spices_csp_single_recipe():
             logging.info(f"  {'Ep':>4}  {'mood':10}  {'exp':>4}  {'aligned':>7}  "
                          f"{'psi_m':>8}  {'peak':>8}  trajectory")
 
+        # Last occurrence of each mood in this seed (for TEMP DEBUG dump after training).
+        dbg_last_episode_by_mood: dict[str, tuple[int, list[float], list[float]]] = {}
+        if log_this_seed and _SINGLE_RECIPE_DEBUG:
+            logging.info(
+                "\n  --- TEMP DEBUG (last seed): will log *last* episode per mood after run | "
+                "psi_conv_step = first step where |Δrunning_psi| < 0.02 twice ---"
+            )
+
         for ep in range(num_episodes):
             obs, _ = env.reset()
             assert isinstance(obs, SpiceState)
 
             step_psi: list[float] = []
+            step_sats: list[float] = []
+            step_match_flags: list[bool] = []
+            step_oracle_minus_actual: list[float] = []
             for _ in range(max_steps):
                 prev_obs = obs
                 csp, samplers, policy, init = csp_gen.generate(obs)
@@ -160,6 +203,24 @@ def test_spices_csp_single_recipe():
                 assert np.isclose(reward, 0.0)
                 csp_gen.observe_transition(prev_obs, act, obs, done, info)
                 step_psi.append(hbm.get_running_psi(DEFAULT_HUMAN))
+                step_sats.append(float(info.get("satisfaction", 0.0)))
+                # TEMP diagnostics for neutral episodes: action match rate and
+                # expected satisfaction gap vs. oracle actor choice.
+                preferred_actor = str(info.get("preferred_actor"))
+                last_actor = str(info.get("last_actor"))
+                if preferred_actor in ("human", "robot") and last_actor in ("human", "robot"):
+                    step_match_flags.append(last_actor == preferred_actor)
+                    pref_sign = 1.0 if preferred_actor == "human" else -1.0
+                    base = float(env._base_satisfaction_bias)
+                    psi_true = float(env._current_psi_true)
+                    phi_latent = pref_sign * base
+                    logit_h = 1.0 * (phi_latent + psi_true)
+                    logit_r = -1.0 * (phi_latent + psi_true)
+                    exp_h = float(np.tanh(logit_h))
+                    exp_r = float(np.tanh(logit_r))
+                    actual_exp = exp_h if last_actor == "human" else exp_r
+                    oracle_exp = max(exp_h, exp_r)
+                    step_oracle_minus_actual.append(oracle_exp - actual_exp)
                 if done:
                     break
 
@@ -167,6 +228,10 @@ def test_spices_csp_single_recipe():
             psi_m      = hbm.get_psi_m(DEFAULT_HUMAN)
             inferred   = max(info["mood_posterior"], key=info["mood_posterior"].get)
             all_records.append((i, ep, mood, info["average_satisfaction"], inferred, psi_m))
+            if mood == "neutral" and step_match_flags:
+                neutral_match_rates.append(float(np.mean(step_match_flags)))
+            if mood == "neutral" and step_oracle_minus_actual:
+                neutral_oracle_gaps.append(float(np.mean(step_oracle_minus_actual)))
 
             if log_this_seed and ep < num_psi_log_eps:
                 in_ep  = [v for v in step_psi if v != 0.0] or step_psi[:1]
@@ -176,6 +241,30 @@ def test_spices_csp_single_recipe():
                 traj   = "  ".join(f"{v:+.2f}" for v in step_psi)
                 logging.info(f"  {ep+1:4d}  {mood:10}  {exp:>4}  {ok:>7}  "
                              f"{psi_m:+8.4f}  {peak:+8.4f}  [{traj}]")
+
+            if log_this_seed and _SINGLE_RECIPE_DEBUG:
+                dbg_last_episode_by_mood[mood] = (
+                    ep + 1,
+                    list(step_psi),
+                    list(step_sats),
+                )
+
+        if log_this_seed and _SINGLE_RECIPE_DEBUG:
+            logging.info("\n  --- TEMP DEBUG: last episode per mood (same last seed) ---")
+            for m in ("neutral", "all_self", "none_self"):
+                if m not in dbg_last_episode_by_mood:
+                    logging.info(f"  [TEMP DEBUG] no '{m}' episode in this run")
+                    continue
+                ep_num, step_psi, step_sats = dbg_last_episode_by_mood[m]
+                conv = _psi_running_convergence_step(step_psi)
+                sat_str = "[" + ", ".join(f"{s:+.3f}" for s in step_sats) + "]"
+                psi_str = "[" + ", ".join(f"{p:+.3f}" for p in step_psi) + "]"
+                logging.info(
+                    f"  [TEMP DEBUG] last '{m}' ep={ep_num}  "
+                    f"psi_conv_step(approx)={conv}  n_steps={len(step_sats)}"
+                )
+                logging.info(f"  [TEMP DEBUG]   satisfaction (per step): {sat_str}")
+                logging.info(f"  [TEMP DEBUG]   running_psi (after each observe): {psi_str}")
 
         env.close()
         if log_this_seed:
@@ -205,6 +294,45 @@ def test_spices_csp_single_recipe():
     overall = np.mean([r[3] for r in all_records])
     logging.info(f"  {'overall':10}: avg={overall:+.3f}  (n={len(all_records)})")
 
+    # ── Neutral-only progression: average every 10 neutral episodes ─────────
+    neutral_series = [sat for (_, _, m, sat, _, _) in all_records if m == "neutral"]
+    if neutral_series:
+        window = 10
+        logging.info(
+            f"\n  --- Neutral Satisfaction Progression (avg per {window} neutral episodes) ---"
+        )
+        for i in range(0, len(neutral_series), window):
+            chunk = neutral_series[i : i + window]
+            lo = i + 1
+            hi = i + len(chunk)
+            logging.info(
+                f"  neutral_eps[{lo:>3}-{hi:>3}] : avg={np.mean(chunk):+.3f}  (n={len(chunk)})"
+            )
+    if neutral_match_rates:
+        window = 10
+        logging.info(
+            f"\n  --- Neutral Actor-Match Rate Progression (avg per {window} neutral episodes) ---"
+        )
+        for i in range(0, len(neutral_match_rates), window):
+            chunk = neutral_match_rates[i : i + window]
+            lo = i + 1
+            hi = i + len(chunk)
+            logging.info(
+                f"  neutral_eps[{lo:>3}-{hi:>3}] : match_rate={np.mean(chunk):.1%}  (n={len(chunk)})"
+            )
+    if neutral_oracle_gaps:
+        window = 10
+        logging.info(
+            f"\n  --- Neutral Oracle Gap Progression (avg per {window} neutral episodes) ---"
+        )
+        for i in range(0, len(neutral_oracle_gaps), window):
+            chunk = neutral_oracle_gaps[i : i + window]
+            lo = i + 1
+            hi = i + len(chunk)
+            logging.info(
+                f"  neutral_eps[{lo:>3}-{hi:>3}] : oracle_minus_actual={np.mean(chunk):+.3f}  (n={len(chunk)})"
+            )
+
     # ── Phi sign accuracy + learned vs. true (final seed) ───────────────────
     if final_hbm is not None and sig_spices:
         c, tot = _phi_sign_accuracy(final_hbm, hidden_hbm, sig_spices, recipe_name)
@@ -231,12 +359,13 @@ def test_spices_csp_cross_transfer():
     """Single Human | Train on K recipes | Evaluate on M held-out recipes vs. cold-start.
 
     Training: forced-neutral mood.
-    Evaluation: real mood; only neutral episodes counted for fair comparison.
+    Evaluation: real mood; report neutral, non-neutral, and all-episode satisfaction.
 
     Metrics logged:
         - Theta sign accuracy (post-training, signal spices)
         - Per-test-recipe satisfaction: trained vs. baseline + delta
-        - Aggregate satisfaction delta
+          (neutral, non-neutral, all episodes)
+        - Aggregate satisfaction delta for all three buckets
         - Learned hyperparameters
     """
     num_seeds     = PARAMETERS["num_seeds"]
@@ -261,8 +390,12 @@ def test_spices_csp_cross_transfer():
     logging.info(f"  Train: {len(train_recipes)} recipes  |  Test: {len(test_recipes)} recipes  "
                  f"|  Vocab: {len(all_spices)} spices  |  Signal: {len(sig_spices)} spices")
 
-    trained_sats  = {r: [] for r in test_recipes}
-    baseline_sats = {r: [] for r in test_recipes}
+    trained_sats_neutral = {r: [] for r in test_recipes}
+    trained_sats_non_neutral = {r: [] for r in test_recipes}
+    trained_sats_all = {r: [] for r in test_recipes}
+    baseline_sats_neutral = {r: [] for r in test_recipes}
+    baseline_sats_non_neutral = {r: [] for r in test_recipes}
+    baseline_sats_all = {r: [] for r in test_recipes}
     post_train_theta_acc: tuple[int, int] | None = None
 
     for i in range(num_seeds):
@@ -274,7 +407,9 @@ def test_spices_csp_cross_transfer():
             spice_list=all_spices, recipe_list=train_recipes, seed=csp_seed
         )
 
+        logging.info(f"Seed {i} of {num_seeds}")
         for recipe_name in train_recipes:
+            logging.info(f"    Recipe: {recipe_name}")
             env = _make_env(env_seed, recipe_name, hidden_hbm, training=True)
             for _ in range(num_train_eps):
                 obs, _ = env.reset()
@@ -310,8 +445,12 @@ def test_spices_csp_cross_transfer():
                     trained_gen.observe_transition(prev_obs, act, obs, done, info)
                     if done:
                         break
+                avg_sat = info["average_satisfaction"]
+                trained_sats_all[recipe_name].append(avg_sat)
                 if info.get("mood") == "neutral":
-                    trained_sats[recipe_name].append(info["average_satisfaction"])
+                    trained_sats_neutral[recipe_name].append(avg_sat)
+                else:
+                    trained_sats_non_neutral[recipe_name].append(avg_sat)
             env.close()
 
         baseline_solver = EnumerationCSPSolver(csp_seed)
@@ -334,8 +473,12 @@ def test_spices_csp_cross_transfer():
                     baseline_gen.observe_transition(prev_obs, act, obs, done, info)
                     if done:
                         break
+                avg_sat = info["average_satisfaction"]
+                baseline_sats_all[recipe_name].append(avg_sat)
                 if info.get("mood") == "neutral":
-                    baseline_sats[recipe_name].append(info["average_satisfaction"])
+                    baseline_sats_neutral[recipe_name].append(avg_sat)
+                else:
+                    baseline_sats_non_neutral[recipe_name].append(avg_sat)
             env.close()
 
     # ── Theta sign accuracy ──────────────────────────────────────────────────
@@ -344,25 +487,37 @@ def test_spices_csp_cross_transfer():
         logging.info(f"\n  --- Theta Sign Accuracy (post-training, {tot} signal spices) ---")
         logging.info(f"  {c}/{tot} = {c/tot:.0%}")
 
-    # ── Satisfaction: trained vs. baseline ──────────────────────────────────
-    logging.info(f"\n  --- Satisfaction: Trained vs. Baseline (neutral episodes only) ---")
-    logging.info(f"  {'recipe':<28} {'trained':>8} {'baseline':>9} {'delta':>7}")
-    logging.info(f"  {'-'*56}")
-    trained_all, baseline_all = [], []
-    for recipe_name in test_recipes:
-        t = trained_sats[recipe_name]
-        b = baseline_sats[recipe_name]
-        trained_all.extend(t)
-        baseline_all.extend(b)
-        t_mean = np.mean(t) if t else float("nan")
-        b_mean = np.mean(b) if b else float("nan")
-        delta  = t_mean - b_mean if t and b else float("nan")
-        logging.info(f"  {recipe_name:<28} {t_mean:+8.3f} {b_mean:+9.3f} {delta:+7.3f}")
-    if trained_all and baseline_all:
-        agg_t = np.mean(trained_all)
-        agg_b = np.mean(baseline_all)
+    # ── Satisfaction: trained vs. baseline by episode bucket ────────────────
+    def _log_satisfaction_table(
+        title: str,
+        trained_dict: dict[str, list[float]],
+        baseline_dict: dict[str, list[float]],
+    ) -> None:
+        logging.info(f"\n  --- Satisfaction: Trained vs. Baseline ({title}) ---")
+        logging.info(f"  {'recipe':<28} {'trained':>8} {'baseline':>9} {'delta':>7}")
         logging.info(f"  {'-'*56}")
-        logging.info(f"  {'AGGREGATE':<28} {agg_t:+8.3f} {agg_b:+9.3f} {agg_t-agg_b:+7.3f}")
+        trained_all_vals: list[float] = []
+        baseline_all_vals: list[float] = []
+        for recipe_name in test_recipes:
+            t = trained_dict[recipe_name]
+            b = baseline_dict[recipe_name]
+            trained_all_vals.extend(t)
+            baseline_all_vals.extend(b)
+            t_mean = np.mean(t) if t else float("nan")
+            b_mean = np.mean(b) if b else float("nan")
+            delta = t_mean - b_mean if t and b else float("nan")
+            logging.info(f"  {recipe_name:<28} {t_mean:+8.3f} {b_mean:+9.3f} {delta:+7.3f}")
+        if trained_all_vals and baseline_all_vals:
+            agg_t = np.mean(trained_all_vals)
+            agg_b = np.mean(baseline_all_vals)
+            logging.info(f"  {'-'*56}")
+            logging.info(f"  {'AGGREGATE':<28} {agg_t:+8.3f} {agg_b:+9.3f} {agg_t-agg_b:+7.3f}")
+
+    _log_satisfaction_table("neutral episodes", trained_sats_neutral, baseline_sats_neutral)
+    _log_satisfaction_table(
+        "non-neutral episodes", trained_sats_non_neutral, baseline_sats_non_neutral
+    )
+    _log_satisfaction_table("all episodes", trained_sats_all, baseline_sats_all)
 
     # ── Learned hyperparameters ──────────────────────────────────────────────
     hbm = trained_gen._pref_gen._hbm

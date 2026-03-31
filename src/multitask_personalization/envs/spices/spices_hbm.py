@@ -165,6 +165,7 @@ def _ell_phi_psi(
     phi_samples: torch.Tensor,    # [N_MC]  (may be scalar broadcast if deterministic)
     psi_offset: torch.Tensor,     # scalar or [N_MC]
     log_sigma_obs: torch.Tensor,
+    sat_logit_temperature: float,
 ) -> torch.Tensor:
     """
     Expected log likelihood shared by both phi and psi ELBO steps.
@@ -175,7 +176,8 @@ def _ell_phi_psi(
     )
     sigma_obs = torch.exp(log_sigma_obs)
     log_p_actor = torch.nn.functional.logsigmoid(logits)
-    expected_sat = torch.tanh(logits)
+    temp = max(float(sat_logit_temperature), 1e-6)
+    expected_sat = torch.tanh(logits / temp)
     log_p_sat = (
         -0.5 * ((sats.unsqueeze(1) - expected_sat) / sigma_obs) ** 2
         - log_sigma_obs
@@ -193,6 +195,7 @@ def _elbo_phi_step(
     m_theta: torch.Tensor,
     log_sigma_r: torch.Tensor,
     log_sigma_obs: torch.Tensor,
+    sat_logit_temperature: float,
 ) -> torch.Tensor:
     """
     ELBO for the phi update step (coordinate ascent Phase 1).
@@ -210,7 +213,14 @@ def _elbo_phi_step(
     phi_samples = m_phi + torch.exp(0.5 * log_v_phi) * eps_phi  # [N_MC]
 
     # psi is deterministic — broadcast as [1] so unsqueeze gives [1, 1]
-    ell = _ell_phi_psi(signs, sats, phi_samples, m_psi_fixed.expand(N_MC_SAMPLES), log_sigma_obs)
+    ell = _ell_phi_psi(
+        signs,
+        sats,
+        phi_samples,
+        m_psi_fixed.expand(N_MC_SAMPLES),
+        log_sigma_obs,
+        sat_logit_temperature,
+    )
     kl_phi = _gaussian_kl(m_phi, log_v_phi, m_theta, 2.0 * log_sigma_r)
     return ell - kl_phi
 
@@ -222,6 +232,7 @@ def _elbo_psi_step(
     m_psi: torch.Tensor,
     log_sigma_mood: torch.Tensor, # fixed (no grad)
     log_sigma_obs: torch.Tensor,
+    sat_logit_temperature: float,
 ) -> torch.Tensor:
     """
     ELBO for the psi update step (coordinate ascent Phase 2).
@@ -247,7 +258,8 @@ def _elbo_psi_step(
     # logit[t, k] = sign_t * (phi_t + psi_k): shape [T, N_MC]
     logits = signs.unsqueeze(1) * (phi_anchors.unsqueeze(1) + psi_samples.unsqueeze(0))
     log_p_actor = torch.nn.functional.logsigmoid(logits)
-    expected_sat = torch.tanh(logits)
+    temp = max(float(sat_logit_temperature), 1e-6)
+    expected_sat = torch.tanh(logits / temp)
     log_p_sat = (
         -0.5 * ((sats.unsqueeze(1) - expected_sat) / sigma_obs) ** 2
         - log_sigma_obs
@@ -270,6 +282,7 @@ def _elbo_phi(
     log_sigma_r: torch.Tensor,      # scalar log prior std (recipe level)
     log_sigma_obs: torch.Tensor,    # scalar log obs noise std
     log_sigma_mood: torch.Tensor,   # scalar log psi prior std (fixed, no grad)
+    sat_logit_temperature: float,
 ) -> torch.Tensor:
     """
     Full joint ELBO for diagnostic use (compute_elbo_snapshot).
@@ -290,7 +303,9 @@ def _elbo_phi(
     eps_psi = torch.randn(N_MC_SAMPLES)
     psi_samples = m_psi + torch.exp(0.5 * log_v_psi) * eps_psi
 
-    ell = _ell_phi_psi(signs, sats, phi_samples, psi_samples, log_sigma_obs)
+    ell = _ell_phi_psi(
+        signs, sats, phi_samples, psi_samples, log_sigma_obs, sat_logit_temperature
+    )
     kl_phi = _gaussian_kl(m_phi, log_v_phi, m_theta, 2.0 * log_sigma_r)
     kl_psi = _gaussian_kl(m_psi, log_v_psi, torch.zeros_like(m_psi), 2.0 * log_sigma_mood)
     return ell - kl_phi - kl_psi
@@ -481,6 +496,9 @@ class HierarchicalPreferenceModel:
         self.mood_prior = np.array(self.config.mood_prior_array, dtype=float)
         self.mood_bias = self.config.get_mood_bias()
         self.base_satisfaction_bias = self.config.satisfaction.base_satisfaction_bias
+        self.sat_logit_temperature = max(
+            float(self.config.satisfaction.satisfaction_logit_temperature), 1e-6
+        )
 
         # Register default human
         self.register_human(DEFAULT_HUMAN)
@@ -737,6 +755,7 @@ class HierarchicalPreferenceModel:
                 m_theta=m_theta,
                 log_sigma_r=self.log_sigma_r,
                 log_sigma_obs=self.log_sigma_obs,
+                sat_logit_temperature=self.sat_logit_temperature,
             )
             (-elbo).backward()
             optimizer_phi.step()
@@ -975,6 +994,7 @@ class HierarchicalPreferenceModel:
                 m_psi=m_psi_running,
                 log_sigma_mood=self.log_sigma_mood,
                 log_sigma_obs=self.log_sigma_obs,
+                sat_logit_temperature=self.sat_logit_temperature,
             )
             (-elbo).backward()
             optimizer.step()
@@ -1019,6 +1039,7 @@ class HierarchicalPreferenceModel:
                 m_psi=m_psi,
                 log_sigma_mood=self.log_sigma_mood,
                 log_sigma_obs=self.log_sigma_obs,
+                sat_logit_temperature=self.sat_logit_temperature,
             )
             (-elbo).backward()
             optimizer_psi.step()
@@ -1284,6 +1305,7 @@ class HierarchicalPreferenceModel:
                 log_sigma_r=self.log_sigma_r,
                 log_sigma_obs=self.log_sigma_obs,
                 log_sigma_mood=self.log_sigma_mood,
+                sat_logit_temperature=self.sat_logit_temperature,
             )
         return elbo.item()
 

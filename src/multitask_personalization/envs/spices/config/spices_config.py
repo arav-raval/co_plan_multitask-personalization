@@ -100,6 +100,15 @@ class MoodConfig:
     non_neutral_pref_weight_match: float = 0.2  # Preference weight when satisfaction matches expectation
     non_neutral_pref_weight_mismatch: float = 0.1  # Preference weight when satisfaction doesn't match
 
+    # Env-only Stage 2 generative parameters for psi_true (sampled once/episode).
+    # Keep these independent from base_satisfaction_bias so mood strength can be tuned
+    # without changing the stable per-spice preference margin.
+    psi_true_mood_mean_abs: float = 3.0
+    psi_true_mood_std: float = 0.5
+    # Neutral-specific psi_true std. Keeping this smaller than non-neutral std
+    # helps neutral episodes remain close to psi_true≈0 for cleaner phi learning.
+    psi_true_neutral_std: float = 0.2
+
 
 @dataclass(frozen=True)
 class UpdateConfig:
@@ -114,7 +123,10 @@ class SatisfactionConfig:
     """Configuration for Satisfaction Computation."""
     
     # Base satisfaction bias (strength of preference signal)
-    base_satisfaction_bias: float = 3.0
+    base_satisfaction_bias: float = 1.5
+    # Temperature for tanh(logit / T) in env generation and HBM sat likelihood.
+    # T>1 reduces saturation so large |phi| values remain distinguishable.
+    satisfaction_logit_temperature: float = 1.0
     
     # Continuous satisfaction: Beta distribution parameters
     satisfaction_beta_kappa: float = 10.0  # Concentration parameter for Beta distribution

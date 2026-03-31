@@ -14,7 +14,7 @@ from gymnasium.core import RenderFrame
 from tomsutils.spaces import EnumSpace
 from multitask_personalization.structs import PublicSceneSpec
 from multitask_personalization.envs.spices.config.spices_config import DEFAULT_CONFIG
-from multitask_personalization.envs.spices.spices_hbm import MoodModel
+from multitask_personalization.envs.spices.spices_hbm import DEFAULT_HUMAN, MoodModel
 
 if TYPE_CHECKING:
     from multitask_personalization.envs.spices.spices_hbm import HierarchicalPreferenceModel
@@ -329,9 +329,10 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
             -1.0 — maximum negative satisfaction
 
         The generative model mirrors the HBM's Stage 2 likelihood:
-            phi_latent = pref_sign * base_satisfaction_bias
+            phi_latent = pref_sign * phi_mag
+            phi_mag    = |hidden_theta(spice)| when available, else base_satisfaction_bias
             logit      = actor_sign * (phi_latent + psi_true)
-            expected   = tanh(logit)    ← matches HBM: tanh(sign_actor*(phi+psi))
+            expected   = tanh(logit / T) where T=satisfaction_logit_temperature
             p        = (expected+1)/2 ← map [-1,+1] → [0,1] for Beta params
             sat      ~ Beta(p*kappa+1, (1-p)*kappa+1) rescaled to [-1, +1]
 
@@ -341,10 +342,21 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
         """
         actor_sign = 1.0 if self._last_actor == "human" else -1.0
         pref_sign = 1.0 if preferred == "human" else -1.0
-        phi_latent = pref_sign * self._base_satisfaction_bias
+        phi_mag = self._base_satisfaction_bias
+        # If a hidden HBM is available, use the true theta magnitude for this spice
+        # so generated logits are calibrated to latent preference strength.
+        if self._hidden_spec.hidden_hbm is not None and self._added:
+            spice = self._added[-1]
+            try:
+                theta_val = self._hidden_spec.hidden_hbm.get_theta(DEFAULT_HUMAN, spice)
+                phi_mag = max(abs(float(theta_val)), 1e-6)
+            except Exception:
+                phi_mag = self._base_satisfaction_bias
+        phi_latent = pref_sign * phi_mag
         logit = actor_sign * (phi_latent + self._current_psi_true)
 
-        expected = float(np.tanh(logit))
+        temp = max(float(DEFAULT_CONFIG.satisfaction.satisfaction_logit_temperature), 1e-6)
+        expected = float(np.tanh(logit / temp))
         p = (expected + 1.0) / 2.0
         alpha = p * self._satisfaction_kappa + 1.0
         beta = (1.0 - p) * self._satisfaction_kappa + 1.0
@@ -357,20 +369,23 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
 
         Maps the 3-category mood to a scalar psi_true sampled once per episode.
         The HBM's prior N(0, sigma_mood²) is centered at 0; non-neutral moods shift
-        the mean to ±base_satisfaction_bias. The within-category std is sigma_mood/2
-        so the distribution is concentrated enough to test mood separation.
+        the mean to ±psi_true_mood_mean_abs (configurable, independent of base bias)
+        with std psi_true_mood_std.
 
         Stage 2: replaces per-step compute_mood_bias. The HBM infers a latent scalar
         psi without knowing the mood category.
         """
-        sigma_mood = DEFAULT_CONFIG.hbm.sigma_mood
+        mean_abs = DEFAULT_CONFIG.mood.psi_true_mood_mean_abs
+        std = DEFAULT_CONFIG.mood.psi_true_mood_std
         mood_means = {
-            "all_self":  +self._base_satisfaction_bias,
+            "all_self":  +mean_abs,
             "neutral":    0.0,
-            "none_self": -self._base_satisfaction_bias,
+            "none_self": -mean_abs,
         }
         mean = mood_means.get(mood, 0.0)
-        return float(self._rng.normal(mean, sigma_mood * 0.5))
+        if mood == "neutral":
+            std = float(DEFAULT_CONFIG.mood.psi_true_neutral_std)
+        return float(self._rng.normal(mean, std))
 
     def _get_info(self, robot_indicated_done: bool = False) -> dict[str, Any]:
         info: dict[str, Any] = {

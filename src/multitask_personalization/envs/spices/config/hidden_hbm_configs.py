@@ -147,6 +147,17 @@ def _spice_specific_theta(spices: list[str]) -> dict[str, float]:
     return {s: _SPICE_SPECIFIC_THETA.get(s, 0.0) for s in spices}
 
 
+def _spice_specific_theta_strong(spices: list[str]) -> dict[str, float]:
+    """
+    Strong-magnitude version of SpiceSpecificHuman.
+
+    Preserves sign structure from _SPICE_SPECIFIC_THETA while increasing absolute
+    values to reduce near-neutral preferences and make actor flips less frequent.
+    """
+    scale = 2.0
+    return {s: scale * _SPICE_SPECIFIC_THETA.get(s, 0.0) for s in spices}
+
+
 def _consistent_variable_theta(spices: list[str]) -> dict[str, float]:
     """Same spice-specific pattern as SpiceSpecificHuman (variance differs in sigma_r)."""
     return _spice_specific_theta(spices)
@@ -230,9 +241,17 @@ HUMAN_PREFERS_SECOND_HALF = HiddenHBMConfig(
 SPICE_SPECIFIC_HUMAN = HiddenHBMConfig(
     name="SpiceSpecificHuman",
     theta_mean=_SPICE_SPECIFIC_THETA,
-    sigma_r=1.0,
-    sigma_h=1.0,
+    sigma_r=0.5,
+    sigma_h=0.5,
     theta_generator=_spice_specific_theta,
+)
+
+SPICE_SPECIFIC_HUMAN_STRONG = HiddenHBMConfig(
+    name="SpiceSpecificHumanStrong",
+    theta_mean={},
+    sigma_r=0.5,
+    sigma_h=0.5,
+    theta_generator=_spice_specific_theta_strong,
 )
 
 CONSISTENT_HUMAN = HiddenHBMConfig(
@@ -286,6 +305,7 @@ ALL_HIDDEN_HBM_CONFIGS: dict[str, HiddenHBMConfig] = {
     "HumanPrefersFirstHalf": HUMAN_PREFERS_FIRST_HALF,
     "HumanPrefersSecondHalf": HUMAN_PREFERS_SECOND_HALF,
     "SpiceSpecificHuman": SPICE_SPECIFIC_HUMAN,
+    "SpiceSpecificHumanStrong": SPICE_SPECIFIC_HUMAN_STRONG,
     "ConsistentHuman": CONSISTENT_HUMAN,
     "VariableHuman": VARIABLE_HUMAN,
     "StrongPreferencesHuman": STRONG_PREFERENCES_HUMAN,
