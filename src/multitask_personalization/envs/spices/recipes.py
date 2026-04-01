@@ -2086,7 +2086,6 @@ ALL_PROFILES = {
     "ChefComplex": CHEF_COMPLEX,
 }
 
-
 def get_profile(name: str) -> ProfileSpec:
     """Retrieve a profile by name."""
     if name not in ALL_PROFILES:

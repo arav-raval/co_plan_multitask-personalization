@@ -3,17 +3,19 @@
 import logging
 
 PARAMETERS = {
-    "num_episodes": 50,       # Training episodes per recipe (was 200)
-    "num_test_episodes": 10,  # Evaluation episodes per test recipe (was 50)
-    "train_frac": 0.6,       # 17/23 train, 6 test for ChefComplex
-    "num_seeds": 5,           # Seeds (was 5) — reduces runtime ~40%
-    "num_epochs": 1,
+    "num_episodes": 150,       
+    "num_test_episodes": 25, 
+    "train_frac": 0.6,       
+    "num_seeds": 10,
     "profile": "ChefComplex",
     "recipe_name": "FortyStepFeast",
-    "env_seed": 125,
-    "csp_seed": 371,
+    "env_seed": 123,
+    "csp_seed": 456,
     "logging_level": logging.INFO,
     "num_humans": 3,
-    "hidden_hbm_config_name": "SpiceSpecificHuman",
-    "hidden_hbm_config_names": None,
+    "hidden_hbm_config_names": [
+        "SpiceSpecificHuman",
+        "SpiceSpecificHumanHeatSeeking",
+        "SpiceSpecificHumanAromaticGentle",
+    ],
 }

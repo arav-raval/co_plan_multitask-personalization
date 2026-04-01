@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Dict, Tuple
+import math
 
 
 @dataclass(frozen=True)
@@ -20,7 +21,7 @@ class HBMConfig:
     mu0: float = 0.0  # Global prior mean
     sigma0: float = 1.0  # Global variance (σ₀²)
     sigma_h: float = 1.0  # Human-level variance (σₕ²)
-    sigma_r: float = 1.5  # Recipe-level variance (σᵣ²) — moderately high to weaken wrong-theta prior without slowing convergence too much
+    sigma_r: float = 0.5  # Recipe-level variance (σᵣ²) — initialized at the hidden HBM's true sigma_r so phi posteriors narrow faster for borderline-magnitude spices
     sigma_obs: float = 1.0  # Observation variance (σ_obs²)
     
     # Exponential Moving Average (EMA) for phi updates
@@ -56,7 +57,7 @@ class HBMConfig:
     # Batch θ/μ updates: call update_theta_and_mu every N episodes instead of every episode.
     # Reduces cost when update_theta_and_mu is the bottleneck (e.g. multi-human training).
     # 1 = every episode (correct Stage 1 behavior); higher values trade correctness for speed.
-    update_theta_mu_every_n_episodes: int = 1
+    update_theta_mu_every_n_episodes: int = 2
 
     # Stage 2: session-level psi latent variable (transient offset).
     # psi ~ N(0, sigma_mood²) — prior std for the per-episode session offset.
@@ -70,6 +71,16 @@ class HBMConfig:
     # Stage 2: psi decay factor at episode end (aggressive reset toward 0).
     # 0.05 means 95% of psi mean is discarded between episodes.
     psi_decay: float = 0.05
+
+    # ELBO / optimizer runtime controls (kept in config for central tuning).
+    n_mc_samples: int = 8
+    n_phi_steps: int = 8  # increased from 8 — borderline-magnitude spices need more gradient steps to overcome Beta noise floor
+    n_theta_steps: int = 12
+    lr_phi: float = 3e-2
+    lr_theta: float = 1e-2
+    lr_hyper: float = 5e-3
+    log_var_min: float = math.log(1e-6)
+    log_var_max: float = math.log(10.0)
 
 
 @dataclass(frozen=True)

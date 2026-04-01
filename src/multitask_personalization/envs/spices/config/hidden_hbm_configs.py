@@ -147,6 +147,28 @@ def _spice_specific_theta(spices: list[str]) -> dict[str, float]:
     return {s: _SPICE_SPECIFIC_THETA.get(s, 0.0) for s in spices}
 
 
+def _scaled_theta_map(base: dict[str, float], scale: float) -> dict[str, float]:
+    return {k: scale * v for k, v in base.items()}
+
+
+def _adjust_theta_map(
+    base: dict[str, float],
+    deltas: dict[str, float],
+    clamp_abs: float = 3.0,
+) -> dict[str, float]:
+    """
+    Additive tweak around a base map, with clipping for stability.
+
+    Useful for defining coherent related human profiles for multi-human tests.
+    """
+    out: dict[str, float] = {}
+    keys = set(base) | set(deltas)
+    for k in keys:
+        val = base.get(k, 0.0) + deltas.get(k, 0.0)
+        out[k] = float(max(-clamp_abs, min(clamp_abs, val)))
+    return out
+
+
 def _spice_specific_theta_strong(spices: list[str]) -> dict[str, float]:
     """
     Strong-magnitude version of SpiceSpecificHuman.
@@ -154,13 +176,58 @@ def _spice_specific_theta_strong(spices: list[str]) -> dict[str, float]:
     Preserves sign structure from _SPICE_SPECIFIC_THETA while increasing absolute
     values to reduce near-neutral preferences and make actor flips less frequent.
     """
-    scale = 2.0
-    return {s: scale * _SPICE_SPECIFIC_THETA.get(s, 0.0) for s in spices}
+    strong = _scaled_theta_map(_SPICE_SPECIFIC_THETA, scale=2.0)
+    return {s: strong.get(s, 0.0) for s in spices}
 
 
 def _consistent_variable_theta(spices: list[str]) -> dict[str, float]:
     """Same spice-specific pattern as SpiceSpecificHuman (variance differs in sigma_r)."""
     return _spice_specific_theta(spices)
+
+
+# ---------------------------------------------------------------------------
+# Multi-human coherent variants (shared backbone + interpretable offsets).
+# ---------------------------------------------------------------------------
+
+_HEAT_SEEKING_DELTAS: dict[str, float] = {
+    "pepper": +1.4,
+    "chili": +1.6,
+    "black_pepper": +1.3,
+    "jalapeno": +1.1,
+    "green_chili": +1.1,
+    "gochujang": +1.0,
+    "gochugaru": +1.0,
+    "cayenne": +1.0,
+    "harissa": +1.0,
+    "berbere": +1.0,
+}
+
+_AROMATIC_GENTLE_DELTAS: dict[str, float] = {
+    "garlic": +0.4,
+    "ginger": +0.4,
+    "mint": +0.5,
+    "cumin": +0.4,
+    "turmeric": +0.4,
+    "basil": +0.3,
+    "lemongrass": +0.4,
+    "chili": -0.8,
+    "pepper": -0.8,
+    "black_pepper": -0.6,
+    "jalapeno": -0.7,
+    "green_chili": -0.7,
+    "gochujang": -0.6,
+    "gochugaru": -0.6,
+}
+
+
+def _spice_specific_theta_heat_seeking(spices: list[str]) -> dict[str, float]:
+    variant = _adjust_theta_map(_SPICE_SPECIFIC_THETA, _HEAT_SEEKING_DELTAS)
+    return {s: variant.get(s, 0.0) for s in spices}
+
+
+def _spice_specific_theta_aromatic_gentle(spices: list[str]) -> dict[str, float]:
+    variant = _adjust_theta_map(_SPICE_SPECIFIC_THETA, _AROMATIC_GENTLE_DELTAS)
+    return {s: variant.get(s, 0.0) for s in spices}
 
 
 # ---------------------------------------------------------------------------
@@ -254,6 +321,22 @@ SPICE_SPECIFIC_HUMAN_STRONG = HiddenHBMConfig(
     theta_generator=_spice_specific_theta_strong,
 )
 
+SPICE_SPECIFIC_HUMAN_HEAT_SEEKING = HiddenHBMConfig(
+    name="SpiceSpecificHumanHeatSeeking",
+    theta_mean={},
+    sigma_r=0.5,
+    sigma_h=0.5,
+    theta_generator=_spice_specific_theta_heat_seeking,
+)
+
+SPICE_SPECIFIC_HUMAN_AROMATIC_GENTLE = HiddenHBMConfig(
+    name="SpiceSpecificHumanAromaticGentle",
+    theta_mean={},
+    sigma_r=0.5,
+    sigma_h=0.5,
+    theta_generator=_spice_specific_theta_aromatic_gentle,
+)
+
 CONSISTENT_HUMAN = HiddenHBMConfig(
     name="ConsistentHuman",
     theta_mean={},
@@ -306,6 +389,8 @@ ALL_HIDDEN_HBM_CONFIGS: dict[str, HiddenHBMConfig] = {
     "HumanPrefersSecondHalf": HUMAN_PREFERS_SECOND_HALF,
     "SpiceSpecificHuman": SPICE_SPECIFIC_HUMAN,
     "SpiceSpecificHumanStrong": SPICE_SPECIFIC_HUMAN_STRONG,
+    "SpiceSpecificHumanHeatSeeking": SPICE_SPECIFIC_HUMAN_HEAT_SEEKING,
+    "SpiceSpecificHumanAromaticGentle": SPICE_SPECIFIC_HUMAN_AROMATIC_GENTLE,
     "ConsistentHuman": CONSISTENT_HUMAN,
     "VariableHuman": VARIABLE_HUMAN,
     "StrongPreferencesHuman": STRONG_PREFERENCES_HUMAN,
