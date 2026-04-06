@@ -397,6 +397,7 @@ class HierarchicalPreferenceModel:
         lr_phi: Optional[float] = None,
         lr_theta: Optional[float] = None,
         lr_hyper: Optional[float] = None,
+        enable_mood_learning: bool = True,
     ) -> None:
         self.spices = list(spices)
         self.config = config if config is not None else DEFAULT_CONFIG
@@ -433,10 +434,12 @@ class HierarchicalPreferenceModel:
         self.n_phi_steps = int(
             n_phi_steps if n_phi_steps is not None else self.config.hbm.n_phi_steps
         )
+        self.n_psi_steps = int(self.config.hbm.n_psi_steps)
         self.n_theta_steps = int(
             n_theta_steps if n_theta_steps is not None else self.config.hbm.n_theta_steps
         )
         self.lr_phi = float(lr_phi if lr_phi is not None else self.config.hbm.lr_phi)
+        self.lr_psi = float(self.config.hbm.lr_psi)
         self.lr_theta = float(
             lr_theta if lr_theta is not None else self.config.hbm.lr_theta
         )
@@ -445,6 +448,7 @@ class HierarchicalPreferenceModel:
         )
         self.log_var_min = float(self.config.hbm.log_var_min)
         self.log_var_max = float(self.config.hbm.log_var_max)
+        self._enable_mood_learning = bool(enable_mood_learning)
 
         # Shared hyperparameter optimizer for log_sigma_h and log_sigma_r.
         # Stepped ONCE per update_theta_and_mu call (after all per-spice theta loops),
@@ -915,6 +919,26 @@ class HierarchicalPreferenceModel:
                         requires_grad=True,
                     )
 
+    def set_phi(
+        self,
+        human_id: str,
+        recipe_name: str,
+        phi_dict: Dict[str, float],
+    ) -> None:
+        """
+        Directly set phi mean values for a (human, recipe) pair.
+
+        Used to initialise per-recipe ground-truth theta overrides in the hidden HBM
+        (Option A recipe-conflict configs).  Only the spices present in phi_dict are
+        updated; other spices keep their theta-initialised values from register_recipe.
+        """
+        self._ensure_registered(human_id, recipe_name)
+        for s, v in phi_dict.items():
+            if s in self._phi_m.get(human_id, {}).get(recipe_name, {}):
+                self._phi_m[human_id][recipe_name][s] = torch.tensor(
+                    float(v), dtype=torch.float32, requires_grad=True
+                )
+
     # ------------------------------------------------------------------
     # Episode interface
     # ------------------------------------------------------------------
@@ -952,13 +976,14 @@ class HierarchicalPreferenceModel:
             neutral_idx = MOODS.index("neutral")
             self._mood_posterior[human_id] = np.zeros(3)
             self._mood_posterior[human_id][neutral_idx] = 1.0
-        else:
+        elif self._enable_mood_learning:
             self._update_mood_posterior(human_id, recipe_name, actor, spice, satisfaction)
 
         # Stage 3: update running psi estimate after each observation.
         # This enables mid-episode CSP adaptation: log_prob_prefer uses phi + running_psi,
         # so if a mood is detected mid-episode the CSP shifts its assignments immediately.
-        self._update_running_psi(human_id)
+        if self._enable_mood_learning:
+            self._update_running_psi(human_id)
 
     def _update_running_psi(self, human_id: str) -> None:
         """
@@ -979,20 +1004,20 @@ class HierarchicalPreferenceModel:
             return
 
         signs, sats = _obs_to_tensors(all_obs)
-        # Build per-observation phi anchor: look up actual phi for each spice seen.
-        # Falls back to 0.0 for spices not yet registered.
+        # Build per-observation phi anchor using the correct (recipe, spice) pair.
+        # _episode_recipe_spices is parallel to _episode_data (both appended in observe()).
         phi_anchor_list: List[float] = []
-        for _act, sp, _sat in self._episode_data[human_id]:
+        for recipe_name, sp in self._episode_recipe_spices[human_id]:
             phi_val = 0.0
-            for r in self._phi_m.get(human_id, {}):
-                if sp in self._phi_m[human_id][r]:
-                    phi_val = self._phi_m[human_id][r][sp].item()
-                    break
+            if (recipe_name and human_id in self._phi_m
+                    and recipe_name in self._phi_m[human_id]
+                    and sp in self._phi_m[human_id][recipe_name]):
+                phi_val = self._phi_m[human_id][recipe_name][sp].item()
             phi_anchor_list.append(phi_val)
         phi_anchors = torch.tensor(phi_anchor_list, dtype=torch.float32)
 
         m_psi_running = self._running_psi_m[human_id]
-        n_steps = max(1, self.n_phi_steps // 2)
+        n_steps = max(1, self.n_psi_steps // 4)  # running estimate: fewer steps (called per-obs)
         optimizer = optim.Adam([m_psi_running], lr=self.lr_phi)
         for _ in range(n_steps):
             optimizer.zero_grad()
@@ -1014,10 +1039,17 @@ class HierarchicalPreferenceModel:
         Batch-infer psi from all episode observations, with phi posteriors fixed.
 
         Called once at episode end. Collects all (actor, satisfaction) pairs from
-        the episode across ALL spices, then runs N_PHI_STEPS Adam steps on m_psi.
+        the episode across ALL spices, then runs n_psi_steps Adam steps on m_psi.
 
         Using all spice observations jointly gives a better psi estimate than
         per-observation updates, and avoids saturating phi's per-observation gradient.
+
+        Neutral-episode gate: if the mood posterior is already confident that this
+        episode is neutral (neutral_prob >= psi_skip_neutral_threshold), skip the
+        ELBO entirely.  On neutral episodes psi_true ≈ 0 and the KL would pull
+        m_psi back to 0 anyway, but the MC likelihood gradient introduces noise
+        that biases phi's subsequent update.  Skipping keeps m_psi ≈ 0 cleanly and
+        gives phi an uncontaminated signal.
         """
         all_obs: List[Tuple[str, float]] = [
             (act, sat) for act, _sp, sat in self._episode_data[human_id]
@@ -1025,21 +1057,30 @@ class HierarchicalPreferenceModel:
         if not all_obs:
             return
 
+        # Gate: skip if the episode is confidently neutral.
+        threshold = self.config.hbm.psi_skip_neutral_threshold
+        mood_post = self._mood_posterior.get(human_id)
+        if mood_post is not None:
+            neutral_idx = MOODS.index("neutral")
+            if float(mood_post[neutral_idx]) >= threshold:
+                return
+
         signs, sats = _obs_to_tensors(all_obs)
-        # Build per-observation phi anchor: look up actual phi for each spice.
+        # Build per-observation phi anchor using the correct (recipe, spice) pair.
+        # _episode_recipe_spices is parallel to _episode_data (both appended in observe()).
         phi_anchor_list: List[float] = []
-        for _act, sp, _sat in self._episode_data[human_id]:
+        for recipe_name, sp in self._episode_recipe_spices[human_id]:
             phi_val = 0.0
-            for r in self._phi_m.get(human_id, {}):
-                if sp in self._phi_m[human_id][r]:
-                    phi_val = self._phi_m[human_id][r][sp].item()
-                    break
+            if (recipe_name and human_id in self._phi_m
+                    and recipe_name in self._phi_m[human_id]
+                    and sp in self._phi_m[human_id][recipe_name]):
+                phi_val = self._phi_m[human_id][recipe_name][sp].item()
             phi_anchor_list.append(phi_val)
         phi_anchors = torch.tensor(phi_anchor_list, dtype=torch.float32)
 
         m_psi = self._psi_m[human_id]
-        optimizer_psi = optim.Adam([m_psi], lr=self.lr_phi)
-        for _ in range(self.n_phi_steps):
+        optimizer_psi = optim.Adam([m_psi], lr=self.lr_psi)
+        for _ in range(self.n_psi_steps):
             optimizer_psi.zero_grad()
             elbo = _elbo_psi_step(
                 signs=signs,
@@ -1059,9 +1100,10 @@ class HierarchicalPreferenceModel:
         """
         Batch update phi for all (recipe, spice) pairs observed this episode.
 
-        Called after _update_psi_episode() so psi holds the episode's inferred
-        session offset. _update_phi_elbo() reads psi via self._psi_m[human_id].detach(),
-        so phi is updated with the correct psi correction already applied.
+        Called after _update_psi_episode() so self._psi_m already holds the
+        episode's inferred mood offset. _update_phi_elbo() reads psi via
+        self._psi_m[human_id].detach(), so phi learns only from the residual
+        signal after mood has been subtracted.
 
         This is coordinate ascent Phase 2: phi update conditioned on inferred psi.
         """
@@ -1088,21 +1130,27 @@ class HierarchicalPreferenceModel:
 
         signs, sats = _obs_to_tensors(all_obs)
         phi_anchor_list: List[float] = []
-        for _act, sp, _sat in self._episode_data[human_id]:
+        for recipe_name, sp in self._episode_recipe_spices[human_id]:
             phi_val = 0.0
-            for r in self._phi_m.get(human_id, {}):
-                if sp in self._phi_m[human_id][r]:
-                    phi_val = self._phi_m[human_id][r][sp].item()
-                    break
+            if (recipe_name and human_id in self._phi_m
+                    and recipe_name in self._phi_m[human_id]
+                    and sp in self._phi_m[human_id][recipe_name]):
+                phi_val = self._phi_m[human_id][recipe_name][sp].item()
             phi_anchor_list.append(phi_val)
         phi_anchors = torch.tensor(phi_anchor_list, dtype=torch.float32)
         m_psi_fixed = self._psi_m[human_id].detach()
 
+        # Limit to 4 steps so sigma_obs adapts slowly — too many steps causes
+        # it to collapse to near-zero, which flattens the phi ELBO gradient and
+        # freezes learning after ~500 training steps.
+        # Also clamp from below: Beta noise floor std ≈ 1/(2*sqrt(kappa)) ≈ 0.16
+        # for kappa=10, so sigma_obs < 0.25 is over-fit.
+        log_sigma_obs_min = math.log(0.25)
         optimizer_obs = optim.Adam([self.log_sigma_obs], lr=self.lr_hyper)
-        for _ in range(self.n_phi_steps):
+        for _ in range(4):
             optimizer_obs.zero_grad()
-            # Compute ell using current phi+psi with only log_sigma_obs as free parameter.
-            # We don't apply a KL here — log_sigma_obs has no prior in this model.
+            with torch.no_grad():
+                self.log_sigma_obs.clamp_(min=log_sigma_obs_min)
             sigma_obs = torch.exp(self.log_sigma_obs)
             logits = signs * (phi_anchors + m_psi_fixed)
             temp = max(self.sat_logit_temperature, 1e-6)
@@ -1115,6 +1163,8 @@ class HierarchicalPreferenceModel:
             ell = log_p_sat.sum()
             (-ell).backward()
             optimizer_obs.step()
+        with torch.no_grad():
+            self.log_sigma_obs.clamp_(min=log_sigma_obs_min)
 
     def end_episode(self, human_id: str, neutral_threshold: float = 0.5) -> None:
         """
@@ -1132,12 +1182,15 @@ class HierarchicalPreferenceModel:
         self._phi_updated[human_id] = True  # always updated now
 
         # Stage 2: coordinate ascent at episode end.
-        # Phase 1 (psi): infer psi from all episode observations with phi fixed at
-        #   pre-episode values. Psi absorbs the session-level deviation.
-        # Phase 2 (phi): update phi with psi fixed at the newly inferred value.
-        #   The psi correction reduces phi's gradient for mood-driven deviations,
-        #   preventing phi from being contaminated by transient session effects.
-        self._update_psi_episode(human_id)
+        # Phase 1 (psi): infer psi from all episode observations with phi fixed.
+        #   Psi gets first credit for the session-level mood offset.
+        # Phase 2 (phi): update phi conditioned on the inferred psi.
+        #   Phi only learns from the residual after psi has been subtracted,
+        #   preventing mood from corrupting the persistent preference signal.
+        # This ordering is correct: psi must be identified before phi can learn,
+        # because phi is updated with m_psi_fixed = self._psi_m (current inferred value).
+        if self._enable_mood_learning:
+            self._update_psi_episode(human_id)
         self._update_phi_episode(human_id)
         self._update_sigma_obs_episode(human_id)
 
@@ -1147,11 +1200,14 @@ class HierarchicalPreferenceModel:
 
         # Stage 2: aggressive psi mean decay (log_v_psi is fixed, no reset needed).
         # Persistent signals accumulate in phi; transient signals cannot persist in psi.
-        psi_decay = self.config.hbm.psi_decay
-        self._psi_m[human_id] = torch.tensor(
-            self._psi_m[human_id].item() * psi_decay,
-            dtype=torch.float32, requires_grad=True,
-        )
+        if self._enable_mood_learning:
+            psi_decay = self.config.hbm.psi_decay
+            self._psi_m[human_id] = torch.tensor(
+                self._psi_m[human_id].item() * psi_decay,
+                dtype=torch.float32, requires_grad=True,
+            )
+        else:
+            self._psi_m[human_id] = torch.tensor(0.0, dtype=torch.float32, requires_grad=True)
 
         # Reset episode state
         self._episode_data[human_id] = []
@@ -1161,6 +1217,39 @@ class HierarchicalPreferenceModel:
         self._current_recipe[human_id] = None
         # Stage 3: reset running psi — next episode starts with no mid-episode signal
         self._running_psi_m[human_id] = torch.tensor(0.0, dtype=torch.float32, requires_grad=True)
+
+    def observe_eval(
+        self,
+        human_id: str,
+        recipe_name: str,
+        spice: str,
+        actor: str,
+        satisfaction: float,
+        done: bool,
+    ) -> None:
+        """
+        Eval-time psi adaptation: accumulate observations and update running_psi only.
+
+        Does NOT touch phi, theta, mu, obs counts, or any training state.
+        Enables the CSP to adapt mid-episode to mood signals at eval time via
+        log_prob_prefer(phi + running_psi), without any learning side-effects.
+
+        At done=True, resets _episode_data and running_psi to avoid bleeding
+        into the next eval episode.
+        """
+        if not self._enable_mood_learning:
+            return
+        self._ensure_registered(human_id, recipe_name)
+        self._episode_data[human_id].append((actor, spice, satisfaction))
+        self._episode_recipe_spices[human_id].append((recipe_name, spice))
+        self._current_recipe[human_id] = recipe_name
+        self._update_running_psi(human_id)
+        if done:
+            self._episode_data[human_id] = []
+            self._episode_recipe_spices[human_id] = []
+            self._running_psi_m[human_id] = torch.tensor(
+                0.0, dtype=torch.float32, requires_grad=True
+            )
 
     # ------------------------------------------------------------------
     # Public update (kept for backward compat with any direct callers)
@@ -1262,6 +1351,8 @@ class HierarchicalPreferenceModel:
         giving the CSP a real-time view of psi without waiting for episode end.
         Resets to 0 at the start of each new episode.
         """
+        if not self._enable_mood_learning:
+            return 0.0
         try:
             return self._running_psi_m[human_id].item()
         except KeyError:
@@ -1311,28 +1402,42 @@ class HierarchicalPreferenceModel:
         recipe_spices: List[str],
         rng: np.random.Generator,
         human_id: str = DEFAULT_HUMAN,
+        stochastic: bool = False,
+        recipe_name: Optional[str] = None,
     ) -> Dict[str, str]:
         """
-        Return the preferred actor for each spice based on the theta mean.
+        Return the preferred actor for each spice.
 
-        Uses theta_mean directly (deterministic sign) rather than sampling
-        phi ~ N(theta, sigma_r²). The phi noise represents recipe-to-recipe
-        variation in the generative model, but within a single recipe episode
-        the human's preference is fixed by theta. Sampling phi each episode
-        introduces spurious label flips for borderline-magnitude spices (e.g.
-        |theta|=0.5 flips ~24% of episodes with sigma_r=0.5), which sends
-        contradictory gradient signal to the learning HBM and prevents phi
-        from converging to the correct sign.
+        If recipe_name is provided and per-recipe phi overrides were set via set_phi
+        (Option A recipe-conflict configs), those override the global theta for the
+        spices in that recipe.  This gives the hidden HBM true recipe-level ground
+        truth that the learning HBM's per-recipe phi hierarchy must track.
+
+        stochastic=False (default): uses the effective theta/phi mean sign directly.
+        stochastic=True: samples phi ~ N(mean, sigma_r²) and uses its sign.
+          Borderline spices flip across episodes, exposing CBTL's inability to track
+          per-recipe uncertainty (it averages flipped labels to ~0).
 
         Spices with no registered theta default to "robot" (neutral / no preference).
         """
+        sigma_r = math.exp(self.log_sigma_r.item())
         preferences: Dict[str, str] = {}
         for spice in recipe_spices:
-            if spice in self._theta_m.get(human_id, {}):
-                theta_mean = self._theta_m[human_id][spice].item()
-                preferred_actor = "human" if theta_mean >= 0 else "robot"
+            if spice not in self._theta_m.get(human_id, {}):
+                preferences[spice] = "robot"
+                continue
+            # Use per-recipe phi override if available (Option A conflict config).
+            phi_recipes = self._phi_m.get(human_id, {})
+            if (recipe_name and recipe_name in phi_recipes
+                    and spice in phi_recipes[recipe_name]):
+                mean_val = phi_recipes[recipe_name][spice].item()
             else:
-                preferred_actor = "robot"
+                mean_val = self._theta_m[human_id][spice].item()
+            if stochastic:
+                sampled = float(rng.normal(mean_val, sigma_r))
+                preferred_actor = "human" if sampled >= 0 else "robot"
+            else:
+                preferred_actor = "human" if mean_val >= 0 else "robot"
             preferences[spice] = preferred_actor
         return preferences
 

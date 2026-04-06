@@ -1,0 +1,32 @@
+# Spices use binary assignment; run_single_experiment forces EnumerationCSPSolver when
+# env=spices (Hydra cannot override root csp_solver from nested env YAML — see run script).
+# Optional: pass csp_solver=enumeration explicitly. env.csp_solver.* is only for RandomWalk.
+env:
+  _target_: "multitask_personalization.envs.spices.spices_env.SpiceEnv"
+  scene_spec:
+    _target_: "multitask_personalization.envs.spices.spices_experiment.build_spice_scene_spec_default_multi"
+  hidden_spec:
+    _target_: "multitask_personalization.envs.spices.spices_env.SpiceHiddenSpec"
+    preferred_actor: {}
+    # Set stochastic_preferences: true when using a *Stochastic hidden_hbm_config_name
+    # so that phi ~ N(theta, sigma_r²) is resampled each episode for the ground truth.
+    # SpiceSpecificHumanRecipeConflict uses deterministic per-recipe phi overrides (no
+    # stochastic resampling needed — the conflict is structural, not noisy).
+    stochastic_preferences: false
+    hidden_hbm:
+      _target_: "multitask_personalization.envs.spices.spices_experiment.build_spice_experiment_hidden_hbm_default_multi"
+      hidden_hbm_config_name: SpiceSpecificHumanRecipeConflict
+  verbose: false
+train_env: {}
+eval_env: {}
+# Episodes are ~18 steps; 10000 steps gives methods ample time to converge and separate.
+# eval_frequency=500 gives 20 checkpoints; num_eval_trials=50 reduces natural eval variance.
+max_environment_steps: 5000
+eval_frequency: 250
+max_eval_episode_length: 40
+num_eval_trials: 50
+dt: 0.01
+csp_solver:
+  max_iters: 2500
+  num_improvements: 500
+  max_improvement_attempts: 100

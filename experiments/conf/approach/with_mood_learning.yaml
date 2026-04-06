@@ -1,0 +1,5 @@
+defaults:
+  - ours
+
+# Explicit alias for ablation runs.
+mood_learning_enabled: true

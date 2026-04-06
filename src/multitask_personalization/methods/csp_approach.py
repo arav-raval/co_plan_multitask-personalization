@@ -25,6 +25,13 @@ from multitask_personalization.envs.pybullet.pybullet_env import PyBulletEnv
 from multitask_personalization.envs.pybullet.pybullet_scene_spec import (
     PyBulletSceneSpec,
 )
+from multitask_personalization.envs.spices.recipes import get_recipe
+from multitask_personalization.envs.spices.spices_baselines import (
+    CBTLClassifierModel,
+    FlatPreferenceModel,
+)
+from multitask_personalization.envs.spices.spices_csp import SpicesAssignCSPGenerator
+from multitask_personalization.envs.spices.spices_env import SpiceSceneSpec
 from multitask_personalization.envs.tiny.tiny_csp import TinyCSPGenerator
 from multitask_personalization.envs.tiny.tiny_env import TinySceneSpec
 from multitask_personalization.methods.approach import (
@@ -50,6 +57,8 @@ class CSPApproach(BaseApproach[_ObsType, _ActType]):
         motion_planning_quality: str = "normal",
         explore_method: str = "nothing-personal",
         disable_learning: bool = False,
+        mood_learning_enabled: bool = True,
+        preference_model_type: str = "hbm",
         csp_save_dir: str | None = None,
         seed: int = 0,
         lifelong_learning: dict | None = None,
@@ -61,6 +70,8 @@ class CSPApproach(BaseApproach[_ObsType, _ActType]):
         self._current_sol: dict[CSPVariable, Any] | None = None
         self._explore_method = explore_method
         self._disable_learning = disable_learning
+        self._mood_learning_enabled = mood_learning_enabled
+        self._preference_model_type = preference_model_type
         self._motion_planning_quality = motion_planning_quality
         self._csp_save_dir = Path(csp_save_dir) if csp_save_dir else None
         self._lifelong_learning = lifelong_learning
@@ -112,12 +123,29 @@ class CSPApproach(BaseApproach[_ObsType, _ActType]):
         if self._current_policy is None or self._current_policy.check_termination(
             self._last_observation
         ):
-            logging.info("Recomputing policy because of termination")
+            logging.debug("Recomputing policy because of termination")
             self._recompute_policy(
                 self._last_observation,
             )
         assert self._current_policy is not None
         return self._current_policy.step(self._last_observation)
+
+    def update(
+        self,
+        obs: _ObsType,
+        reward: float,
+        done: bool,
+        info: dict[str, Any],
+    ) -> None:
+        # At eval time, update running_psi so the CSP adapts mid-episode to mood
+        # signals without modifying any learned phi/theta state.
+        if self._train_or_eval == "eval" and hasattr(
+            self._csp_generator, "observe_transition_eval"
+        ):
+            self._csp_generator.observe_transition_eval(
+                self._last_observation, self._last_action, obs, done, info
+            )
+        super().update(obs, reward, done, info)
 
     def _learn_from_transition(
         self,
@@ -211,6 +239,37 @@ class CSPApproach(BaseApproach[_ObsType, _ActType]):
                 self._seed,
                 explore_method=self._explore_method,
                 disable_learning=self._disable_learning,
+            )
+        if isinstance(self._scene_spec, SpiceSceneSpec):
+            spec = self._scene_spec
+            if spec.train_recipe_names:
+                train_names = list(spec.train_recipe_names)
+                union: set[str] = set()
+                for n in train_names:
+                    union.update(get_recipe(n).spices)
+                spice_list = sorted(union)
+                recipe_list = train_names
+            else:
+                recipe = spec.recipe
+                spice_list = list(recipe.spices)
+                recipe_list = [recipe.name]
+            preference_model = None
+            if self._preference_model_type == "flat":
+                preference_model = FlatPreferenceModel(
+                    spices=spice_list, recipes=recipe_list
+                )
+            elif self._preference_model_type == "cbtl":
+                preference_model = CBTLClassifierModel(
+                    spices=spice_list, recipes=recipe_list
+                )
+            return SpicesAssignCSPGenerator(
+                spice_list=spice_list,
+                recipe_list=recipe_list,
+                seed=self._seed,
+                explore_method=self._explore_method,
+                disable_learning=self._disable_learning,
+                mood_learning_enabled=self._mood_learning_enabled,
+                preference_model=preference_model,
             )
 
         raise NotImplementedError()

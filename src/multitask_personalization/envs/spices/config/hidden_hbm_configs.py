@@ -255,6 +255,23 @@ class HiddenHBMConfig:
     sigma_r: float = 1.0  # Recipe-level variance (Level 3: φ) — controls sampling variation
     sigma_obs: float = 1.0  # Observation noise
 
+    # When True, the hidden HBM samples phi ~ N(theta, sigma_r²) each episode and
+    # uses its sign as the ground-truth preferred actor.  This makes borderline spices
+    # (|theta| small relative to sigma_r) flip preference across episodes, which
+    # exposes the limits of methods that cannot track per-recipe uncertainty (CBTL).
+    stochastic_preferences: bool = False
+
+    # Per-recipe theta overrides (Option A). Maps recipe_name -> {spice -> theta}.
+    # Spices listed here override the global theta_mean/theta_generator for that recipe.
+    # This lets you define true per-recipe conflicts: a spice that the human prefers
+    # to handle in one recipe (theta>0) but defers to the robot in another (theta<0).
+    # CBTL shares w[human][spice] across all recipes and will average contradictory
+    # gradients to ~0, making consistently mediocre decisions on conflicted spices.
+    # The HBM's per-recipe phi tracks each correctly.
+    recipe_theta_overrides: dict[str, dict[str, float]] = field(
+        default_factory=dict, hash=False, compare=False, repr=False
+    )
+
     # When provided, this callable generates the full theta_mean dict from the recipe's
     # spice list.  It takes priority over the `theta_mean` field.
     theta_generator: Callable[[list[str]], dict[str, float]] | None = field(
@@ -275,6 +292,21 @@ class HiddenHBMConfig:
         if self.theta_generator is not None:
             return self.theta_generator(spices)
         return {s: self.theta_mean.get(s, 0.0) for s in spices}
+
+    def generate_theta_for_recipe(self, spices: list[str], recipe_name: str) -> dict[str, float]:
+        """
+        Return a {spice: theta_mean} mapping for the given spice list, applying
+        any per-recipe overrides from recipe_theta_overrides.
+
+        recipe_theta_overrides[recipe_name] entries replace individual spice thetas
+        while the global theta (from theta_generator or theta_mean) fills the rest.
+        This allows true per-recipe conflicts without changing the global human profile.
+        """
+        base = self.generate_theta(spices)
+        overrides = self.recipe_theta_overrides.get(recipe_name, {})
+        if overrides:
+            base = {s: overrides.get(s, base[s]) for s in spices}
+        return base
 
 
 # ---------------------------------------------------------------------------
@@ -319,6 +351,88 @@ SPICE_SPECIFIC_HUMAN_STRONG = HiddenHBMConfig(
     sigma_r=0.5,
     sigma_h=0.5,
     theta_generator=_spice_specific_theta_strong,
+)
+
+# Stochastic variant: phi ~ N(theta, sigma_r²) resampled each episode.
+# Borderline spices (|theta| ≈ sigma_r) flip preferred actor across episodes,
+# which exposes CBTL's inability to track per-recipe preference uncertainty.
+SPICE_SPECIFIC_HUMAN_STRONG_STOCHASTIC = HiddenHBMConfig(
+    name="SpiceSpecificHumanStrongStochastic",
+    theta_mean={},
+    sigma_r=0.5,
+    sigma_h=0.5,
+    theta_generator=_spice_specific_theta_strong,
+    stochastic_preferences=True,
+)
+
+# Mid-strength stochastic variant: uses base (1×) theta magnitudes so nuanced spices
+# (|theta|=0.5–1.0) sit at or below sigma_r and genuinely flip preferred actor across
+# recipes/episodes. sigma_r=0.8 means:
+#   - Strong spices (|theta|≥1.5): P(flip) < 3% — stable ground truth for anchoring
+#   - Mid spices (|theta|≈0.8–1.0): P(flip) ≈ 16–32% — occasionally flip, challenging
+#   - Nuanced spices (|theta|≈0.5): P(flip) ≈ 53% — near-random, hardest to learn
+# The HBM's per-recipe phi posterior should track these; CBTL's shared w averages away.
+SPICE_SPECIFIC_HUMAN_MID_STOCHASTIC = HiddenHBMConfig(
+    name="SpiceSpecificHumanMidStochastic",
+    theta_mean={},
+    sigma_r=0.8,
+    sigma_h=0.5,
+    theta_generator=_spice_specific_theta,
+    stochastic_preferences=True,
+)
+
+# Recipe-conflicting variant (Option A): per-recipe phi overrides flip the sign of
+# 8 spices across the 4-recipe pool (UltraComplexFeast, AsianFusionBowl,
+# IndianFeastComplex, MediterraneanComplex).
+#
+# Design principles:
+#  - Conflicted spices appear in 2+ recipes so CBTL sees contradictory labels and
+#    its shared w[spice] is driven toward ~0 (chance performance on those spices).
+#  - The HBM's per-recipe phi learns the correct sign independently for each recipe.
+#  - "Anchor" spices (salt, garlic, pepper, ginger, chili) are intentionally kept
+#    consistent across all recipes so both methods can anchor on a stable signal;
+#    this makes the evaluation fair rather than adversarial.
+#  - Conflict magnitudes match the strong (2×) scale of the theta generator so the
+#    signal-to-noise ratio is the same as non-conflicted strong spices.
+#
+# Conflict table (all values are phi_true for that recipe; blanks = global theta):
+#
+#  Spice        | Ultra  | Asian  | Indian | Mediterr | Global θ
+#  -------------|--------|--------|--------|----------|----------
+#  cumin        |  +2.0  |  -2.0  |  +2.0  |   +2.0   |  +2.0
+#  turmeric     |  +1.0  |  -2.0  |  -1.0  |    —     |  +1.0
+#  cinnamon     |  +1.0  |  +1.0  |  -1.0  |    —     |  +1.0
+#  coriander    |  +1.6  |  -1.6  |  -1.6  |   +1.6   |  +1.6
+#  onion        |  +2.0  |  -2.0  |  -2.0  |   +2.0   |  +2.0
+#  paprika      |  +1.6  |  -1.6  |    —   |   +1.6   |  +1.6
+#  honey        |  +2.0  |  -2.0  |    —   |    —     |  +2.0
+#  yogurt       |  +1.0  |    —   |  -1.0  |    —     |  +1.0
+#
+# CBTL: shared w averages contradictory gradients → w≈0 → chance on all 8 spices.
+# HBM:  per-recipe phi correctly tracks each recipe's true direction → high accuracy.
+SPICE_SPECIFIC_HUMAN_RECIPE_CONFLICT = HiddenHBMConfig(
+    name="SpiceSpecificHumanRecipeConflict",
+    theta_mean={},
+    sigma_r=0.5,
+    sigma_h=0.5,
+    theta_generator=_spice_specific_theta_strong,
+    recipe_theta_overrides={
+        "AsianFusionBowl": {
+            "cumin":     -2.0,
+            "turmeric":  -2.0,
+            "coriander": -1.6,
+            "onion":     -2.0,
+            "paprika":   -1.6,
+            "honey":     -2.0,
+        },
+        "IndianFeastComplex": {
+            "cinnamon":  -1.0,
+            "coriander": -1.6,
+            "turmeric":  -1.0,
+            "onion":     -2.0,
+            "yogurt":    -1.0,
+        },
+    },
 )
 
 SPICE_SPECIFIC_HUMAN_HEAT_SEEKING = HiddenHBMConfig(
@@ -389,6 +503,9 @@ ALL_HIDDEN_HBM_CONFIGS: dict[str, HiddenHBMConfig] = {
     "HumanPrefersSecondHalf": HUMAN_PREFERS_SECOND_HALF,
     "SpiceSpecificHuman": SPICE_SPECIFIC_HUMAN,
     "SpiceSpecificHumanStrong": SPICE_SPECIFIC_HUMAN_STRONG,
+    "SpiceSpecificHumanStrongStochastic": SPICE_SPECIFIC_HUMAN_STRONG_STOCHASTIC,
+    "SpiceSpecificHumanMidStochastic": SPICE_SPECIFIC_HUMAN_MID_STOCHASTIC,
+    "SpiceSpecificHumanRecipeConflict": SPICE_SPECIFIC_HUMAN_RECIPE_CONFLICT,
     "SpiceSpecificHumanHeatSeeking": SPICE_SPECIFIC_HUMAN_HEAT_SEEKING,
     "SpiceSpecificHumanAromaticGentle": SPICE_SPECIFIC_HUMAN_AROMATIC_GENTLE,
     "ConsistentHuman": CONSISTENT_HUMAN,

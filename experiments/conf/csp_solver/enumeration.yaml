@@ -1,0 +1,2 @@
+_target_: "multitask_personalization.csp_solvers.EnumerationCSPSolver"
+seed: ${seed}

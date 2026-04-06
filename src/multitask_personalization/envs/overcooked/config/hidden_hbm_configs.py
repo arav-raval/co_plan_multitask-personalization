@@ -19,15 +19,15 @@ from typing import Callable, Dict, Optional
 # ---------------------------------------------------------------------------
 
 def _prefers_prep(subtasks: list[str]) -> dict[str, float]:
-    """Human prefers prep tasks (fetching, chopping); robot handles delivery."""
-    prep = {"fetch_onion", "fetch_tomato", "fetch_dish", "chop"}
+    """Human prefers prep tasks (fetch + load); robot handles serve loop."""
+    prep = {"fetch_ingredient", "load_pot"}
     return {s: +1.5 if s in prep else -1.5 for s in subtasks}
 
 
 def _prefers_delivery(subtasks: list[str]) -> dict[str, float]:
-    """Human prefers plating and delivery; robot handles ingredient fetching."""
-    delivery = {"plate_soup", "deliver"}
-    return {s: +1.5 if s in delivery else -1.5 for s in subtasks}
+    """Human prefers the serve loop (dish + pickup + deliver); robot preps."""
+    serve = {"fetch_dish", "pickup_soup", "deliver"}
+    return {s: +1.5 if s in serve else -1.5 for s in subtasks}
 
 
 def _prefers_all(subtasks: list[str]) -> dict[str, float]:
@@ -46,23 +46,21 @@ def _alternating(subtasks: list[str]) -> dict[str, float]:
 
 
 # Semantically grounded mapping for a realistic simulated human.
-# This human enjoys hands-on cooking tasks but dislikes the physical delivery.
+# This human enjoys active prep work but dislikes the navigational serve loop.
 _REALISTIC_THETA: dict[str, float] = {
-    "fetch_onion": +1.0,    # enjoys ingredient prep
-    "fetch_tomato": +1.0,
-    "fetch_dish":   +0.5,   # mild preference for dish handling
-    "chop":         +1.5,   # strongly prefers chopping (active task)
-    "plate_soup":   -0.5,   # mild aversion (messy, easy to spill)
-    "deliver":      -1.5,   # dislikes delivery (navigation, time pressure)
+    "fetch_ingredient": +1.0,   # enjoys fetching ingredients
+    "load_pot":         +1.5,   # strongly prefers loading the pot (active)
+    "fetch_dish":       +0.5,   # mild preference for grabbing dishes
+    "pickup_soup":      -0.5,   # mild aversion (timing-critical, easy to drop)
+    "deliver":          -1.5,   # dislikes delivery (navigation, time pressure)
 }
 
 _ROBOT_CENTRIC_THETA: dict[str, float] = {
-    "fetch_onion": -1.0,
-    "fetch_tomato": -1.0,
-    "fetch_dish":   -1.5,
-    "chop":         -1.0,
-    "plate_soup":   +0.5,
-    "deliver":      +1.5,   # human wants to do the final delivery (pride in completion)
+    "fetch_ingredient": -1.0,
+    "load_pot":         -1.0,
+    "fetch_dish":       -1.5,
+    "pickup_soup":      +0.5,
+    "deliver":          +1.5,   # human wants to do the final delivery
 }
 
 

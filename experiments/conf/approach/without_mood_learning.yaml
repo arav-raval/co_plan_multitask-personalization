@@ -1,0 +1,5 @@
+defaults:
+  - ours
+
+# Mood-ablation baseline: same planner/HBM stack, but no psi/mood inference updates.
+mood_learning_enabled: false

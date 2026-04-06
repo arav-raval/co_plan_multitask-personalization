@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
+import pickle
 from typing import Any, TypeAlias, TYPE_CHECKING
 import logging
 import gymnasium as gym
@@ -113,8 +115,15 @@ class RecipeSpec:
 
 @dataclass(frozen=True)
 class SpiceSceneSpec(PublicSceneSpec):
-    """A scene specification for the spices environment."""
+    """A scene specification for the spices environment.
+
+    ``recipe`` is the active recipe for the current episode. When
+    ``train_recipe_names`` is set, each ``reset()`` samples a recipe from that
+    pool (shared vocabulary / multi-dish training).
+    """
+
     recipe: RecipeSpec
+    train_recipe_names: tuple[str, ...] | None = None
 
 @dataclass(frozen=False)  # Mutable to allow setting preferences from HBM
 class SpiceHiddenSpec:
@@ -122,6 +131,7 @@ class SpiceHiddenSpec:
     preferred_actor: dict[str, str]  # {"Spice": "Actor"}
     hidden_hbm: "HierarchicalPreferenceModel | None" = None
     force_neutral_mood: bool = False  # If True, all episodes use neutral mood (training mode)
+    stochastic_preferences: bool = False  # If True, phi ~ N(theta, sigma_r²) resampled each episode
 
 @dataclass(frozen=True)
 class SpiceState:
@@ -157,10 +167,16 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
         hidden_spec: SpiceHiddenSpec,
         seed: int = 0,
         verbose: bool = False,
+        eval_mode: bool | None = None,
     ) -> None:
+        """If ``eval_mode`` is not ``None``, set ``hidden_spec.force_neutral_mood`` to
+        that value (used by ``run_single_experiment``). If ``None``, leave
+        ``force_neutral_mood`` unchanged for backward compatibility."""
 
         self._rng = np.random.default_rng(seed)
         self._hidden_spec = hidden_spec
+        if eval_mode is not None:
+            self._hidden_spec.force_neutral_mood = eval_mode
         self.scene_spec = scene_spec
         self.action_space = gym.spaces.OneOf(
             (
@@ -170,16 +186,12 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
         )
         self._mood_model = MoodModel(self._rng)
 
-        # Precompute topological order and layers
-        self._topo_order = self.scene_spec.recipe.get_topological_sort()
-        self._layers = self.scene_spec.recipe.layers()
-
-        self._layer_index: dict[str, int] = {
-            spice: idx
-            for idx, layer in enumerate(self._layers)
-            for spice in layer
-        }
-        self._topo_index: dict[str, int] = {s: i for i, s in enumerate(self._topo_order)}
+        self._train_recipe_names: list[str] | None = (
+            list(self.scene_spec.train_recipe_names)
+            if self.scene_spec.train_recipe_names
+            else None
+        )
+        self._refresh_recipe_topology_caches()
 
         # Satisfaction parameters from config.
         self._base_satisfaction_bias: float = DEFAULT_CONFIG.satisfaction.base_satisfaction_bias
@@ -201,6 +213,17 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
         if verbose:
             self._log_recipe()
 
+    def _refresh_recipe_topology_caches(self) -> None:
+        """Recompute DAG caches after ``scene_spec.recipe`` changes."""
+        self._topo_order = self.scene_spec.recipe.get_topological_sort()
+        self._layers = self.scene_spec.recipe.layers()
+        self._layer_index = {
+            spice: idx
+            for idx, layer in enumerate(self._layers)
+            for spice in layer
+        }
+        self._topo_index = {s: i for i, s in enumerate(self._topo_order)}
+
     def reset(
         self,
         *,
@@ -212,12 +235,26 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
         if seed is not None:
             self._rng = np.random.default_rng(seed)
 
+        if self._train_recipe_names:
+            from multitask_personalization.envs.spices.recipes import get_recipe
+
+            chosen = str(self._rng.choice(self._train_recipe_names))
+            self.scene_spec = SpiceSceneSpec(
+                recipe=get_recipe(chosen),
+                train_recipe_names=tuple(self._train_recipe_names),
+            )
+            self._refresh_recipe_topology_caches()
+            if self.verbose:
+                self._log_recipe()
+
         # Sample hidden preferences from HBM when available; otherwise use fixed preferences.
         if self._hidden_spec.hidden_hbm is not None:
             self._hidden_spec.preferred_actor = (
                 self._hidden_spec.hidden_hbm.sample_episode_preferences(
                     list(self.scene_spec.recipe.spices),
                     self._rng,
+                    stochastic=self._hidden_spec.stochastic_preferences,
+                    recipe_name=self.scene_spec.recipe.name,
                 )
             )
 
@@ -263,6 +300,9 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
         # Add the assigned spice.
         assert payload is not None, "Payload is not set"
         assert payload in {"human", "robot"}, "Invalid actor"
+        if self._current_spice is None:
+            info = self._get_info(robot_indicated_done=True)
+            return self._get_state(), 0.0, True, False, info
 
         self._last_actor = str(payload)
         self._added.append(self._current_spice)
@@ -287,6 +327,20 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
 
     def render(self) -> RenderFrame | list[RenderFrame] | None:
         raise NotImplementedError
+
+    def save_state(self, filepath: Path) -> None:
+        """Persist minimal state for crash debugging (matches other envs' interface)."""
+        payload = {
+            "rng_state": self._rng.bit_generator.state,
+            "t": self._t,
+            "added": list(self._added),
+            "current_spice": self._current_spice,
+            "last_actor": self._last_actor,
+            "current_mood": self._current_mood,
+            "current_psi_true": self._current_psi_true,
+        }
+        with open(filepath, "wb") as f:
+            pickle.dump(payload, f)
 
     # ---------------- UTILITY FUNCTIONS ----------------
     def _log_recipe(self) -> None:
@@ -328,13 +382,14 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
              0.0 — neutral
             -1.0 — maximum negative satisfaction
 
-        The generative model mirrors the HBM's Stage 2 likelihood:
+        The generative model:
             phi_latent = pref_sign * phi_mag
             phi_mag    = |hidden_theta(spice)| when available, else base_satisfaction_bias
             logit      = actor_sign * (phi_latent + psi_true)
-            expected   = tanh(logit / T) where T=satisfaction_logit_temperature
-            p        = (expected+1)/2 ← map [-1,+1] → [0,1] for Beta params
-            sat      ~ Beta(p*kappa+1, (1-p)*kappa+1) rescaled to [-1, +1]
+            p          = (tanh(logit/T) + 1) / 2    ← maps logit to (0,1)
+            sat      ~ Beta(p*kappa, (1-p)*kappa) rescaled to [-1, +1]
+        E[sat] = 2*p - 1 = tanh(logit/T), so satisfaction reaches near ±1 for
+        strong preferences (no +1 Laplace offset that previously capped the mean).
 
         psi_true is sampled once per episode from a mood-conditioned distribution
         (see _sample_psi_from_mood). This replaces the old per-step actor-dependent
@@ -356,10 +411,14 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
         logit = actor_sign * (phi_latent + self._current_psi_true)
 
         temp = max(float(DEFAULT_CONFIG.satisfaction.satisfaction_logit_temperature), 1e-6)
-        expected = float(np.tanh(logit / temp))
-        p = (expected + 1.0) / 2.0
-        alpha = p * self._satisfaction_kappa + 1.0
-        beta = (1.0 - p) * self._satisfaction_kappa + 1.0
+        p = float(np.tanh(logit / temp))
+        # Rescale tanh output from [-1,1] to [0,1] for Beta params.
+        # Use alpha=p*kappa, beta=(1-p)*kappa without the +1 Laplace offset so
+        # E[Beta(p*k, (1-p)*k)] = p exactly — satisfaction reaches near ±1 for
+        # strong preferences. p is clamped to keep alpha,beta strictly positive.
+        p = float(np.clip((p + 1.0) / 2.0, 1e-6, 1.0 - 1e-6))
+        alpha = p * self._satisfaction_kappa
+        beta = (1.0 - p) * self._satisfaction_kappa
         p_sampled = self._rng.beta(alpha, beta)
         return float(np.clip(2.0 * p_sampled - 1.0, -1.0, 1.0))
 
@@ -400,6 +459,7 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
         if not self._added:
             info.update({
                 "satisfaction": 0.0,
+                "user_satisfaction": 0.0,
                 "preferred_actor": None,
                 "last_spice": None,
                 "last_actor": None,
@@ -411,6 +471,7 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
             last_spice = self._added[-1]
             info.update({
                 "satisfaction": self._last_satisfaction,
+                "user_satisfaction": self._last_satisfaction,
                 "preferred_actor": self._hidden_spec.preferred_actor[last_spice],
                 "last_spice": last_spice,
                 "last_actor": self._last_actor,

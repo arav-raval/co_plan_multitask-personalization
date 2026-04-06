@@ -632,6 +632,8 @@ class OvercookedPreferenceModel:
         signs_by_dim, scores_by_dim, phi_by_dim = self._build_psi_inputs(human_id)
 
         m_psi = self._psi_m[human_id]
+        if not m_psi.requires_grad:
+            m_psi = m_psi.detach().clone().requires_grad_(True)
         optimizer_psi = optim.Adam([m_psi], lr=self.lr_phi)
         for _ in range(self.n_phi_steps):
             optimizer_psi.zero_grad()
@@ -644,6 +646,8 @@ class OvercookedPreferenceModel:
                 log_sigma_obs=self.log_sigma_obs.detach(),
                 task_logit_temperature=self.task_logit_temperature,
             )
+            if not elbo.requires_grad:
+                break
             (-elbo).backward()
             optimizer_psi.step()
         self._psi_m[human_id] = m_psi
@@ -660,6 +664,8 @@ class OvercookedPreferenceModel:
         signs_by_dim, scores_by_dim, phi_by_dim = self._build_psi_inputs(human_id)
 
         m_psi_running = self._running_psi_m[human_id]
+        if not m_psi_running.requires_grad:
+            m_psi_running = m_psi_running.detach().clone().requires_grad_(True)
         n_steps = max(1, self.n_phi_steps // 2)
         optimizer = optim.Adam([m_psi_running], lr=self.lr_phi)
         for _ in range(n_steps):
@@ -673,6 +679,8 @@ class OvercookedPreferenceModel:
                 log_sigma_obs=self.log_sigma_obs.detach(),
                 task_logit_temperature=self.task_logit_temperature,
             )
+            if not elbo.requires_grad:
+                break
             (-elbo).backward()
             optimizer.step()
         self._running_psi_m[human_id] = m_psi_running

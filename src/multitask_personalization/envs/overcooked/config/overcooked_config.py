@@ -55,8 +55,8 @@ class HBMConfig:
 
     # Vector psi: per-episode session-offset vector.
     # psi_dim should equal len(subtasks) for the layout being trained on,
-    # or be set explicitly here.  Default 6 covers the full ALL_SUBTASKS list.
-    psi_dim: int = 6
+    # or be set explicitly here.  Default 5 covers the full ALL_SUBTASKS list.
+    psi_dim: int = 5
 
     # Prior std for each psi dimension.  Fixed (not learned) to prevent
     # psi prior collapse, same reasoning as scalar-psi in spices.

@@ -1,0 +1,8 @@
+defaults:
+  - ours
+
+# Flat Beta-Bernoulli model: no hierarchy across recipes or humans.
+# Ablates Claims 2 & 3 (cross-recipe and cross-human transfer).
+preference_model_type: flat
+explore_method: exploit-only
+mood_learning_enabled: false

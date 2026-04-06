@@ -34,7 +34,7 @@ from multitask_personalization.envs.overcooked.layouts import ALL_SUBTASKS
 # Helpers
 # ---------------------------------------------------------------------------
 
-SUBTASKS = ["fetch_onion", "fetch_dish", "chop", "deliver"]
+SUBTASKS = ["fetch_ingredient", "load_pot", "fetch_dish", "deliver"]
 LAYOUT = "CrampedRoom"
 LAYOUT2 = "CoordinationRing"
 
@@ -92,12 +92,12 @@ class TestRegistration:
 
     def test_observe_buffers_data(self):
         hbm = make_hbm()
-        hbm.observe(DEFAULT_HUMAN, LAYOUT, "chop", "human", 0.7)
+        hbm.observe(DEFAULT_HUMAN, LAYOUT, "load_pot", "human", 0.7)
         assert len(hbm._episode_data[DEFAULT_HUMAN]) == 1
 
     def test_end_episode_clears_buffer(self):
         hbm = make_hbm()
-        hbm.observe(DEFAULT_HUMAN, LAYOUT, "chop", "human", 0.7)
+        hbm.observe(DEFAULT_HUMAN, LAYOUT, "load_pot", "human", 0.7)
         hbm.end_episode(DEFAULT_HUMAN)
         assert len(hbm._episode_data[DEFAULT_HUMAN]) == 0
 
@@ -107,7 +107,7 @@ class TestPhiConvergence:
         """After many episodes of human actor + positive score, phi > 0."""
         hbm = make_hbm()
         phi_means = run_episodes(
-            hbm, LAYOUT, "chop", "human", n_episodes=30, score_mean=0.8
+            hbm, LAYOUT, "load_pot", "human", n_episodes=30, score_mean=0.8
         )
         # phi should become positive (human preferred)
         assert phi_means[-1] > 0.0, f"phi did not converge to positive: {phi_means[-1]:.3f}"
@@ -116,16 +116,16 @@ class TestPhiConvergence:
         """After many episodes of robot actor + positive score, phi < 0."""
         hbm = make_hbm()
         phi_means = run_episodes(
-            hbm, LAYOUT, "deliver", "robot", n_episodes=30, score_mean=0.8
+            hbm, LAYOUT, "fetch_ingredient", "robot", n_episodes=30, score_mean=0.8
         )
         assert phi_means[-1] < 0.0, f"phi did not converge to negative: {phi_means[-1]:.3f}"
 
     def test_phi_variance_decreases_with_more_observations(self):
         hbm = make_hbm()
         hbm.register_layout(DEFAULT_HUMAN, LAYOUT)
-        var_before = hbm.get_phi_var(DEFAULT_HUMAN, LAYOUT, "chop")
-        run_episodes(hbm, LAYOUT, "chop", "human", n_episodes=20, score_mean=0.8)
-        var_after = hbm.get_phi_var(DEFAULT_HUMAN, LAYOUT, "chop")
+        var_before = hbm.get_phi_var(DEFAULT_HUMAN, LAYOUT, "load_pot")
+        run_episodes(hbm, LAYOUT, "load_pot", "human", n_episodes=20, score_mean=0.8)
+        var_after = hbm.get_phi_var(DEFAULT_HUMAN, LAYOUT, "load_pot")
         assert var_after < var_before, (
             f"Variance did not decrease: {var_before:.4f} → {var_after:.4f}"
         )
@@ -138,7 +138,7 @@ class TestVectorPsiReset:
         hbm = make_hbm()
         # Build up psi by running a session with extreme scores
         for _ in range(8):
-            hbm.observe(DEFAULT_HUMAN, LAYOUT, "chop", "human", 0.95)
+            hbm.observe(DEFAULT_HUMAN, LAYOUT, "load_pot", "human", 0.95)
         hbm.end_episode(DEFAULT_HUMAN)
         psi_vec = hbm.get_psi_vec(DEFAULT_HUMAN)
         # After decay, all dimensions should be small in magnitude
@@ -149,7 +149,7 @@ class TestVectorPsiReset:
         """Running psi should be zeroed at the start of each episode."""
         hbm = make_hbm()
         for _ in range(6):
-            hbm.observe(DEFAULT_HUMAN, LAYOUT, "deliver", "robot", -0.9)
+            hbm.observe(DEFAULT_HUMAN, LAYOUT, "fetch_ingredient", "robot", -0.9)
         hbm.end_episode(DEFAULT_HUMAN)  # resets running psi
         running = hbm.get_running_psi_vec(DEFAULT_HUMAN)
         assert all(abs(v) < 1e-6 for v in running), (
@@ -176,10 +176,10 @@ class TestVectorPsiAbsorbs:
         for _ in range(15):
             for _ in range(6):
                 s = float(np.clip(rng.normal(0.8, 0.1), -1.0, 1.0))
-                hbm.observe(DEFAULT_HUMAN, LAYOUT, "chop", "human", s)
+                hbm.observe(DEFAULT_HUMAN, LAYOUT, "load_pot", "human", s)
             hbm.end_episode(DEFAULT_HUMAN)
 
-        phi_after_neutral = hbm.get_phi(DEFAULT_HUMAN, LAYOUT, "chop")
+        phi_after_neutral = hbm.get_phi(DEFAULT_HUMAN, LAYOUT, "load_pot")
         assert phi_after_neutral > 0.1, (
             f"phi not positive after neutral episodes: {phi_after_neutral:.3f}"
         )
@@ -188,17 +188,17 @@ class TestVectorPsiAbsorbs:
         for _ in range(5):
             for _ in range(6):
                 s = float(np.clip(rng.normal(-0.7, 0.1), -1.0, 1.0))
-                hbm.observe(DEFAULT_HUMAN, LAYOUT, "chop", "human", s)
+                hbm.observe(DEFAULT_HUMAN, LAYOUT, "load_pot", "human", s)
             hbm.end_episode(DEFAULT_HUMAN)
 
         # Phase 3: recovery
         for _ in range(5):
             for _ in range(6):
                 s = float(np.clip(rng.normal(0.8, 0.1), -1.0, 1.0))
-                hbm.observe(DEFAULT_HUMAN, LAYOUT, "chop", "human", s)
+                hbm.observe(DEFAULT_HUMAN, LAYOUT, "load_pot", "human", s)
             hbm.end_episode(DEFAULT_HUMAN)
 
-        phi_after_recovery = hbm.get_phi(DEFAULT_HUMAN, LAYOUT, "chop")
+        phi_after_recovery = hbm.get_phi(DEFAULT_HUMAN, LAYOUT, "load_pot")
         # phi should still be positive (not flipped by fatigue)
         assert phi_after_recovery > 0.0, (
             f"phi corrupted by fatigued episodes: {phi_after_recovery:.3f}"
@@ -211,18 +211,18 @@ class TestRunningPsiVec:
         hbm = make_hbm()
         # Observations with very consistent positive scores → running psi should grow
         for _ in range(5):
-            hbm.observe(DEFAULT_HUMAN, LAYOUT, "chop", "human", 0.95)
+            hbm.observe(DEFAULT_HUMAN, LAYOUT, "load_pot", "human", 0.95)
         running = hbm.get_running_psi_vec(DEFAULT_HUMAN)
-        chop_dim = ALL_SUBTASKS.index("chop") if "chop" in ALL_SUBTASKS else 0
-        assert abs(running[chop_dim]) > 0.0 or any(abs(v) > 0.0 for v in running), (
+        load_dim = ALL_SUBTASKS.index("load_pot") if "load_pot" in ALL_SUBTASKS else 0
+        assert abs(running[load_dim]) > 0.0 or any(abs(v) > 0.0 for v in running), (
             f"Running psi is all zero after observations: {running}"
         )
 
     def test_running_psi_per_subtask_differs(self):
         """Observations for different subtasks should create different psi values."""
-        hbm = make_hbm(subtasks=["chop", "deliver"])
+        hbm = make_hbm(subtasks=["load_pot", "deliver"])
         for _ in range(6):
-            hbm.observe(DEFAULT_HUMAN, LAYOUT, "chop", "human", 0.95)
+            hbm.observe(DEFAULT_HUMAN, LAYOUT, "load_pot", "human", 0.95)
         for _ in range(6):
             hbm.observe(DEFAULT_HUMAN, LAYOUT, "deliver", "robot", 0.95)
         running = hbm.get_running_psi_vec(DEFAULT_HUMAN)
@@ -234,8 +234,8 @@ class TestPreferredActor:
     def test_preferred_actor_sign_matches_phi(self):
         """preferred_actor returns 'human' when phi + running_psi > 0."""
         hbm = make_hbm()
-        run_episodes(hbm, LAYOUT, "chop", "human", n_episodes=25, score_mean=0.8)
-        actor = hbm.preferred_actor(DEFAULT_HUMAN, LAYOUT, "chop")
+        run_episodes(hbm, LAYOUT, "load_pot", "human", n_episodes=25, score_mean=0.8)
+        actor = hbm.preferred_actor(DEFAULT_HUMAN, LAYOUT, "load_pot")
         assert actor == "human", f"Expected 'human', got '{actor}'"
 
     def test_log_prob_prefer_human_greater_after_human_episodes(self):
@@ -250,8 +250,8 @@ class TestPreferredActor:
     def test_log_prob_sums_to_approximately_one(self):
         hbm = make_hbm()
         hbm.register_layout(DEFAULT_HUMAN, LAYOUT)
-        lp_h = hbm.log_prob_prefer(DEFAULT_HUMAN, LAYOUT, "chop", "human")
-        lp_r = hbm.log_prob_prefer(DEFAULT_HUMAN, LAYOUT, "chop", "robot")
+        lp_h = hbm.log_prob_prefer(DEFAULT_HUMAN, LAYOUT, "load_pot", "human")
+        lp_r = hbm.log_prob_prefer(DEFAULT_HUMAN, LAYOUT, "load_pot", "robot")
         total = math.exp(lp_h) + math.exp(lp_r)
         assert abs(total - 1.0) < 0.05, f"Probabilities don't sum to 1: {total:.4f}"
 
@@ -260,14 +260,14 @@ class TestMultiSubtask:
     def test_different_subtasks_learned_independently(self):
         """Consistent observations for one subtask should not contaminate others."""
         hbm = make_hbm()
-        # Learn "chop" → human
-        run_episodes(hbm, LAYOUT, "chop", "human", n_episodes=20, score_mean=0.8)
+        # Learn "load_pot" → human
+        run_episodes(hbm, LAYOUT, "load_pot", "human", n_episodes=20, score_mean=0.8)
         # "deliver" → robot
         run_episodes(hbm, LAYOUT, "deliver", "robot", n_episodes=20, score_mean=0.8)
 
-        phi_chop = hbm.get_phi(DEFAULT_HUMAN, LAYOUT, "chop")
+        phi_load = hbm.get_phi(DEFAULT_HUMAN, LAYOUT, "load_pot")
         phi_deliver = hbm.get_phi(DEFAULT_HUMAN, LAYOUT, "deliver")
-        assert phi_chop > 0.0, f"chop phi should be positive: {phi_chop:.3f}"
+        assert phi_load > 0.0, f"load_pot phi should be positive: {phi_load:.3f}"
         assert phi_deliver < 0.0, f"deliver phi should be negative: {phi_deliver:.3f}"
 
 
@@ -278,24 +278,24 @@ class TestThetaTransfer:
         initialise phi_LAYOUT2 from theta (which has been updated from phi_LAYOUT).
         """
         hbm = make_hbm()
-        run_episodes(hbm, LAYOUT, "chop", "human", n_episodes=20, score_mean=0.8)
+        run_episodes(hbm, LAYOUT, "load_pot", "human", n_episodes=20, score_mean=0.8)
         hbm.flush_theta_mu()
 
-        theta_chop = hbm.get_theta(DEFAULT_HUMAN, "chop")
+        theta_load = hbm.get_theta(DEFAULT_HUMAN, "load_pot")
         # Register a second layout — phi initialised from theta
         hbm.register_layout(DEFAULT_HUMAN, LAYOUT2)
-        phi_new = hbm.get_phi(DEFAULT_HUMAN, LAYOUT2, "chop")
+        phi_new = hbm.get_phi(DEFAULT_HUMAN, LAYOUT2, "load_pot")
 
         # phi of new layout should be close to theta (cold-start transfer)
-        assert abs(phi_new - theta_chop) < 0.5, (
-            f"Cold-start phi {phi_new:.3f} too far from theta {theta_chop:.3f}"
+        assert abs(phi_new - theta_load) < 0.5, (
+            f"Cold-start phi {phi_new:.3f} too far from theta {theta_load:.3f}"
         )
 
 
 class TestLearnedSigmas:
     def test_learned_sigmas_return_reasonable_values(self):
         hbm = make_hbm()
-        run_episodes(hbm, LAYOUT, "chop", "human", n_episodes=10, score_mean=0.8)
+        run_episodes(hbm, LAYOUT, "load_pot", "human", n_episodes=10, score_mean=0.8)
         sigmas = hbm.get_learned_sigmas()
         for k, v in sigmas.items():
             assert v > 0, f"Sigma {k} not positive: {v}"

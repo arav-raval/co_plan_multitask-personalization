@@ -37,7 +37,8 @@ from multitask_personalization.envs.overcooked.overcooked_hbm import (
     OvercookedPreferenceModel,
 )
 
-SUBTASKS = CRAMPED_ROOM.subtasks
+from multitask_personalization.envs.overcooked.layouts import ALL_SUBTASKS as _ALL_SUBTASKS
+SUBTASKS = CRAMPED_ROOM.subtasks  # ["fetch_ingredient", "load_pot", "fetch_dish", "pickup_soup", "deliver"]
 LAYOUT = CRAMPED_ROOM.name
 
 
@@ -63,7 +64,7 @@ def make_csp_gen(
     return gen
 
 
-def make_obs(subtask: str | None = "chop") -> OvercookedState:
+def make_obs(subtask: str | None = "load_pot") -> OvercookedState:
     return OvercookedState(
         layout_name=LAYOUT,
         current_subtask=subtask,
@@ -118,7 +119,7 @@ class TestCSPSetup:
 
     def test_generate_cost_train_mode(self):
         gen = make_csp_gen(train=True, explore="max-entropy")
-        obs = make_obs()
+        obs = make_obs("load_pot")
         variables, _ = gen._generate_variables(obs)
         gen._pref_gen._current_layout_name = LAYOUT
         cost = gen._generate_cost(obs, variables)
@@ -126,7 +127,7 @@ class TestCSPSetup:
 
     def test_generate_cost_eval_mode(self):
         gen = make_csp_gen(train=False)
-        obs = make_obs()
+        obs = make_obs("load_pot")
         variables, _ = gen._generate_variables(obs)
         gen._pref_gen._current_layout_name = LAYOUT
         cost = gen._generate_cost(obs, variables)
@@ -143,10 +144,10 @@ class TestCSPSetup:
 class TestObserveTransition:
     def test_observe_transition_updates_hbm(self):
         gen = make_csp_gen()
-        obs = make_obs("chop")
+        obs = make_obs("load_pot")
         act = OvercookedAction(actor="human")
         next_obs = make_obs("deliver")
-        info = make_transition_info("chop", "human", 0.7)
+        info = make_transition_info("load_pot", "human", 0.7)
 
         gen.observe_transition(obs, act, next_obs, done=False, info=info)
 
@@ -155,10 +156,10 @@ class TestObserveTransition:
 
     def test_observe_transition_done_clears_buffer(self):
         gen = make_csp_gen()
-        obs = make_obs("chop")
+        obs = make_obs("load_pot")
         act = OvercookedAction(actor="human")
         next_obs = make_obs(None)
-        info = make_transition_info("chop", "human", 0.7)
+        info = make_transition_info("load_pot", "human", 0.7)
 
         gen.observe_transition(obs, act, next_obs, done=True, info=info)
 
@@ -172,7 +173,7 @@ class TestObserveTransition:
             next_obs = make_obs(SUBTASKS[(i + 1) % len(SUBTASKS)])
             info = make_transition_info(st, "human", 0.8)
             gen.observe_transition(
-                obs, OvercookedAction("human"), next_obs, done=False, info=info
+                obs, OvercookedAction(actor="human"), next_obs, done=False, info=info
             )
 
         # All subtasks should be buffered
@@ -204,12 +205,12 @@ class TestPreferenceSnapshot:
         for _ in range(20):
             for _ in range(6):
                 score = float(np.clip(rng.normal(0.8, 0.1), -1.0, 1.0))
-                hbm.observe(DEFAULT_HUMAN, LAYOUT, "chop", "human", score)
+                hbm.observe(DEFAULT_HUMAN, LAYOUT, "load_pot", "human", score)
             hbm.end_episode(DEFAULT_HUMAN)
 
         snapshot = gen.get_pref_snapshot()
-        assert snapshot["chop"]["human"] > 0.5, (
-            f"P(human|chop) should be > 0.5, got {snapshot['chop']['human']}"
+        assert snapshot["load_pot"]["human"] > 0.5, (
+            f"P(human|load_pot) should be > 0.5, got {snapshot['load_pot']['human']}"
         )
 
 

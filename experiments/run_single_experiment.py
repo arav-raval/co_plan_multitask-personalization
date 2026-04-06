@@ -18,9 +18,45 @@ from multitask_personalization.methods.approach import BaseApproach
 # Environments that support preference shifts
 PREFERENCE_SHIFT_ENVS = ["cooking-nonstationary"]
 
+# Episodic Gymnasium envs that return terminated=True and require reset() before the
+# next step (e.g. SpiceEnv). Without this, training stays on a terminal observation and
+# the CSP policy recomputes every step.
+EPISODIC_RESET_TRAIN_ENVS = ["spices"]
+
+_EXPERIMENT_CONF_DIR = Path(__file__).resolve().parent / "conf"
+
+
+def _force_enumeration_csp_for_spices(cfg: DictConfig) -> None:
+    """Binary spice assignment needs EnumerationCSPSolver; root defaults use RandomWalk.
+
+    Hydra 1.3 does not allow ``override /csp_solver`` from ``env/spices.yaml`` (nested
+    package resolves to ``env.csp_solver``, which clashes with the env tuning dict).
+    """
+    if cfg.get("env_name") != "spices":
+        return
+    target = str(OmegaConf.select(cfg, "csp_solver._target_") or "")
+    if "EnumerationCSPSolver" in target:
+        return
+    enum_path = _EXPERIMENT_CONF_DIR / "csp_solver" / "enumeration.yaml"
+    logging.info(
+        "env=spices: switching CSP solver to EnumerationCSPSolver (binary domain; "
+        "Hydra cannot override root csp_solver from env YAML)."
+    )
+    cfg.csp_solver = OmegaConf.merge(
+        OmegaConf.load(enum_path),
+        OmegaConf.create({"seed": cfg.seed}),
+    )
+
+
+def _sync_spices_scene_spec(approach: BaseApproach, env: gym.Env) -> None:
+    """Multi-dish SpiceEnv replaces ``scene_spec`` on reset; keep the approach in sync."""
+    approach._scene_spec = env.unwrapped.scene_spec  # type: ignore[attr-defined]  # pylint: disable=protected-access
+
 
 @hydra.main(version_base=None, config_name="config", config_path="conf/")
 def _main(cfg: DictConfig) -> None:
+
+    _force_enumeration_csp_for_spices(cfg)
 
     logging.info(
         f"Running seed={cfg.seed}, env={cfg.env_name}, approach={cfg.approach_name}"
@@ -99,10 +135,11 @@ def _main(cfg: DictConfig) -> None:
 
     # Catch any exceptions so we can debug from the last saved state.
     try:
-        # Reset the training environment, one time only.
+        # Initial reset of training environment and approach.
         obs, info = train_env.reset()
-        # Reset the training approach, one time only.
         train_approach.reset(obs, info)
+        if cfg.env_name == "spices":
+            _sync_spices_scene_spec(train_approach, train_env)
         # Main training and eval loop.
         for t in range(cfg.env.max_environment_steps + 1):
             if t % cfg.train_logging_interval == 0:
@@ -127,17 +164,48 @@ def _main(cfg: DictConfig) -> None:
                             train_env._hidden_spec.meal_preference_model  # pylint: disable=protected-access
                         )
                 # Run evaluation.
-                step_eval_metrics = _evaluate_approach(
-                    eval_approach,
-                    eval_env,
-                    cfg,
-                    t,
-                    (
-                        shift_occurred_since_last_eval
-                        if cfg.env_name in PREFERENCE_SHIFT_ENVS
-                        else False
-                    ),
-                )
+                if cfg.env_name == "spices":
+                    neutral_eval = _evaluate_approach(
+                        eval_approach,
+                        eval_env,
+                        cfg,
+                        t,
+                        (
+                            shift_occurred_since_last_eval
+                            if cfg.env_name in PREFERENCE_SHIFT_ENVS
+                            else False
+                        ),
+                        force_neutral_mood=True,
+                        metric_prefix="neutral_",
+                        include_metadata=True,
+                    )
+                    natural_eval = _evaluate_approach(
+                        eval_approach,
+                        eval_env,
+                        cfg,
+                        t,
+                        (
+                            shift_occurred_since_last_eval
+                            if cfg.env_name in PREFERENCE_SHIFT_ENVS
+                            else False
+                        ),
+                        force_neutral_mood=False,
+                        metric_prefix="natural_",
+                        include_metadata=False,
+                    )
+                    step_eval_metrics = {**neutral_eval, **natural_eval}
+                else:
+                    step_eval_metrics = _evaluate_approach(
+                        eval_approach,
+                        eval_env,
+                        cfg,
+                        t,
+                        (
+                            shift_occurred_since_last_eval
+                            if cfg.env_name in PREFERENCE_SHIFT_ENVS
+                            else False
+                        ),
+                    )
                 if cfg.wandb.enable:
                     wandb_metrics = {
                         f"eval/{k}": v for k, v in step_eval_metrics.items()
@@ -156,11 +224,20 @@ def _main(cfg: DictConfig) -> None:
                 break
             # Continue training.
             act = train_approach.step()
-            obs, rew, _, _, info = train_env.step(act)
+            obs, rew, env_terminated, env_truncated, info = train_env.step(act)
             assert np.isclose(rew, 0.0)
-            # During training, there is no such thing as termination.
-            terminated = False
-            train_approach.update(obs, float(rew), terminated, info)
+            # Preserve episodic termination for envs like spices so learning modules
+            # can run end-of-episode updates (e.g., HBM phi/theta propagation).
+            done_for_learning = bool(env_terminated or env_truncated)
+            train_approach.update(obs, float(rew), done_for_learning, info)
+
+            if cfg.env_name in EPISODIC_RESET_TRAIN_ENVS and (
+                env_terminated or env_truncated
+            ):
+                obs, info = train_env.reset()
+                train_approach.reset(obs, info)
+                if cfg.env_name == "spices":
+                    _sync_spices_scene_spec(train_approach, train_env)
 
             # Track if any shift occurred during training
             preference_shift = False
@@ -226,38 +303,86 @@ def _evaluate_approach(
     cfg: DictConfig,
     training_step: int,
     shift_occurred_since_last_eval: bool,
+    force_neutral_mood: bool | None = None,
+    metric_prefix: str = "",
+    include_metadata: bool = True,
 ) -> dict[str, float]:
-    """Evaluate the given approach and return metrics."""
+    """Evaluate the given approach and return metrics.
+
+    Per-step ``user_satisfaction`` from the env is typically in ``[-1, 1]`` (e.g. spices).
+    Reported ``eval_episode_*_user_satisfaction`` values are the **sum** of that signal
+    over all env steps in the trial (so scale grows with episode length, roughly
+    ``[-T, T]`` for ``T`` steps). Use ``*_mean_step_user_satisfaction`` for a ``[-1, 1]``-ish
+    per-step average within each trial.
+    """
     # Evaluate for a given number of trials.
     cumulative_user_satisfactions: list[float] = []
+    eval_num_steps: list[int] = []
+    spices_episode_avg_satisfactions: list[float] = []
+    original_force_neutral: bool | None = None
+    if cfg.env_name == "spices" and force_neutral_mood is not None:
+        original_force_neutral = bool(eval_env.unwrapped._hidden_spec.force_neutral_mood)  # pylint: disable=protected-access
+        eval_env.unwrapped._hidden_spec.force_neutral_mood = force_neutral_mood  # pylint: disable=protected-access
+
     logging.info("Starting evaluation")
-    for eval_trial_idx in range(cfg.env.num_eval_trials):
-        seed = cfg.seed + cfg.eval_seed_offset + eval_trial_idx
-        obs, info = eval_env.reset(seed=seed)
-        # Reset the approach.
-        eval_approach.reset(obs, info)
-        # Main eval loop.
-        cumulative_user_satisfaction = 0.0
-        for _ in range(cfg.env.max_eval_episode_length):
-            act = eval_approach.step()
-            obs, rew, terminated, truncated, info = eval_env.step(act)
-            assert np.isclose(float(rew), 0.0)
-            eval_approach.update(obs, float(rew), terminated, info)
-            user_satisfaction = info.get("user_satisfaction", 0.0)
-            cumulative_user_satisfaction += user_satisfaction
-            if terminated or truncated:
-                break
-        cumulative_user_satisfactions.append(cumulative_user_satisfaction)
-    step_eval_metrics: dict[str, float] = {
-        "training_step": training_step,
-        "training_execution_time": training_step * cfg.env.dt,
-        "preference_shift": shift_occurred_since_last_eval,
-    }
+    try:
+        for eval_trial_idx in range(cfg.env.num_eval_trials):
+            seed = cfg.seed + cfg.eval_seed_offset + eval_trial_idx
+            obs, info = eval_env.reset(seed=seed)
+            # Reset the approach.
+            eval_approach.reset(obs, info)
+            if cfg.env_name == "spices":
+                _sync_spices_scene_spec(eval_approach, eval_env)
+            # Main eval loop.
+            cumulative_user_satisfaction = 0.0
+            n_steps = 0
+            for _ in range(cfg.env.max_eval_episode_length):
+                act = eval_approach.step()
+                obs, rew, terminated, truncated, info = eval_env.step(act)
+                assert np.isclose(float(rew), 0.0)
+                eval_approach.update(obs, float(rew), terminated, info)
+                user_satisfaction = info.get("user_satisfaction", 0.0)
+                cumulative_user_satisfaction += user_satisfaction
+                n_steps += 1
+                if terminated or truncated:
+                    break
+            if cfg.env_name == "spices":
+                spices_episode_avg_satisfactions.append(
+                    float(info.get("average_satisfaction", np.nan))
+                )
+            cumulative_user_satisfactions.append(cumulative_user_satisfaction)
+            eval_num_steps.append(n_steps)
+    finally:
+        if cfg.env_name == "spices" and original_force_neutral is not None:
+            eval_env.unwrapped._hidden_spec.force_neutral_mood = original_force_neutral  # pylint: disable=protected-access
+
+    step_eval_metrics: dict[str, float] = {}
+    if include_metadata:
+        step_eval_metrics.update(
+            {
+                "training_step": training_step,
+                "training_execution_time": training_step * cfg.env.dt,
+                "preference_shift": shift_occurred_since_last_eval,
+            }
+        )
+    mean_step_per_trial: list[float] = []
     for idx, cus in enumerate(cumulative_user_satisfactions):
-        step_eval_metrics[f"eval_episode_{idx}_user_satisfaction"] = cus
-    step_eval_metrics["eval_mean_user_satisfaction"] = float(
+        ns = eval_num_steps[idx]
+        step_eval_metrics[f"{metric_prefix}eval_episode_{idx}_user_satisfaction"] = cus
+        step_eval_metrics[f"{metric_prefix}eval_episode_{idx}_num_steps"] = float(ns)
+        mstep = float(cus / ns) if ns > 0 else float("nan")
+        step_eval_metrics[f"{metric_prefix}eval_episode_{idx}_mean_step_user_satisfaction"] = mstep
+        mean_step_per_trial.append(mstep)
+    step_eval_metrics[f"{metric_prefix}eval_mean_user_satisfaction"] = float(
         np.mean(cumulative_user_satisfactions)
     )
+    step_eval_metrics[f"{metric_prefix}eval_mean_user_satisfaction_per_step"] = float(
+        np.nanmean(mean_step_per_trial)
+    )
+    if cfg.env_name == "spices" and spices_episode_avg_satisfactions:
+        step_eval_metrics[f"{metric_prefix}eval_mean_episode_average_satisfaction"] = float(
+            np.nanmean(spices_episode_avg_satisfactions)
+        )
     return step_eval_metrics
 
 

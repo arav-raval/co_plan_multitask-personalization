@@ -1,0 +1,8 @@
+defaults:
+  - ours
+
+# Original CBTL paper baseline: supervised logistic classifier per (human, spice).
+# No hierarchy, no psi, no mood handling. Direct paper comparison.
+preference_model_type: cbtl
+explore_method: exploit-only
+mood_learning_enabled: false

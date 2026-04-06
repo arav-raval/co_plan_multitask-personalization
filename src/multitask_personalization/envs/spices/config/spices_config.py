@@ -19,7 +19,7 @@ class HBMConfig:
     
     # Prior means and variances
     mu0: float = 0.0  # Global prior mean
-    sigma0: float = 1.0  # Global variance (σ₀²)
+    sigma0: float = 3.0  # Global variance (σ₀²) — wide so mu prior is nearly uninformative; allows theta to escape the mu=0 shrinkage that attenuates phi toward 0
     sigma_h: float = 1.0  # Human-level variance (σₕ²)
     sigma_r: float = 0.5  # Recipe-level variance (σᵣ²) — initialized at the hidden HBM's true sigma_r so phi posteriors narrow faster for borderline-magnitude spices
     sigma_obs: float = 1.0  # Observation variance (σ_obs²)
@@ -61,22 +61,52 @@ class HBMConfig:
 
     # Stage 2: session-level psi latent variable (transient offset).
     # psi ~ N(0, sigma_mood²) — prior std for the per-episode session offset.
-    # Smaller than base_satisfaction_bias (3.0) because psi only needs to cover
-    # deviations around phi, not the full preference magnitude. sigma_mood=2.0
-    # means a mood-shifted psi_true of ±3.0 is within 1.5 std of the prior.
+    # sigma_mood=4.0 keeps psi_true=±5.0 within 1.25 std of the prior, so the
+    # KL penalty doesn't resist large mood offsets too aggressively.
     # Note: q(psi) variance is fixed at sigma_mood² (not learned) to prevent
     # psi's uncertainty from inflating phi's variance through the theta optimizer.
-    sigma_mood: float = 0.5
+    # sigma_mood is the prior std for psi. It also sets the posterior std for psi
+    # (q_var == p_var == sigma_mood² — fixed, not learned). This means:
+    # - Larger sigma_mood → psi can roam further from 0, less KL resistance to
+    #   large mood values, but also more gradient noise into phi.
+    # - sigma_mood should be ~= psi_true_mood_mean_abs so psi_true sits within
+    #   ~1 std of the prior, keeping KL resistance manageable.
+    # Lowered from 2.0→1.2 to match reduced psi_true_mood_mean_abs and reduce
+    # mood's interference with nuanced phi learning.
+    sigma_mood: float = 2.0
 
-    # Stage 2: psi decay factor at episode end (aggressive reset toward 0).
-    # 0.05 means 95% of psi mean is discarded between episodes.
+    # psi_decay: fraction of psi mean retained between episodes (0.05 = 95% reset).
+    # After end_episode, psi_m *= psi_decay. This ensures psi stays transient:
+    # persistent signals accumulate in phi, not psi. Too high → psi bleeds across
+    # episodes. Too low → same as resetting to 0 each time (fine for identifiability).
     psi_decay: float = 0.05
 
-    # ELBO / optimizer runtime controls (kept in config for central tuning).
+    # ELBO / optimizer runtime controls.
     n_mc_samples: int = 8
-    n_phi_steps: int = 8  # increased from 8 — borderline-magnitude spices need more gradient steps to overcome Beta noise floor
+    # n_phi_steps: Adam steps on phi ELBO per episode. More steps = faster convergence
+    # but also more overfitting risk to recent episode's noise. 16 is a good balance.
+    n_phi_steps: int = 10
+    # n_psi_steps: Adam steps on psi ELBO per episode. Psi uses the same lr as phi
+    # (lr_phi), so it also converges slowly — this is intentional. If psi converges
+    # too fast (over-shoots to psi_true), phi gets zero residual and learns nothing.
+    # The partial-convergence of psi is what preserves phi's identifiability.
+    # Reduced from 16→8: the psi ELBO is a scalar KL bowl and converges quickly;
+    # fewer steps halve the MC gradient noise injected into phi on neutral episodes.
+    n_psi_steps: int = 10
+
+    # Mood confidence threshold for skipping the psi ELBO entirely.
+    # If the neutral mood posterior exceeds this value at episode end, the episode
+    # is confidently neutral (psi_true ≈ 0) and running the ELBO would only inject
+    # MC gradient noise into the psi mean — which then biases phi's update.
+    # At 0.85 the gate fires on ~80% of neutral episodes (posterior concentrates
+    # quickly) while always staying open for genuinely moody episodes where
+    # the neutral posterior stays low.  Set to 1.0 to disable.
+    psi_skip_neutral_threshold: float = 1.0
     n_theta_steps: int = 12
+    # lr_phi: Adam lr for phi and psi updates. Same rate for both keeps psi from
+    # racing ahead of phi and stealing the learning signal.
     lr_phi: float = 3e-2
+    lr_psi: float = 3e-2  # keep equal to lr_phi — psi must not outpace phi
     lr_theta: float = 1e-2
     lr_hyper: float = 5e-3
     log_var_min: float = math.log(1e-6)
@@ -87,9 +117,14 @@ class HBMConfig:
 class MoodConfig:
     """Configuration for Mood Inference."""
     
-    # Mood prior probabilities [all_self, neutral, none_self]
-    # Matches the generation distribution in MoodSpec.priors: 80% neutral, 10% each non-neutral
-    mood_prior: Tuple[float, float, float] = (0.1, 0.8, 0.1)
+    # Mood prior probabilities [all_self, neutral, none_self].
+    # Controls the fraction of training and eval episodes that are moody.
+    # Original was (0.1, 0.8, 0.1) — too few moody episodes for a clear gap.
+    # (0.25, 0.5, 0.25) gives 50% moody — enough contamination to separate methods,
+    # but combined with strong psi_true (2.0) it overwhelms nuanced phi learning.
+    # Reduced to (0.2, 0.6, 0.2): 60% neutral gives cleaner phi signal for nuanced spices,
+    # while 40% moody episodes still provide enough mood signal to reward mood inference.
+    mood_prior: Tuple[float, float, float] = (0.25, 0.6, 0.25)
     
     # Mood inference smoothing
     mood_smoothing_alpha: float = 0.3  # EMA smoothing (30% new info, 70% old)
@@ -114,11 +149,26 @@ class MoodConfig:
     # Env-only Stage 2 generative parameters for psi_true (sampled once/episode).
     # Keep these independent from base_satisfaction_bias so mood strength can be tuned
     # without changing the stable per-spice preference margin.
-    psi_true_mood_mean_abs: float = 3.0
+    # Mood signal: psi_true ~ N(±5.0, 0.5) for non-neutral episodes.
+    # Strong enough that without_mood_learning is severely degraded on moody episodes,
+    # while with_mood_learning infers psi and compensates.
+    # psi_true_mood_mean_abs: the ground-truth mood offset magnitude for non-neutral
+    # episodes. psi_true ~ N(±psi_true_mood_mean_abs, psi_true_mood_std²).
+    # This shifts satisfaction by tanh(phi + psi_true) — tanh(phi).
+    # At phi≈0 and psi_true=2.0: satisfaction shifts from 0.0 to tanh(2.0)=0.96.
+    # Too large → psi absorbs everything and phi gets zero gradient.
+    # Too small → without_mood_learning barely degrades, gap is not meaningful.
+    # 2.0 was calibrated so that: (a) with_mood_learning can infer psi and still
+    # learn phi correctly from the residual, and (b) without_mood_learning degrades
+    # noticeably because psi_true=2.0 shifts ~40% of spice assignments.
+    # Reduced to 1.2: mood still contaminates enough to reward learning it, but
+    # nuanced spices (|phi|≈0.5) are no longer drowned out by mood contamination.
+    # At psi_true=1.2 and phi=0.5: tanh(1.7)=0.94 (moody) vs tanh(0.5)=0.46 (neutral)
+    # — mood still clearly shifts behavior, but phi signal remains recoverable.
+    psi_true_mood_mean_abs: float = 2.0
     psi_true_mood_std: float = 0.5
-    # Neutral-specific psi_true std. Keeping this smaller than non-neutral std
-    # helps neutral episodes remain close to psi_true≈0 for cleaner phi learning.
-    psi_true_neutral_std: float = 0.2
+    # Neutral episode psi_true std: small so neutral episodes give clean phi signal.
+    psi_true_neutral_std: float = 0.25
 
 
 @dataclass(frozen=True)
@@ -134,7 +184,9 @@ class SatisfactionConfig:
     """Configuration for Satisfaction Computation."""
     
     # Base satisfaction bias (strength of preference signal)
-    base_satisfaction_bias: float = 1.5
+    # Increased from 1.5 → 2.0 to raise the tanh ceiling for weak-magnitude spices
+    # (|theta|=0.5 now gives tanh(2.0*0.5)=0.76 vs tanh(1.5*0.5)=0.64).
+    base_satisfaction_bias: float = 2.0
     # Temperature for tanh(logit / T) in env generation and HBM sat likelihood.
     # T>1 reduces saturation so large |phi| values remain distinguishable.
     satisfaction_logit_temperature: float = 1.0
