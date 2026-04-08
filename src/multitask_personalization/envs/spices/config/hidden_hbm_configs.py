@@ -381,35 +381,54 @@ SPICE_SPECIFIC_HUMAN_MID_STOCHASTIC = HiddenHBMConfig(
     stochastic_preferences=True,
 )
 
-# Recipe-conflicting variant (Option A): per-recipe phi overrides flip the sign of
-# 8 spices across the 4-recipe pool (UltraComplexFeast, AsianFusionBowl,
-# IndianFeastComplex, MediterraneanComplex).
+# Recipe-conflicting variant: per-recipe phi overrides model a realistic persona
+# whose spice handling preferences vary by cuisine familiarity.
+#
+# Persona narrative:
+#   A home cook confident in Mediterranean and pan-fusion cooking, but less
+#   experienced with Indian and Asian cuisines.  They want to personally handle
+#   spices they know well in familiar cuisines (positive phi → "human"), but
+#   defer to the robot (negative phi → "robot") in unfamiliar ones where the
+#   robot's trained recipes are more reliable.
+#
+#   For example, they insist on personally seasoning with cumin in a
+#   Mediterranean or fusion context (they know the right amount), but defer
+#   to the robot in an Asian stir-fry (where the balance with soy sauce and
+#   ginger is less intuitive to them).  Similarly, they're precise about
+#   yogurt in a fusion dish but defer in Indian curry where tempering yogurt
+#   requires technique they haven't mastered.
 #
 # Design principles:
-#  - Conflicted spices appear in 2+ recipes so CBTL sees contradictory labels and
-#    its shared w[spice] is driven toward ~0 (chance performance on those spices).
-#  - The HBM's per-recipe phi learns the correct sign independently for each recipe.
-#  - "Anchor" spices (salt, garlic, pepper, ginger, chili) are intentionally kept
-#    consistent across all recipes so both methods can anchor on a stable signal;
-#    this makes the evaluation fair rather than adversarial.
-#  - Conflict magnitudes match the strong (2×) scale of the theta generator so the
-#    signal-to-noise ratio is the same as non-conflicted strong spices.
+#   - Conflicts span all preference bands (strong, mid, weak) for thorough
+#     evaluation — not just strong flips, which would be unrealistically stark.
+#   - Asymmetric magnitudes: the override is not always a full sign flip.
+#     Deference in unfamiliar cuisines (-1.0 to -1.5) is weaker than
+#     confidence in familiar ones (+1.5 to +2.0) — the cook has opinions
+#     but is cautious rather than averse.
+#   - Anchor spices (salt, garlic, pepper, ginger, chili) are kept consistent
+#     across all recipes so both CBTL and HBM have a stable learning signal.
+#   - The theta_generator uses 2× (strong) magnitudes.  This raises the
+#     satisfaction ceiling (E[tanh(|phi|)] ≈ 0.90 vs 0.70 at 1×) while keeping
+#     the same narrative.  Override magnitudes are scaled proportionally so the
+#     relative conflict structure is preserved.
 #
-# Conflict table (all values are phi_true for that recipe; blanks = global theta):
+# Conflict table (overrides only — blanks inherit from global θ at 2× scale):
 #
-#  Spice        | Ultra  | Asian  | Indian | Mediterr | Global θ
-#  -------------|--------|--------|--------|----------|----------
-#  cumin        |  +2.0  |  -2.0  |  +2.0  |   +2.0   |  +2.0
-#  turmeric     |  +1.0  |  -2.0  |  -1.0  |    —     |  +1.0
-#  cinnamon     |  +1.0  |  +1.0  |  -1.0  |    —     |  +1.0
-#  coriander    |  +1.6  |  -1.6  |  -1.6  |   +1.6   |  +1.6
-#  onion        |  +2.0  |  -2.0  |  -2.0  |   +2.0   |  +2.0
-#  paprika      |  +1.6  |  -1.6  |    —   |   +1.6   |  +1.6
-#  honey        |  +2.0  |  -2.0  |    —   |    —     |  +2.0
-#  yogurt       |  +1.0  |    —   |  -1.0  |    —     |  +1.0
+#  Band   | Spice      | Ultra  | Asian  | Indian | Mediter | Global θ | Rationale
+#  -------|------------|--------|--------|--------|---------|----------|----------
+#  strong | cumin      |  +2.0  |  -3.0  |  -2.0  |  +3.0   |  +2.0   | Confident in Med/fusion cumin, defers in Asian/Indian amounts
+#  strong | onion      |  +2.0  |  -3.0  |  -3.0  |  +3.0   |  +2.0   | Knows Med onion prep; unfamiliar with Asian/Indian technique
+#  strong | honey      |  +2.0  |  -3.0  |   —    |   —     |  +2.0   | Precise about fusion glaze, defers to robot for Asian balance
+#  mid    | coriander  |  +1.6  |  -2.0  |  -1.6  |  +2.0   |  +1.6   | Fresh cilantro vs ground coriander — different per cuisine
+#  mid    | paprika    |  +1.6  |  -1.6  |   —    |  +2.0   |  +1.6   | Smoked paprika in Med/fusion (personal), Asian chili blend (defers)
+#  mid    | turmeric   |  +1.0  |  -2.0  |  -1.0  |   —     |  +1.0   | Mild preference globally; defers in Asian (staining concerns)
+#  weak   | yogurt     |  +1.0  |   —    |  -1.6  |   —     |  +1.0   | Fusion raita (personal) vs Indian curry tempering (defers)
+#  weak   | cinnamon   |  +1.0  |  +1.0  |  -1.0  |   —     |  +1.0   | Sweet/baking contexts (positive) vs Indian savory (defers)
 #
-# CBTL: shared w averages contradictory gradients → w≈0 → chance on all 8 spices.
-# HBM:  per-recipe phi correctly tracks each recipe's true direction → high accuracy.
+# CBTL impact: shared w[spice] averages contradictory labels → w≈0 on all
+#   8 conflict spices, producing ~50% accuracy on them regardless of training.
+# HBM impact: per-recipe phi tracks each cuisine's direction independently,
+#   learning that cumin is "human" in Mediterranean but "robot" in Asian.
 SPICE_SPECIFIC_HUMAN_RECIPE_CONFLICT = HiddenHBMConfig(
     name="SpiceSpecificHumanRecipeConflict",
     theta_mean={},
@@ -418,19 +437,32 @@ SPICE_SPECIFIC_HUMAN_RECIPE_CONFLICT = HiddenHBMConfig(
     theta_generator=_spice_specific_theta_strong,
     recipe_theta_overrides={
         "AsianFusionBowl": {
-            "cumin":     -2.0,
-            "turmeric":  -2.0,
-            "coriander": -1.6,
-            "onion":     -2.0,
+            # Strong: familiar spices become unfamiliar in Asian context
+            "cumin":     -3.0,
+            "onion":     -3.0,
+            "honey":     -3.0,
+            # Mid: ground spice handling differs
+            "coriander": -2.0,
             "paprika":   -1.6,
-            "honey":     -2.0,
+            "turmeric":  -2.0,
         },
         "IndianFeastComplex": {
-            "cinnamon":  -1.0,
+            # Strong: Indian technique is different from familiar Western prep
+            "cumin":     -2.0,
+            "onion":     -3.0,
+            # Mid: Indian-specific handling
             "coriander": -1.6,
             "turmeric":  -1.0,
-            "onion":     -2.0,
-            "yogurt":    -1.0,
+            # Weak: technique-dependent preferences
+            "yogurt":    -1.6,
+            "cinnamon":  -1.0,
+        },
+        "MediterraneanComplex": {
+            # Boost: extra confident in Med cuisine — push above global theta
+            "cumin":     +3.0,
+            "onion":     +3.0,
+            "coriander": +2.0,
+            "paprika":   +2.0,
         },
     },
 )

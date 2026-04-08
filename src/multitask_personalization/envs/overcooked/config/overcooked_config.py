@@ -60,7 +60,10 @@ class HBMConfig:
 
     # Prior std for each psi dimension.  Fixed (not learned) to prevent
     # psi prior collapse, same reasoning as scalar-psi in spices.
-    sigma_session: float = 0.5
+    # Prior std for psi. Must be wide enough to absorb session effects
+    # (nonneutral_mean_abs=2.0) without the KL penalty pulling psi to 0
+    # and contaminating phi.
+    sigma_session: float = 2.0
 
     # Aggressive decay at episode end (same as spices psi_decay).
     psi_decay: float = 0.05
@@ -72,9 +75,9 @@ class HBMConfig:
 
     # ELBO optimizer
     n_mc_samples: int = 8
-    n_phi_steps: int = 8
+    n_phi_steps: int = 12
     n_theta_steps: int = 12
-    lr_phi: float = 3e-2
+    lr_phi: float = 5e-2
     lr_theta: float = 1e-2
     lr_hyper: float = 5e-3
     log_var_min: float = math.log(1e-6)
@@ -90,23 +93,36 @@ class SessionConfig:
 
     Since we use vector psi (no discrete mood categories), inference is
     purely through the ELBO — no Bayesian mood-posterior filter needed.
+
+    Session profiles
+    ----------------
+    Non-neutral sessions apply *differentiated* effects per subtask via
+    named session profiles (see config/session_profiles.py).  Each profile
+    defines per-subtask sensitivity weights controlling how strongly
+    fatigue/energy affects each subtask's claiming probability:
+
+        psi_true[d] ~ N(weight[d] * ±mean_abs, std²)
+
+    This makes vector psi strictly more expressive than scalar psi: a scalar
+    model cannot capture the heterogeneous session response across subtasks.
     """
 
     # Prior for session-level psi (one std per subtask dimension).
-    # Can be a single float (broadcast) or per-dimension.
     session_prior_std: float = 0.5
 
-    # Generative parameters for simulated session effects in the env.
-    # Per-episode psi_true is sampled as:
-    #   psi_true[d] ~ N(session_bias[d], session_std²)
-    # where session_bias is 0 for a neutral session, ±session_nonneutral_mean
-    # for a "tired" or "energised" session.
+    # Base magnitude of non-neutral session effects.
     session_nonneutral_mean_abs: float = 2.0
     session_nonneutral_std: float = 0.5
     session_neutral_std: float = 0.2
 
+    # Named session profile controlling per-subtask sensitivity weights.
+    # See config/session_profiles.py for available profiles and their semantics.
+    # "PhysicalFatigue" (default): physically demanding tasks more affected.
+    # "TiredOfWalking": navigation tasks heavily affected, stationary tasks spared.
+    # "Uniform": all tasks equally affected (equivalent to scalar psi baseline).
+    session_profile_name: str = "PhysicalFatigue"
+
     # Session type prior (probability of neutral vs. non-neutral session).
-    # Used by the environment to sample session type at episode start.
     prob_neutral_session: float = 0.8
 
 
@@ -114,8 +130,21 @@ class SessionConfig:
 class TaskConfig:
     """Configuration for the task-level feedback (satisfaction) model.
 
-    Replaces SatisfactionConfig.  In Overcooked, feedback is derived from
-    order-completion score (normalised to [-1, +1]).
+    Generates a continuous satisfaction signal in [-1, +1] that encodes
+    preference magnitude, session effects, and coordination quality.
+    Mirrors SatisfactionConfig from spices.
+
+    The generative model:
+        phi_latent = pref_sign * phi_mag
+        phi_mag    = |hidden_theta(subtask)| when available, else base_task_bias
+        logit      = actor_sign * (phi_latent + psi_true[subtask_dim])
+        p          = (tanh(logit / T) + 1) / 2    maps logit to (0, 1)
+        sat      ~ Beta(p * kappa, (1 - p) * kappa) rescaled to [-1, +1]
+
+    Coordination cost (additive penalty):
+        When the robot mispredicts (conflict or missed pass), coordination_cost
+        is subtracted.  This makes satisfaction sensitive to robot prediction
+        quality independently of preference strength.
     """
 
     # Preference signal strength (analogous to base_satisfaction_bias).
@@ -124,12 +153,20 @@ class TaskConfig:
     # Temperature for tanh(logit / T) mapping logit → expected score.
     task_logit_temperature: float = 1.0
 
-    # Concentration for Beta-distributed task score (higher = less noise).
+    # Concentration for Beta-distributed satisfaction (higher = less noise).
     task_beta_kappa: float = 10.0
 
+    # Flat penalty subtracted from satisfaction when robot mispredicts.
+    coordination_cost: float = 0.5
+
+    # Minimum-effort threshold: when the human has no preferred tasks available,
+    # they'll still accept a task if phi + psi > min_effort_threshold.
+    # -1.0 = very reluctant (only mildly disliked tasks)
+    # -3.0 = will do almost anything if necessary
+    # float('inf') = never does disliked tasks (pure preference-driven)
+    min_effort_threshold: float = -1.0
+
     # Normalisation range for raw Overcooked shaped reward → [-1, +1].
-    # Shaped reward per step is typically 0–20; clipping at max_shaped_reward
-    # and dividing by half-range gives the normalised satisfaction signal.
     max_shaped_reward: float = 20.0
 
 

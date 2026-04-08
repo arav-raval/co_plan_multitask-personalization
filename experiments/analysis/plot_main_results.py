@@ -11,27 +11,39 @@ from omegaconf import DictConfig
 
 ENV_TO_DISPLAY_NAME = {
     # "tiny": "Tiny",
-    "cooking-nonstationary": "Cooking (Non-Stationary)",
-    "cooking-stationary": "Cooking",
+    "spices": "Spice Assignment",
+    "overcooked": "Overcooked",
+    # "cooking-nonstationary": "Cooking (Non-Stationary)",
+    # "cooking-stationary": "Cooking",
     # "cleaning-stationary": "Cleaning",
     # "overnight-stationary": "Books",
 }
 
 APPROACH_TO_DISPLAY_NAME = {
-    "ours": "CBTL (Ours)",
+    # Spices comparison approaches
+    "ours": "HBM (Ours)",
+    "cbtl_classifier": "CBTL Classifier",
+    "flat_model": "Flat Bayesian",
+    "without_mood_learning": "HBM (no psi)",
+    "exploit_only": "Exploit Only",
+    # Legacy cooking approaches
     "nothing_personal": "Free Explore",
     "epsilon_greedy": "Epsilon Greedy",
-    "exploit_only": "Exploit Only",
     "no_learning": "No Learning",
 }
 
 # https://colorbrewer2.org/#type=diverging&scheme=Spectral&n=8
 APPROACH_TO_COLOR = {
+    # Spices comparison
     "ours": "#3288bd",
-    "nothing_personal": "#66c2a5",
-    "epsilon_greedy": "#abdda4",
-    "exploit_only": "#e6f598",
-    "no_learning": "#fee08b",
+    "cbtl_classifier": "#d53e4f",
+    "flat_model": "#f46d43",
+    "without_mood_learning": "#66c2a5",
+    "exploit_only": "#fee08b",
+    # Legacy cooking
+    "nothing_personal": "#abdda4",
+    "epsilon_greedy": "#e6f598",
+    "no_learning": "#fdae61",
 }
 
 # Colors for preference shift backgrounds
@@ -102,8 +114,7 @@ def _main(results_dir: Path, outfile: Path) -> None:
         zip(axes[0], ENV_TO_DISPLAY_NAME.items())
     ):
         ax.set_title(env_display_name)
-        ax.set_xlabel("Simulated Execution Time")
-        ax.set_ylim((-1.05, 1.05))
+        ax.set_xlabel("Training Steps")
 
         # Colored background sections for preference shifts
         if env_name == "cooking-nonstationary":
@@ -143,10 +154,19 @@ def _main(results_dir: Path, outfile: Path) -> None:
                 print(f"WARNING: no data found for {env_name}: {approach_name}")
                 continue
             check_for_missing_results(df)
+            # Use neutral_eval (forced neutral mood) as the primary metric for spices:
+            # it isolates learned phi from transient psi effects, giving the cleanest
+            # measure of preference learning quality. Fall back to eval_mean for
+            # legacy cooking environments that don't have the neutral/natural split.
+            y_col = (
+                "neutral_eval_mean_user_satisfaction"
+                if "neutral_eval_mean_user_satisfaction" in df.columns
+                else "eval_mean_user_satisfaction"
+            )
             line = sns.lineplot(
                 data=df,
                 x="training_execution_time",
-                y="eval_mean_user_satisfaction",
+                y=y_col,
                 estimator="mean",
                 errorbar="se",
                 ax=ax,
@@ -160,7 +180,7 @@ def _main(results_dir: Path, outfile: Path) -> None:
                 labels.append(approach_display_name)
 
         if i == 0:
-            ax.set_ylabel("Simulated User Satisfaction")
+            ax.set_ylabel("Cumulative Task Score (50 eval episodes)")
         else:
             ax.set_ylabel("")
 

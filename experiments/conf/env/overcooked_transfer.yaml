@@ -1,0 +1,31 @@
+# Multi-layout transfer test: train on CrampedRoom, eval on AsymmetricAdvantages.
+# The HBM's theta hierarchy should enable faster convergence on the eval layout
+# because preferences learned in CrampedRoom transfer via theta.
+env:
+  _target_: "multitask_personalization.envs.overcooked.overcooked_env.OvercookedEnv"
+  layout_spec:
+    _target_: "multitask_personalization.envs.overcooked.layouts.get_layout"
+    name: "CrampedRoom"
+  hidden_spec:
+    _target_: "multitask_personalization.envs.overcooked.overcooked_experiment.build_overcooked_hidden_spec"
+    layout_name: "CrampedRoom"
+    hidden_hbm_config_name: "RealisticCook"
+train_env: {}
+eval_env:
+  # Eval uses AsymmetricAdvantages — different layout, same human preferences.
+  layout_spec:
+    _target_: "multitask_personalization.envs.overcooked.layouts.get_layout"
+    name: "AsymmetricAdvantages"
+  hidden_spec:
+    _target_: "multitask_personalization.envs.overcooked.overcooked_experiment.build_overcooked_hidden_spec"
+    layout_name: "AsymmetricAdvantages"
+    hidden_hbm_config_name: "RealisticCook"
+max_environment_steps: 5000
+eval_frequency: 250
+max_eval_episode_length: 200
+num_eval_trials: 10
+dt: 0.01
+csp_solver:
+  max_iters: 2500
+  num_improvements: 500
+  max_improvement_attempts: 100

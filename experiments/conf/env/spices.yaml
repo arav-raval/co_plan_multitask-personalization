@@ -23,7 +23,7 @@ eval_env: {}
 # eval_frequency=500 gives 20 checkpoints; num_eval_trials=50 reduces natural eval variance.
 max_environment_steps: 5000
 eval_frequency: 250
-max_eval_episode_length: 40
+max_eval_episode_length: 50
 num_eval_trials: 50
 dt: 0.01
 csp_solver:

@@ -70,6 +70,9 @@ class SeedSeries:
     sign_accuracy_by_band: dict[str, dict[int, float]]
     # smoothed training satisfaction: step -> rolling mean
     train_satisfaction: dict[int, float]
+    # prediction accuracy: fraction of steps robot flag matched human behavior [0, 1]
+    neutral_pred_accuracy: dict[int, float]
+    natural_pred_accuracy: dict[int, float]
 
 
 def _mean_se(vals: list[float]) -> tuple[float, float]:
@@ -144,6 +147,29 @@ def _load_eval_satisfaction_series(
                 and row["natural_eval_mean_episode_average_satisfaction"] != ""
             ):
                 natural[step] = float(row["natural_eval_mean_episode_average_satisfaction"])
+    return neutral, natural
+
+
+def _load_eval_prediction_accuracy_series(
+    eval_csv_path: Path,
+) -> tuple[dict[int, float], dict[int, float]]:
+    """Return neutral and natural prediction accuracy series from eval CSV."""
+    neutral: dict[int, float] = {}
+    natural: dict[int, float] = {}
+    with eval_csv_path.open("r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            step = int(float(row["training_step"]))
+            if "neutral_eval_mean_prediction_accuracy" in row and row["neutral_eval_mean_prediction_accuracy"] != "":
+                try:
+                    neutral[step] = float(row["neutral_eval_mean_prediction_accuracy"])
+                except ValueError:
+                    pass
+            if "natural_eval_mean_prediction_accuracy" in row and row["natural_eval_mean_prediction_accuracy"] != "":
+                try:
+                    natural[step] = float(row["natural_eval_mean_prediction_accuracy"])
+                except ValueError:
+                    pass
     return neutral, natural
 
 
@@ -229,19 +255,23 @@ def _load_phi_from_checkpoint(ckpt: Path) -> dict[str, dict[str, float]] | None:
         return out
 
     # CBTLClassifierModel: w[human][spice], shared across recipes.
-    # Replicate the weight into every recipe in per_recipe_theta so the per-recipe
-    # averaging in the caller works correctly.
+    # Replicate the shared weight into every recipe so the per-recipe error
+    # computation compares CBTL's single w against each recipe's true phi
+    # (including recipe-specific overrides).  This is fair: the HBM is also
+    # evaluated per-recipe, and CBTL's structural limitation (no recipe-level
+    # split) should be visible as higher error on conflict spices.
     cbtl_path = ckpt / "cbtl_classifier.pkl"
     if cbtl_path.exists():
         with cbtl_path.open("rb") as f:
             state = pickle.load(f)
         w = state.get("w", {}).get(DEFAULT_HUMAN, {})
-        # We don't know which recipes exist here; the caller will only iterate over
-        # recipes that appear in human_phi, so we return a sentinel recipe key that
-        # the caller will not find in per_recipe_theta — it will then fall back to
-        # global_theta, which is the correct comparison target for CBTL (no recipe
-        # splits).  We use a fixed key "__global__" for this.
-        return {"__global__": {spice: float(w_val) for spice, w_val in w.items()}}
+        spice_vals = {spice: float(w_val) for spice, w_val in w.items()}
+        # Replicate into all known recipes.  We pull the recipe list from the
+        # experiment pool so every recipe gets a row, just like HBM checkpoints.
+        from multitask_personalization.envs.spices.spices_experiment import (
+            MULTI_RECIPE_EXPERIMENT_POOL,
+        )
+        return {recipe: dict(spice_vals) for recipe in MULTI_RECIPE_EXPERIMENT_POOL}
 
     return None
 
@@ -380,6 +410,7 @@ def _collect_seed_series(log_dir: Path, signal_threshold: float) -> list[SeedSer
         seed = int(cfg.get("seed", -1))
 
         neutral_satisfaction, natural_satisfaction = _load_eval_satisfaction_series(eval_csv)
+        neutral_pred_accuracy, natural_pred_accuracy = _load_eval_prediction_accuracy_series(eval_csv)
         train_satisfaction = _load_train_satisfaction_series(train_csv)
         global_theta, per_recipe_theta = _extract_true_theta_from_config(cfg)
         phi_mae, phi_rmse, tanh_phi_mae, sign_accuracy, sign_accuracy_by_band = (
@@ -402,6 +433,8 @@ def _collect_seed_series(log_dir: Path, signal_threshold: float) -> list[SeedSer
                 sign_accuracy=sign_accuracy,
                 sign_accuracy_by_band=sign_accuracy_by_band,
                 train_satisfaction=train_satisfaction,
+                neutral_pred_accuracy=neutral_pred_accuracy,
+                natural_pred_accuracy=natural_pred_accuracy,
             )
         )
     return all_series
@@ -435,33 +468,45 @@ def _aggregate_by_method(
 
 # Display names for methods (raw key -> formatted label)
 _METHOD_LABELS: dict[str, str] = {
-    "with_mood_learning":    "HBM (with mood learning)",
-    "without_mood_learning": "HBM (without mood learning)",
-    "flat_model":            "Flat Model",
-    "cbtl_classifier":       "CBTL Classifier",
+    "ours":                  "HBM (Ours)",
+    "with_mood_learning":    "HBM (with psi)",
+    "without_mood_learning": "HBM (Ours; no psi)",
+    "flat_model":            "Flat Bayesian",
+    "cbtl_classifier":       "CBTL",
+    "exploit_only":          "Exploit Only",
+    "no_learning":           "No Learning",
 }
 
 # Consistent color palette (colorblind-safe: Okabe-Ito)
 _METHOD_COLORS: dict[str, str] = {
+    "ours":                  "#0072B2",  # blue
     "with_mood_learning":    "#0072B2",  # blue
     "without_mood_learning": "#E69F00",  # amber
     "flat_model":            "#009E73",  # green
     "cbtl_classifier":       "#CC79A7",  # pink
+    "exploit_only":          "#D55E00",  # vermillion
+    "no_learning":           "#999999",  # grey
 }
 
 # Line styles to aid black-and-white printing
 _METHOD_LINESTYLES: dict[str, str] = {
+    "ours":                  "-",
     "with_mood_learning":    "-",
     "without_mood_learning": "--",
     "flat_model":            "-.",
     "cbtl_classifier":       ":",
+    "exploit_only":          (0, (3, 1, 1, 1)),
+    "no_learning":           (0, (5, 5)),
 }
 
 _METHOD_MARKERS: dict[str, str] = {
+    "ours":                  "o",
     "with_mood_learning":    "o",
     "without_mood_learning": "s",
     "flat_model":            "^",
     "cbtl_classifier":       "D",
+    "exploit_only":          "v",
+    "no_learning":           "x",
 }
 
 def _plot_timeseries(
@@ -604,10 +649,13 @@ def _plot_sign_accuracy_by_band(
 
     # Determine method order: prefer a canonical order, then alphabetical fallback.
     preferred_order = [
+        "ours",
         "with_mood_learning",
         "without_mood_learning",
         "flat_model",
         "cbtl_classifier",
+        "exploit_only",
+        "no_learning",
     ]
     methods = [m for m in preferred_order if m in band_agg]
     methods += sorted(m for m in band_agg if m not in preferred_order)
@@ -735,6 +783,8 @@ def main() -> None:
     neutral_sat_agg = _aggregate_by_method(all_series, "neutral_satisfaction")
     natural_sat_agg = _aggregate_by_method(all_series, "natural_satisfaction")
     train_sat_agg = _aggregate_by_method(all_series, "train_satisfaction")
+    neutral_pred_acc_agg = _aggregate_by_method(all_series, "neutral_pred_accuracy")
+    natural_pred_acc_agg = _aggregate_by_method(all_series, "natural_pred_accuracy")
     phi_mae_agg = _aggregate_by_method(all_series, "phi_mae")
     phi_rmse_agg = _aggregate_by_method(all_series, "phi_rmse")
     tanh_phi_mae_agg = _aggregate_by_method(all_series, "tanh_phi_mae")
@@ -797,6 +847,21 @@ def main() -> None:
             out_path=out_dir / "sign_accuracy_over_time.png",
         )
 
+    if neutral_pred_acc_agg:
+        _plot_timeseries(
+            neutral_pred_acc_agg,
+            title="Prediction Accuracy under Neutral Mood (mean ± SE)",
+            y_label="Fraction of Steps Correctly Predicted",
+            out_path=out_dir / "neutral_prediction_accuracy_over_time.png",
+        )
+    if natural_pred_acc_agg:
+        _plot_timeseries(
+            natural_pred_acc_agg,
+            title="Prediction Accuracy under Natural Mood Variation (mean ± SE)",
+            y_label="Fraction of Steps Correctly Predicted",
+            out_path=out_dir / "natural_prediction_accuracy_over_time.png",
+        )
+
     band_agg = _aggregate_band_accuracy_at_final(all_series)
     if band_agg:
         _plot_sign_accuracy_by_band(
@@ -855,6 +920,18 @@ def main() -> None:
             out_dir / "sign_accuracy_over_time.csv",
             metric_name="sign_accuracy",
         )
+    if neutral_pred_acc_agg:
+        _write_summary_csv(
+            neutral_pred_acc_agg,
+            out_dir / "neutral_prediction_accuracy_over_time.csv",
+            metric_name="neutral_eval_mean_prediction_accuracy",
+        )
+    if natural_pred_acc_agg:
+        _write_summary_csv(
+            natural_pred_acc_agg,
+            out_dir / "natural_prediction_accuracy_over_time.csv",
+            metric_name="natural_eval_mean_prediction_accuracy",
+        )
 
     print(f"Wrote analysis outputs to: {out_dir}")
     print(f"- {out_dir / 'neutral_satisfaction_over_time.png'}")
@@ -877,6 +954,12 @@ def main() -> None:
         print(f"- {out_dir / 'tanh_phi_mae_over_time.csv'}")
     if sign_accuracy_agg:
         print(f"- {out_dir / 'sign_accuracy_over_time.csv'}")
+    if neutral_pred_acc_agg:
+        print(f"- {out_dir / 'neutral_prediction_accuracy_over_time.png'}")
+        print(f"- {out_dir / 'neutral_prediction_accuracy_over_time.csv'}")
+    if natural_pred_acc_agg:
+        print(f"- {out_dir / 'natural_prediction_accuracy_over_time.png'}")
+        print(f"- {out_dir / 'natural_prediction_accuracy_over_time.csv'}")
     if band_agg:
         print(f"- {out_dir / 'sign_accuracy_by_theta_band.png'}")
         print(f"- {out_dir / 'sign_accuracy_by_theta_band.csv'}")

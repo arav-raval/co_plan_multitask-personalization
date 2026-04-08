@@ -46,12 +46,17 @@ from dataclasses import dataclass, field
 # ---------------------------------------------------------------------------
 
 ALL_SUBTASKS: list[str] = [
-    "fetch_ingredient",  # pick up onion/tomato from dispenser (O or T)
-    "load_pot",          # place ingredient into pot (P); triggers cooking
-    "fetch_dish",        # pick up plate from dish dispenser (D)
-    "pickup_soup",       # scoop cooked soup from pot into held dish
-    "deliver",           # carry plated soup to serving location (S)
+    "fetch_ingredient",    # pick up onion/tomato from dispenser (O or T)
+    "load_pot",            # place ingredient into pot (P); triggers cooking
+    "fetch_dish",          # pick up plate from dish dispenser (D)
+    "pickup_soup",         # scoop cooked soup from pot into held dish
+    "deliver",             # carry plated soup to serving location (S)
+    "place_on_counter",    # drop held item on a shared counter tile (X)
+    "pickup_from_counter", # pick up item from a shared counter tile (X)
 ]
+
+# The 5 core subtasks used in layouts where both agents can reach everything.
+CORE_SUBTASKS: list[str] = ALL_SUBTASKS[:5]
 
 
 # ---------------------------------------------------------------------------
@@ -80,8 +85,8 @@ class LayoutSpec:
 
     name: str
     layout_name: str
-    subtasks: list[str] = field(default_factory=lambda: list(ALL_SUBTASKS))
-    episode_length: int = 400
+    subtasks: list[str] = field(default_factory=lambda: list(CORE_SUBTASKS))
+    episode_length: int = 800
     description: str = ""
 
     def __post_init__(self) -> None:
@@ -105,7 +110,7 @@ class LayoutSpec:
 CRAMPED_ROOM = LayoutSpec(
     name="CrampedRoom",
     layout_name="cramped_room",
-    episode_length=400,
+    episode_length=800,
     description=(
         "Tight 5×4 grid with one pot and two onion dispensers on opposite "
         "sides.  Counter space is scarce so agents collide frequently — the "
@@ -116,7 +121,7 @@ CRAMPED_ROOM = LayoutSpec(
 ASYMMETRIC_ADVANTAGES = LayoutSpec(
     name="AsymmetricAdvantages",
     layout_name="asymmetric_advantages",
-    episode_length=400,
+    episode_length=800,
     description=(
         "9×5 grid where each agent starts near different resources.  Spatial "
         "asymmetry makes stable role specialisation (one agent preps, one "
@@ -127,7 +132,7 @@ ASYMMETRIC_ADVANTAGES = LayoutSpec(
 COORDINATION_RING = LayoutSpec(
     name="CoordinationRing",
     layout_name="coordination_ring",
-    episode_length=400,
+    episode_length=800,
     description=(
         "Ring-shaped layout; agents must move in the same rotational direction "
         "to avoid blocking each other.  Reveals preferences about who leads "
@@ -138,18 +143,22 @@ COORDINATION_RING = LayoutSpec(
 FORCED_COORDINATION = LayoutSpec(
     name="ForcedCoordination",
     layout_name="forced_coordination",
-    episode_length=400,
+    subtasks=list(ALL_SUBTASKS),  # includes handoff subtasks
+    episode_length=800,
     description=(
-        "Layout where one agent cannot reach the serving counter without "
-        "passing through the other agent's space.  Forces handoffs and reveals "
-        "preferences about who initiates vs. completes deliveries."
+        "Layout where a wall separates the kitchen into two halves.  "
+        "The human (left) can reach dispensers (O, D) but not pots or "
+        "serving counter.  The robot (right) can reach pots and serving "
+        "but not dispensers.  Items must be passed via shared counter tiles "
+        "in the wall.  Tests handoff preferences and role specialisation."
     ),
 )
 
 COUNTER_CIRCUIT = LayoutSpec(
     name="CounterCircuit",
     layout_name="counter_circuit",
-    episode_length=400,
+    subtasks=list(ALL_SUBTASKS),  # includes handoff subtasks
+    episode_length=800,
     description=(
         "Counter-heavy layout where items are passed via shared counters.  "
         "Tests preferences about who fetches ingredients and who picks items "

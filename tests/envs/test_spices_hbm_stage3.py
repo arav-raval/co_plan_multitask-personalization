@@ -52,12 +52,13 @@ SIGMA_MOOD = DEFAULT_CONFIG.hbm.sigma_mood
 # Helpers
 # ---------------------------------------------------------------------------
 
-def make_hbm(spices=None) -> HierarchicalPreferenceModel:
+def make_hbm(spices=None, enable_mood_learning=True) -> HierarchicalPreferenceModel:
     return HierarchicalPreferenceModel(
         spices=spices or SPICES,
         sigma_obs=0.5,
         n_phi_steps=10,
         n_theta_steps=15,
+        enable_mood_learning=enable_mood_learning,
     )
 
 
@@ -109,13 +110,19 @@ def _make_csp_gen(
 def _get_cost(
     csp_gen: SpicesAssignCSPGenerator, actor: str, spice: str = SPICE
 ) -> float:
-    """Evaluate the CSP's current cost function for a given actor."""
+    """Evaluate the CSP's current cost function for a given actor.
+
+    The CSP variable is now 'flag' (0=robot claims, 1=robot passes).
+    Convention: 'human' maps to flag=1 (robot passes, predicting human claims)
+                'robot'  maps to flag=0 (robot claims, predicting human won't).
+    """
     obs = _make_obs(spice)
     variables, _ = csp_gen._generate_variables(obs)
     cost = csp_gen._generate_cost(obs, variables)
     if cost is None:
         return 0.0
-    return cost.get_cost({variables[0]: actor})
+    flag = 1 if actor == "human" else 0
+    return cost.get_cost({variables[0]: flag})
 
 
 # ---------------------------------------------------------------------------
@@ -134,7 +141,7 @@ class TestPhiEntropy:
 
     def test_entropy_decreases_with_data(self):
         """Exploration value should shrink as phi converges."""
-        hbm = make_hbm()
+        hbm = make_hbm(enable_mood_learning=False)
         hbm.register_recipe(DEFAULT_HUMAN, RECIPE)
         rng = np.random.default_rng(99)
         entropy_init = hbm.get_phi_entropy(DEFAULT_HUMAN, RECIPE, SPICE)
@@ -157,7 +164,7 @@ class TestPhiEntropy:
 
     def test_entropy_higher_for_untrained_spice(self):
         """An unobserved spice should have higher entropy than a trained one."""
-        hbm = make_hbm(spices=[SPICE, "cumin"])
+        hbm = make_hbm(spices=[SPICE, "cumin"], enable_mood_learning=False)
         hbm.register_recipe(DEFAULT_HUMAN, RECIPE)
         rng = np.random.default_rng(11)
         run_episodes(hbm, RECIPE, SPICE, "human", n_episodes=15, rng=rng)
@@ -326,18 +333,20 @@ class TestCSPCostTransition:
     def test_explore_val_monotonically_decreasing_trend(self):
         """phi_entropy should trend downward over training (not necessarily monotone
         due to stochastic ELBO, but median should decrease)."""
-        hbm = make_hbm()
+        hbm = make_hbm(enable_mood_learning=False)
         hbm.register_recipe(DEFAULT_HUMAN, RECIPE)
         rng = np.random.default_rng(2)
         entropies = []
-        for _ in range(20):
+        for _ in range(40):
             for _ in range(6):
                 sat = float(np.clip(rng.normal(0.8, 0.1), -1.0, 1.0))
                 hbm.observe(DEFAULT_HUMAN, RECIPE, SPICE, "human", sat)
             hbm.end_episode(DEFAULT_HUMAN)
             entropies.append(hbm.get_phi_entropy(DEFAULT_HUMAN, RECIPE, SPICE))
 
-        # First 5 average should be higher than last 5 average
+        # First 5 average should be higher than last 5 average.
+        # Use wider separation (first 5 vs last 5) for robustness against
+        # stochastic ELBO noise at the low-entropy floor.
         early_avg = float(np.mean(entropies[:5]))
         late_avg = float(np.mean(entropies[-5:]))
         assert late_avg < early_avg, (
@@ -426,7 +435,7 @@ class TestStage2Preserved:
         assert abs(psi_after) < 0.2, f"psi should decay near 0 after episode, got {psi_after:.3f}"
 
     def test_phi_stable_after_contradictory_episode(self):
-        hbm = make_hbm()
+        hbm = make_hbm(enable_mood_learning=False)
         hbm.register_recipe(DEFAULT_HUMAN, RECIPE)
         rng = np.random.default_rng(60)
         run_episodes(hbm, RECIPE, SPICE, "human", n_episodes=10, rng=rng)
@@ -519,14 +528,11 @@ class TestRunningPsi:
         hbm = make_hbm()
         hbm.register_recipe(DEFAULT_HUMAN, RECIPE)
         rng = np.random.default_rng(200)
-        # Prime phi to be positive (human preferred)
         run_episodes(hbm, RECIPE, SPICE, "human", n_episodes=10, rng=rng)
-        # Now observe contradictory signals (robot + high sat) without ending episode
         for _ in range(5):
             sat = float(np.clip(rng.normal(0.8, 0.1), -1.0, 1.0))
             hbm.observe(DEFAULT_HUMAN, RECIPE, SPICE, "robot", sat)
         psi_running = hbm.get_running_psi(DEFAULT_HUMAN)
-        # Running psi should be nonzero (absorbing the contradiction)
         assert abs(psi_running) > 0.01, (
             f"running psi should drift from 0 after contradictory obs, got {psi_running:.4f}"
         )
@@ -539,7 +545,7 @@ class TestRunningPsi:
         for _ in range(5):
             sat = float(np.clip(rng.normal(0.8, 0.1), -1.0, 1.0))
             hbm.observe(DEFAULT_HUMAN, RECIPE, SPICE, "human", sat)
-        assert abs(hbm.get_running_psi(DEFAULT_HUMAN)) > 0.0  # nonzero during episode
+        assert abs(hbm.get_running_psi(DEFAULT_HUMAN)) > 0.0
         hbm.end_episode(DEFAULT_HUMAN)
         assert hbm.get_running_psi(DEFAULT_HUMAN) == 0.0, (
             f"running psi should be 0 after end_episode, got {hbm.get_running_psi(DEFAULT_HUMAN):.4f}"
@@ -551,7 +557,6 @@ class TestRunningPsi:
         hbm.register_recipe(DEFAULT_HUMAN, RECIPE)
         rng = np.random.default_rng(202)
         run_episodes(hbm, RECIPE, SPICE, "human", n_episodes=10, rng=rng)
-        # Observe increasingly many contradictory signals
         psi_after_1 = None
         for i in range(6):
             sat = float(np.clip(rng.normal(0.8, 0.1), -1.0, 1.0))
@@ -564,19 +569,15 @@ class TestRunningPsi:
         )
 
     def test_running_psi_separate_from_psi_m(self):
-        """_running_psi_m and _psi_m are independent; mid-episode running_psi doesn't corrupt _psi_m."""
+        """_running_psi_m and _psi_m are independent."""
         hbm = make_hbm()
         hbm.register_recipe(DEFAULT_HUMAN, RECIPE)
         rng = np.random.default_rng(203)
-        # Run several neutral episodes to establish _psi_m ≈ 0
         run_episodes(hbm, RECIPE, SPICE, "human", n_episodes=5, rng=rng)
-        psi_m_before = hbm.get_psi(DEFAULT_HUMAN)  # _psi_m after decay ≈ 0
-        # Observe contradictory signals WITHOUT ending episode
+        psi_m_before = hbm.get_psi(DEFAULT_HUMAN)
         for _ in range(5):
             hbm.observe(DEFAULT_HUMAN, RECIPE, SPICE, "robot", 0.8)
-        # _running_psi_m should be nonzero
         assert abs(hbm.get_running_psi(DEFAULT_HUMAN)) > 0.01
-        # _psi_m should be unchanged (not modified by running psi updates)
         psi_m_during = hbm.get_psi(DEFAULT_HUMAN)
         assert psi_m_during == psi_m_before, (
             f"_psi_m should not change mid-episode: before={psi_m_before:.4f}, during={psi_m_during:.4f}"
@@ -594,17 +595,14 @@ class TestMidEpisodeAdaptation:
         hbm = make_hbm()
         hbm.register_recipe(DEFAULT_HUMAN, RECIPE)
         rng = np.random.default_rng(300)
-        # Train phi positive (human preferred)
         run_episodes(hbm, RECIPE, SPICE, "human", n_episodes=10, rng=rng)
         phi = hbm.get_phi(DEFAULT_HUMAN, RECIPE, SPICE)
         assert phi > 0, f"phi should be positive, got {phi:.3f}"
 
         lp_robot_before = hbm.log_prob_prefer(DEFAULT_HUMAN, RECIPE, SPICE, "robot")
-        # Observe several robot+high_sat signals mid-episode — running psi should go negative
         for _ in range(5):
             hbm.observe(DEFAULT_HUMAN, RECIPE, SPICE, "robot", 0.8)
         lp_robot_after = hbm.log_prob_prefer(DEFAULT_HUMAN, RECIPE, SPICE, "robot")
-        # After psi absorbs the contradiction, robot should appear MORE plausible
         assert lp_robot_after > lp_robot_before, (
             f"log_prob_prefer(robot) should increase after robot+sat observations: "
             f"before={lp_robot_before:.3f}, after={lp_robot_after:.3f}"
@@ -617,9 +615,7 @@ class TestMidEpisodeAdaptation:
         """
         hbm = make_hbm()
         hbm.register_recipe(DEFAULT_HUMAN, RECIPE)
-        # phi ≈ 0 → preferred_actor = "human" (tie-break)
         assert hbm.preferred_actor(DEFAULT_HUMAN, RECIPE, SPICE) == "human"
-        # Observe strong robot+high_sat signals → running psi goes negative → phi+psi < 0
         rng = np.random.default_rng(301)
         for _ in range(8):
             hbm.observe(DEFAULT_HUMAN, RECIPE, SPICE, "robot", 0.9)

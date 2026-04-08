@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -293,10 +294,12 @@ class OvercookedPreferenceModel:
         lr_phi: Optional[float] = None,
         lr_theta: Optional[float] = None,
         lr_hyper: Optional[float] = None,
+        scalar_psi: bool = False,
     ) -> None:
         self.subtasks = list(subtasks)
         self.config = config if config is not None else DEFAULT_CONFIG
         self.mu0 = mu0
+        self._scalar_psi = scalar_psi
         self.sigma0 = sigma0
 
         cfg = self.config.hbm
@@ -305,11 +308,15 @@ class OvercookedPreferenceModel:
         _sigma_obs = sigma_obs if sigma_obs is not None else cfg.sigma_obs
         _sigma_session = sigma_session if sigma_session is not None else cfg.sigma_session
 
-        # Subtask index map for vector psi dimension lookup
-        self._subtask_index: Dict[str, int] = {
-            s: i for i, s in enumerate(self.subtasks)
-        }
-        self._psi_dim = len(self.subtasks)
+        # Subtask index map for psi dimension lookup.
+        # Vector psi: each subtask gets its own dimension.
+        # Scalar psi: all subtasks share dimension 0.
+        if self._scalar_psi:
+            self._subtask_index: Dict[str, int] = {s: 0 for s in self.subtasks}
+            self._psi_dim = 1
+        else:
+            self._subtask_index = {s: i for i, s in enumerate(self.subtasks)}
+            self._psi_dim = len(self.subtasks)
 
         # Fixed (not learned) psi prior std per dimension.
         # Stored as log_sigma_session [D] tensor, no grad.
@@ -970,3 +977,91 @@ class OvercookedPreferenceModel:
         )
         kl_psi = 0.5 * (m_psi / torch.exp(self.log_sigma_session[dim])) ** 2
         return float((ell - kl_phi - kl_psi).item())
+
+    # ------------------------------------------------------------------
+    # Save / load
+    # ------------------------------------------------------------------
+
+    def save(self, path: Path) -> None:
+        """Persist all variational parameters to disk."""
+        import pickle
+        state = {
+            "phi_m": {
+                h: {L: {s: p.detach().cpu().item() for s, p in sdict.items()}
+                     for L, sdict in ldict.items()}
+                for h, ldict in self._phi_m.items()
+            },
+            "phi_logv": {
+                h: {L: {s: p.detach().cpu().item() for s, p in sdict.items()}
+                     for L, sdict in ldict.items()}
+                for h, ldict in self._phi_logv.items()
+            },
+            "theta_m": {
+                h: {s: p.detach().cpu().item() for s, p in sdict.items()}
+                for h, sdict in self._theta_m.items()
+            },
+            "theta_logv": {
+                h: {s: p.detach().cpu().item() for s, p in sdict.items()}
+                for h, sdict in self._theta_logv.items()
+            },
+            "mu_mean": {s: float(v) for s, v in self.mu_mean.items()},
+            "mu_var": {s: float(v) for s, v in self.mu_var.items()},
+            "log_sigma_obs": self.log_sigma_obs.detach().cpu().item(),
+            "log_sigma_r": self.log_sigma_r.detach().cpu().item(),
+        }
+        with open(path / "overcooked_hbm.pkl", "wb") as f:
+            pickle.dump(state, f)
+
+    def load(self, path: Path) -> None:
+        """Load variational parameters from disk."""
+        import pickle
+        p = path / "overcooked_hbm.pkl"
+        if not p.exists():
+            return
+        try:
+            with open(p, "rb") as f:
+                state = pickle.load(f)
+        except (EOFError, pickle.UnpicklingError, Exception):
+            return  # corrupted file — skip load
+        for h, ldict in state["phi_m"].items():
+            if h not in self._phi_m:
+                self.register_human(h)
+            for L, sdict in ldict.items():
+                if L not in self._phi_m.get(h, {}):
+                    self.register_layout(h, L)
+                for s, v in sdict.items():
+                    if s in self._phi_m.get(h, {}).get(L, {}):
+                        self._phi_m[h][L][s] = torch.tensor(
+                            v, dtype=torch.float32, requires_grad=True
+                        )
+        for h, ldict in state["phi_logv"].items():
+            for L, sdict in ldict.items():
+                for s, v in sdict.items():
+                    if s in self._phi_logv.get(h, {}).get(L, {}):
+                        self._phi_logv[h][L][s] = torch.tensor(
+                            v, dtype=torch.float32, requires_grad=True
+                        )
+        for h, sdict in state["theta_m"].items():
+            for s, v in sdict.items():
+                if s in self._theta_m.get(h, {}):
+                    self._theta_m[h][s] = torch.tensor(
+                        v, dtype=torch.float32, requires_grad=True
+                    )
+        for h, sdict in state["theta_logv"].items():
+            for s, v in sdict.items():
+                if s in self._theta_logv.get(h, {}):
+                    self._theta_logv[h][s] = torch.tensor(
+                        v, dtype=torch.float32, requires_grad=True
+                    )
+        for s, v in state.get("mu_mean", {}).items():
+            if s in self.mu_mean:
+                self.mu_mean[s] = float(v)
+        for s, v in state.get("mu_var", {}).items():
+            if s in self.mu_var:
+                self.mu_var[s] = float(v)
+        self.log_sigma_obs = torch.tensor(
+            state["log_sigma_obs"], dtype=torch.float32, requires_grad=True
+        )
+        self.log_sigma_r = torch.tensor(
+            state["log_sigma_r"], dtype=torch.float32, requires_grad=True
+        )

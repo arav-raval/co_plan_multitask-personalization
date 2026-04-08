@@ -19,20 +19,22 @@ from multitask_personalization.methods.approach import BaseApproach
 PREFERENCE_SHIFT_ENVS = ["cooking-nonstationary"]
 
 # Episodic Gymnasium envs that return terminated=True and require reset() before the
-# next step (e.g. SpiceEnv). Without this, training stays on a terminal observation and
-# the CSP policy recomputes every step.
-EPISODIC_RESET_TRAIN_ENVS = ["spices"]
+# next step (e.g. SpiceEnv, OvercookedEnv). Without this, training stays on a terminal
+# observation and the CSP policy recomputes every step.
+EPISODIC_RESET_TRAIN_ENVS = ["spices", "overcooked"]
 
 _EXPERIMENT_CONF_DIR = Path(__file__).resolve().parent / "conf"
 
 
 def _force_enumeration_csp_for_spices(cfg: DictConfig) -> None:
-    """Binary spice assignment needs EnumerationCSPSolver; root defaults use RandomWalk.
+    """Binary assignment envs need EnumerationCSPSolver; root defaults use RandomWalk.
 
     Hydra 1.3 does not allow ``override /csp_solver`` from ``env/spices.yaml`` (nested
     package resolves to ``env.csp_solver``, which clashes with the env tuning dict).
+    Applies to both spices and overcooked (both have binary flag domains).
     """
-    if cfg.get("env_name") != "spices":
+    env_name = str(cfg.get("env_name", ""))
+    if not (env_name.startswith("spices") or env_name == "overcooked"):
         return
     target = str(OmegaConf.select(cfg, "csp_solver._target_") or "")
     if "EnumerationCSPSolver" in target:
@@ -138,7 +140,7 @@ def _main(cfg: DictConfig) -> None:
         # Initial reset of training environment and approach.
         obs, info = train_env.reset()
         train_approach.reset(obs, info)
-        if cfg.env_name == "spices":
+        if cfg.env_name.startswith("spices"):
             _sync_spices_scene_spec(train_approach, train_env)
         # Main training and eval loop.
         for t in range(cfg.env.max_environment_steps + 1):
@@ -164,7 +166,7 @@ def _main(cfg: DictConfig) -> None:
                             train_env._hidden_spec.meal_preference_model  # pylint: disable=protected-access
                         )
                 # Run evaluation.
-                if cfg.env_name == "spices":
+                if cfg.env_name.startswith("spices") or cfg.env_name == "overcooked":
                     neutral_eval = _evaluate_approach(
                         eval_approach,
                         eval_env,
@@ -231,12 +233,12 @@ def _main(cfg: DictConfig) -> None:
             done_for_learning = bool(env_terminated or env_truncated)
             train_approach.update(obs, float(rew), done_for_learning, info)
 
-            if cfg.env_name in EPISODIC_RESET_TRAIN_ENVS and (
+            if any(cfg.env_name.startswith(e) for e in EPISODIC_RESET_TRAIN_ENVS) and (
                 env_terminated or env_truncated
             ):
                 obs, info = train_env.reset()
                 train_approach.reset(obs, info)
-                if cfg.env_name == "spices":
+                if cfg.env_name.startswith("spices"):
                     _sync_spices_scene_spec(train_approach, train_env)
 
             # Track if any shift occurred during training
@@ -319,8 +321,10 @@ def _evaluate_approach(
     cumulative_user_satisfactions: list[float] = []
     eval_num_steps: list[int] = []
     spices_episode_avg_satisfactions: list[float] = []
+    spices_episode_pred_accuracies: list[float] = []
+    overcooked_deliveries: list[int] = []
     original_force_neutral: bool | None = None
-    if cfg.env_name == "spices" and force_neutral_mood is not None:
+    if cfg.env_name.startswith("spices") or cfg.env_name == "overcooked" and force_neutral_mood is not None:
         original_force_neutral = bool(eval_env.unwrapped._hidden_spec.force_neutral_mood)  # pylint: disable=protected-access
         eval_env.unwrapped._hidden_spec.force_neutral_mood = force_neutral_mood  # pylint: disable=protected-access
 
@@ -331,8 +335,11 @@ def _evaluate_approach(
             obs, info = eval_env.reset(seed=seed)
             # Reset the approach.
             eval_approach.reset(obs, info)
-            if cfg.env_name == "spices":
+            if cfg.env_name.startswith("spices"):
                 _sync_spices_scene_spec(eval_approach, eval_env)
+            # Track prediction accuracy for overcooked
+            overcooked_correct = 0
+            overcooked_total = 0
             # Main eval loop.
             cumulative_user_satisfaction = 0.0
             n_steps = 0
@@ -344,16 +351,35 @@ def _evaluate_approach(
                 user_satisfaction = info.get("user_satisfaction", 0.0)
                 cumulative_user_satisfaction += user_satisfaction
                 n_steps += 1
+                # Track prediction accuracy for overcooked (CSP decisions only).
+                # Skip forced steps (item continuations) — they inflate accuracy
+                # equally for all approaches and don't reflect learning quality.
+                if cfg.env_name == "overcooked" and info.get("last_subtask") is not None:
+                    if not info.get("forced", False):
+                        pred_correct = info.get("prediction_correct", False)
+                        if pred_correct:
+                            overcooked_correct += 1
+                        overcooked_total += 1
                 if terminated or truncated:
                     break
-            if cfg.env_name == "spices":
+            if cfg.env_name.startswith("spices"):
                 spices_episode_avg_satisfactions.append(
                     float(info.get("average_satisfaction", np.nan))
+                )
+                spices_episode_pred_accuracies.append(
+                    float(info.get("prediction_accuracy", np.nan))
+                )
+            if cfg.env_name == "overcooked" and overcooked_total > 0:
+                spices_episode_pred_accuracies.append(
+                    overcooked_correct / overcooked_total
+                )
+                overcooked_deliveries.append(
+                    info.get("deliveries", 0)
                 )
             cumulative_user_satisfactions.append(cumulative_user_satisfaction)
             eval_num_steps.append(n_steps)
     finally:
-        if cfg.env_name == "spices" and original_force_neutral is not None:
+        if cfg.env_name.startswith("spices") or cfg.env_name == "overcooked" and original_force_neutral is not None:
             eval_env.unwrapped._hidden_spec.force_neutral_mood = original_force_neutral  # pylint: disable=protected-access
 
     step_eval_metrics: dict[str, float] = {}
@@ -379,10 +405,50 @@ def _evaluate_approach(
     step_eval_metrics[f"{metric_prefix}eval_mean_user_satisfaction_per_step"] = float(
         np.nanmean(mean_step_per_trial)
     )
-    if cfg.env_name == "spices" and spices_episode_avg_satisfactions:
-        step_eval_metrics[f"{metric_prefix}eval_mean_episode_average_satisfaction"] = float(
-            np.nanmean(spices_episode_avg_satisfactions)
-        )
+    if cfg.env_name.startswith("spices") or cfg.env_name == "overcooked":
+        if spices_episode_avg_satisfactions:
+            step_eval_metrics[f"{metric_prefix}eval_mean_episode_average_satisfaction"] = float(
+                np.nanmean(spices_episode_avg_satisfactions)
+            )
+        if spices_episode_pred_accuracies:
+            step_eval_metrics[f"{metric_prefix}eval_mean_prediction_accuracy"] = float(
+                np.nanmean(spices_episode_pred_accuracies)
+            )
+    # Overcooked-specific: deliveries and phi MAE.
+    if cfg.env_name == "overcooked":
+        if overcooked_deliveries:
+            step_eval_metrics[f"{metric_prefix}eval_mean_deliveries"] = float(
+                np.mean(overcooked_deliveries)
+            )
+        # Compute phi MAE: how far learned P(human) is from true P(human).
+        try:
+            from multitask_personalization.envs.overcooked.layouts import ALL_SUBTASKS
+            true_prefs = eval_env.unwrapped.hidden_spec.preferred_actor
+            # Get the CSP generator's HBM from the approach
+            csp_gen = eval_approach._csp_generator  # type: ignore[attr-defined]
+            hbm = csp_gen._pref_gen._hbm
+            layout_name = eval_env.unwrapped.layout_spec.name
+            human_id = csp_gen._pref_gen._human_id
+
+            import math
+            phi_errors = []
+            for s in ALL_SUBTASKS[:5]:
+                try:
+                    learned_phi = hbm.get_phi(human_id, layout_name, s)
+                    learned_p = 1.0 / (1.0 + math.exp(-learned_phi))
+                    true_pref = true_prefs.get(s, "robot")
+                    # Get true theta from hidden HBM
+                    true_phi = eval_env.unwrapped.hidden_spec.hidden_hbm.get_phi(
+                        human_id, layout_name, s
+                    )
+                    true_p = 1.0 / (1.0 + math.exp(-float(true_phi)))
+                    phi_errors.append(abs(learned_p - true_p))
+                except Exception:
+                    pass
+            if phi_errors:
+                step_eval_metrics[f"{metric_prefix}eval_phi_mae"] = float(np.mean(phi_errors))
+        except Exception:
+            pass
     return step_eval_metrics
 
 

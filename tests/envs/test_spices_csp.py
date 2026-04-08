@@ -251,22 +251,24 @@ def test_spices_csp_single_recipe():
                 obs, reward, done, _, info = env.step(act)
                 assert np.isclose(reward, 0.0)
                 csp_gen.observe_transition(prev_obs, act, obs, done, info)
-                # TEMP diagnostics for neutral episodes: action match rate and
-                # expected satisfaction gap vs. oracle actor choice.
-                preferred_actor = str(info.get("preferred_actor"))
-                last_actor = str(info.get("last_actor"))
-                if preferred_actor in ("human", "robot") and last_actor in ("human", "robot"):
-                    step_match_flags.append(last_actor == preferred_actor)
-                    pref_sign = 1.0 if preferred_actor == "human" else -1.0
-                    base = float(env._base_satisfaction_bias)
-                    psi_true = float(env._current_psi_true)
-                    phi_latent = pref_sign * base
-                    logit_h = 1.0 * (phi_latent + psi_true)
-                    logit_r = -1.0 * (phi_latent + psi_true)
-                    exp_h = float(np.tanh(logit_h))
-                    exp_r = float(np.tanh(logit_r))
-                    actual_exp = exp_h if last_actor == "human" else exp_r
-                    oracle_exp = max(exp_h, exp_r)
+                # Diagnostics for neutral episodes: robot prediction accuracy.
+                # Under autonomous-human semantics, task_score=+1 means human claimed
+                # (robot correctly passed), task_score=-1 means human didn't claim.
+                # A conflict (task_score=0) is excluded from match-rate computation.
+                task_score = float(info.get("task_score", 0.0))
+                conflict = bool(info.get("conflict", False))
+                robot_flag = act[0]  # 0=claim, 1=pass
+                if not conflict and task_score != 0.0:
+                    # Match: robot passed (flag=1) when human claimed (+1), or
+                    #        robot claimed (flag=0) when human didn't claim (-1).
+                    human_claimed = task_score > 0
+                    robot_passed = (robot_flag == 1)
+                    step_match_flags.append(human_claimed == robot_passed)
+                    # Oracle gap: oracle always matches human behavior (max task_score)
+                    # actual_score is abs(task_score) for a correct match, 0 otherwise.
+                    correct = (human_claimed == robot_passed)
+                    oracle_exp = 1.0  # oracle always gets task_score=+1
+                    actual_exp = 1.0 if correct else -1.0
                     step_oracle_minus_actual.append(oracle_exp - actual_exp)
                 if done:
                     break

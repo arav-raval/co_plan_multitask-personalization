@@ -81,11 +81,13 @@ def make_env(preferred: dict | None = None) -> OvercookedEnv:
     return OvercookedEnv(layout_spec=CRAMPED_ROOM, hidden_spec=hidden, seed=42)
 
 
-def make_transition_info(subtask: str, actor: str, score: float) -> dict:
+def make_transition_info(subtask: str, actor: str, score: float, conflict: bool = False) -> dict:
     return {
         "last_subtask": subtask,
         "last_actor": actor,
         "task_score": score,
+        "satisfaction": score,
+        "conflict": conflict,
         "shaped_reward": 3.0,
         "psi_true": [0.0] * 6,
         "session_type": "neutral",
@@ -107,8 +109,8 @@ class TestCSPSetup:
         obs = make_obs()
         variables, init = gen._generate_variables(obs)
         assert len(variables) == 1
-        assert variables[0].name == "actor"
-        assert init[variables[0]] in ("human", "robot")
+        assert variables[0].name == "flag"
+        assert init[variables[0]] in (0, 1)
 
     def test_generate_personal_constraints(self):
         gen = make_csp_gen()
@@ -145,9 +147,9 @@ class TestObserveTransition:
     def test_observe_transition_updates_hbm(self):
         gen = make_csp_gen()
         obs = make_obs("load_pot")
-        act = OvercookedAction(actor="human")
+        act = OvercookedAction(flag=1)  # robot passed; human claimed (task_score=+1)
         next_obs = make_obs("deliver")
-        info = make_transition_info("load_pot", "human", 0.7)
+        info = make_transition_info("load_pot", "human", 1.0)
 
         gen.observe_transition(obs, act, next_obs, done=False, info=info)
 
@@ -157,13 +159,25 @@ class TestObserveTransition:
     def test_observe_transition_done_clears_buffer(self):
         gen = make_csp_gen()
         obs = make_obs("load_pot")
-        act = OvercookedAction(actor="human")
+        act = OvercookedAction(flag=1)
         next_obs = make_obs(None)
-        info = make_transition_info("load_pot", "human", 0.7)
+        info = make_transition_info("load_pot", "human", 1.0)
 
         gen.observe_transition(obs, act, next_obs, done=True, info=info)
 
         # Episode end should have cleared episode data
+        assert len(gen._pref_gen._hbm._episode_data[DEFAULT_HUMAN]) == 0
+
+    def test_conflict_step_not_buffered(self):
+        gen = make_csp_gen()
+        obs = make_obs("load_pot")
+        act = OvercookedAction(flag=0)  # robot claimed, conflict
+        next_obs = make_obs("load_pot")
+        info = make_transition_info("load_pot", "human", 0.0, conflict=True)
+
+        gen.observe_transition(obs, act, next_obs, done=False, info=info)
+
+        # Conflict step should NOT be buffered
         assert len(gen._pref_gen._hbm._episode_data[DEFAULT_HUMAN]) == 0
 
     def test_multiple_transitions_accumulate(self):
@@ -171,9 +185,9 @@ class TestObserveTransition:
         for i, st in enumerate(SUBTASKS):
             obs = make_obs(st)
             next_obs = make_obs(SUBTASKS[(i + 1) % len(SUBTASKS)])
-            info = make_transition_info(st, "human", 0.8)
+            info = make_transition_info(st, "human", 1.0)
             gen.observe_transition(
-                obs, OvercookedAction(actor="human"), next_obs, done=False, info=info
+                obs, OvercookedAction(flag=1), next_obs, done=False, info=info
             )
 
         # All subtasks should be buffered
@@ -226,13 +240,14 @@ class TestEnvCSPRoundtrip:
         steps = 0
 
         while not done and steps < 20:
-            # CSP assigns actor for current subtask
+            # CSP picks flag=1 (pass/predict human) when HBM prefers human; else flag=0
             if obs.current_subtask is None:
                 break
 
             hbm = gen._pref_gen._hbm
-            actor = hbm.preferred_actor(DEFAULT_HUMAN, LAYOUT, obs.current_subtask)
-            action = OvercookedAction(actor=actor)
+            preferred = hbm.preferred_actor(DEFAULT_HUMAN, LAYOUT, obs.current_subtask)
+            flag = 1 if preferred == "human" else 0
+            action = OvercookedAction(flag=flag)
 
             next_obs, reward, done, _, info = env.step(action)
             gen.observe_transition(obs, action, next_obs, done=done, info=info)
@@ -241,6 +256,9 @@ class TestEnvCSPRoundtrip:
             steps += 1
 
         assert steps > 0, "Episode completed zero steps"
+        assert "task_score" in info
+        assert "conflict" in info
+        assert "conflict_count" in info
 
     def test_metrics_returns_psi_values(self):
         gen = make_csp_gen()

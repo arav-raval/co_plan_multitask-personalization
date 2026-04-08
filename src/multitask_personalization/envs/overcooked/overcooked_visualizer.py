@@ -147,6 +147,222 @@ class OvercookedVisualizer:
         except Exception:
             return False
 
+    def render_to_array(
+        self,
+        state: Any,
+        hud: Optional[Dict[str, Any]] = None,
+    ) -> Any:
+        """
+        Render *state* to a numpy array (H, W, 3) suitable for video encoding.
+
+        Returns None if rendering is unavailable.
+        """
+        if not self._available or self._viz is None:
+            return None
+        try:
+            import pygame
+            import numpy as np
+            surface = self._viz.render_state(
+                state, self._grid, hud if hud else None
+            )
+            arr = pygame.surfarray.array3d(surface)
+            return np.transpose(arr, (1, 0, 2))
+        except Exception:
+            return None
+
+    def render_composite(
+        self,
+        state: Any,
+        status_lines: Optional[List[str]] = None,
+        table_rows: Optional[List[List[str]]] = None,
+        table_header: Optional[List[str]] = None,
+        table_footer: Optional[List[str]] = None,
+    ) -> Any:
+        """
+        Render game state + status bar (left) + preference table (right).
+
+        Returns a pygame surface (or None). Layout:
+
+            ┌──────────────────┬─────────────────────┐
+            │  Status lines    │  Preference Table   │
+            │  (left, top)     │  (right, top)       │
+            │                  │                     │
+            │  Game render     │  Header row         │
+            │  (left, below    │  Data rows...       │
+            │   status)        │                     │
+            │                  │  Config footer      │
+            └──────────────────┴─────────────────────┘
+
+        Parameters
+        ----------
+        state: overcooked_ai state
+        status_lines: list of strings for the left status area
+        table_rows: list of [col1, col2, ...] for the preference table
+        table_header: header row for the table
+        table_footer: list of strings shown below the table (e.g. config info)
+        """
+        if not self._available or self._viz is None:
+            return None
+        try:
+            import pygame
+
+            # Render game without HUD
+            game_surface = self._viz.render_state(state, self._grid, None)
+            gw, gh = game_surface.get_size()
+
+            # Font setup
+            pygame.font.init()
+            font = pygame.font.SysFont("monospace", 14)
+            small_font = pygame.font.SysFont("monospace", 12)
+            line_h = 18
+            small_line_h = 16
+
+            # Compute table panel width
+            table_w = 280
+            if table_rows and table_header:
+                # Estimate width from content
+                max_row_text = max(
+                    (len("  ".join(row)) for row in [table_header] + table_rows),
+                    default=30,
+                )
+                table_w = max(table_w, max_row_text * 8 + 20)
+
+            # Compute status area height
+            n_status = len(status_lines) if status_lines else 0
+            status_h = max(n_status * line_h + 8, 0)
+
+            # Total canvas size
+            total_w = gw + table_w
+            total_h = max(gh + status_h, 300)
+
+            canvas = pygame.Surface((total_w, total_h))
+            canvas.fill((40, 40, 50))  # dark background
+
+            # --- Draw status lines (top-left, above game) ---
+            if status_lines:
+                y = 4
+                for line in status_lines:
+                    text_surf = font.render(line, True, (220, 220, 220))
+                    canvas.blit(text_surf, (8, y))
+                    y += line_h
+
+            # --- Draw game (left, below status) ---
+            canvas.blit(game_surface, (0, status_h))
+
+            # --- Draw preference table (right panel) ---
+            if table_header and table_rows:
+                panel_x = gw + 4
+                y = 4
+
+                # Table title
+                title_surf = font.render("Learned vs True", True, (180, 220, 255))
+                canvas.blit(title_surf, (panel_x + 4, y))
+                y += line_h + 4
+
+                # Compute column widths from content
+                all_rows = [table_header] + table_rows
+                n_cols = len(table_header)
+                col_widths = [0] * n_cols
+                for row in all_rows:
+                    for c in range(min(n_cols, len(row))):
+                        col_widths[c] = max(col_widths[c], len(row[c]) * 8 + 8)
+
+                # Header
+                x = panel_x + 4
+                for c, hdr in enumerate(table_header):
+                    color = (160, 180, 200)
+                    text_surf = small_font.render(hdr, True, color)
+                    canvas.blit(text_surf, (x, y))
+                    x += col_widths[c]
+                y += small_line_h
+
+                # Separator line
+                pygame.draw.line(
+                    canvas, (100, 100, 120),
+                    (panel_x + 4, y), (panel_x + sum(col_widths) + 4, y)
+                )
+                y += 4
+
+                # Data rows
+                for row in table_rows:
+                    x = panel_x + 4
+                    for c, cell in enumerate(row):
+                        if c == 0:
+                            color = (220, 220, 220)
+                        else:
+                            color = (200, 200, 200)
+                        text_surf = small_font.render(cell, True, color)
+                        canvas.blit(text_surf, (x, y))
+                        x += col_widths[c]
+                    y += small_line_h
+
+            # --- Config footer (below table, right panel) ---
+            if table_footer:
+                y_footer = max(y + 12, status_h + gh - len(table_footer) * small_line_h - 8)
+                panel_x = gw + 4
+                pygame.draw.line(
+                    canvas, (80, 80, 100),
+                    (panel_x + 4, y_footer - 4),
+                    (panel_x + table_w - 8, y_footer - 4),
+                )
+                for line in table_footer:
+                    text_surf = small_font.render(line, True, (140, 150, 170))
+                    canvas.blit(text_surf, (panel_x + 4, y_footer))
+                    y_footer += small_line_h
+
+            return canvas
+        except Exception:
+            return None
+
+    def show_composite(
+        self,
+        state: Any,
+        status_lines: Optional[List[str]] = None,
+        table_rows: Optional[List[List[str]]] = None,
+        table_header: Optional[List[str]] = None,
+        table_footer: Optional[List[str]] = None,
+        pause_ms: int = 100,
+    ) -> bool:
+        """Display composite frame in a live pygame window."""
+        surface = self.render_composite(state, status_lines, table_rows, table_header, table_footer)
+        if surface is None:
+            return False
+        try:
+            import pygame
+            w, h = surface.get_size()
+            if self._window is None or self._window.get_size() != (w, h):
+                self._window = pygame.display.set_mode((w, h))
+                pygame.display.set_caption("Overcooked — Preference Learning")
+            self._window.blit(surface, (0, 0))
+            pygame.display.flip()
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    return False
+            pygame.time.wait(pause_ms)
+            return True
+        except Exception:
+            return False
+
+    def composite_to_array(
+        self,
+        state: Any,
+        status_lines: Optional[List[str]] = None,
+        table_rows: Optional[List[List[str]]] = None,
+        table_header: Optional[List[str]] = None,
+        table_footer: Optional[List[str]] = None,
+    ) -> Any:
+        """Render composite to numpy array (H, W, 3) for video encoding."""
+        surface = self.render_composite(state, status_lines, table_rows, table_header, table_footer)
+        if surface is None:
+            return None
+        try:
+            import pygame
+            import numpy as np
+            arr = pygame.surfarray.array3d(surface)
+            return np.transpose(arr, (1, 0, 2))
+        except Exception:
+            return None
+
     # ------------------------------------------------------------------
     # Trajectory rendering
     # ------------------------------------------------------------------

@@ -1,0 +1,7 @@
+defaults:
+  - ours
+
+# HBM with scalar psi: single shared session offset across all subtasks.
+# Ablates the vector psi advantage. A fatigued session shifts all subtask
+# preferences equally, unlike vector psi which allows per-subtask fatigue.
+psi_type: scalar

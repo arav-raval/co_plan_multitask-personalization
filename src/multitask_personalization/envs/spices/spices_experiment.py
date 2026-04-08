@@ -107,3 +107,77 @@ def build_spice_experiment_hidden_hbm_default_multi(
         list(MULTI_RECIPE_EXPERIMENT_POOL),
         hidden_hbm_config_name,
     )
+
+
+# ---------------------------------------------------------------------------
+# Claim 2: Cross-recipe generalization helpers
+# ---------------------------------------------------------------------------
+
+# Default split: train on 3, eval on 1 held-out recipe.
+CROSS_RECIPE_TRAIN: tuple[str, ...] = (
+    "UltraComplexFeast",
+    "AsianFusionBowl",
+    "IndianFeastComplex",
+)
+CROSS_RECIPE_EVAL: tuple[str, ...] = (
+    "MediterraneanComplex",
+)
+
+
+def build_spice_scene_spec_cross_recipe_train() -> SpiceSceneSpec:
+    """Scene spec for cross-recipe training: 3 recipes, no MediterraneanComplex."""
+    return build_spice_scene_spec_multi(list(CROSS_RECIPE_TRAIN))
+
+
+def build_spice_scene_spec_cross_recipe_eval() -> SpiceSceneSpec:
+    """Scene spec for cross-recipe eval: held-out MediterraneanComplex only."""
+    return build_spice_scene_spec_multi(list(CROSS_RECIPE_EVAL))
+
+
+def build_spice_experiment_hidden_hbm_cross_recipe(
+    hidden_hbm_config_name: str,
+) -> HierarchicalPreferenceModel:
+    """Hidden HBM spanning ALL recipes (train + eval) so truth is available everywhere."""
+    all_recipes = list(CROSS_RECIPE_TRAIN) + list(CROSS_RECIPE_EVAL)
+    return build_spice_experiment_hidden_hbm(all_recipes, hidden_hbm_config_name)
+
+
+# ---------------------------------------------------------------------------
+# Claim 3: Cross-human transfer helpers
+# ---------------------------------------------------------------------------
+
+# Population of related-but-different humans for multi-human training.
+# Each config shares the same base preference structure but with personality
+# offsets (heat-seeking, aromatic-gentle, etc.).
+POPULATION_HUMAN_CONFIGS: tuple[tuple[str, str], ...] = (
+    ("human_base", "SpiceSpecificHumanStrong"),
+    ("human_heat", "SpiceSpecificHumanHeatSeeking"),
+    ("human_gentle", "SpiceSpecificHumanAromaticGentle"),
+)
+
+# The new human introduced at eval time (unseen during training).
+NEW_HUMAN_CONFIG: tuple[str, str] = ("human_new", "SpiceSpecificHumanRecipeConflict")
+
+
+def build_multi_human_hidden_hbms(
+    recipe_names: list[str],
+) -> dict[str, HierarchicalPreferenceModel]:
+    """Build separate hidden HBMs for each human in the population.
+
+    Returns {human_label: hidden_hbm} where each HBM represents that
+    human's true preferences (used by the environment to generate behavior).
+    """
+    result: dict[str, HierarchicalPreferenceModel] = {}
+    for human_label, config_name in POPULATION_HUMAN_CONFIGS:
+        result[human_label] = build_spice_experiment_hidden_hbm(
+            recipe_names, config_name,
+        )
+    return result
+
+
+def build_new_human_hidden_hbm(
+    recipe_names: list[str],
+) -> HierarchicalPreferenceModel:
+    """Build hidden HBM for the new (unseen) human used at eval time."""
+    label, config_name = NEW_HUMAN_CONFIG
+    return build_spice_experiment_hidden_hbm(recipe_names, config_name)

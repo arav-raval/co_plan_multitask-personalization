@@ -77,9 +77,18 @@ class SubtaskPlanner:
         force stub mode (always returns STAY).
     """
 
-    def __init__(self, mdp: Any, mlam: Optional[Any] = None) -> None:
+    def __init__(
+        self,
+        mdp: Any,
+        mlam: Optional[Any] = None,
+        shared_counter_positions: Optional[List[Tuple[int, int]]] = None,
+    ) -> None:
         self._mdp = mdp
         self._mlam = mlam
+        # Shared counter tiles for handoff subtasks (computed externally).
+        self._shared_counters: List[Tuple[int, int]] = (
+            list(shared_counter_positions) if shared_counter_positions else []
+        )
         # Cache of (subtask → goal positions) computed once from the gridworld.
         self._goal_positions: Dict[str, List[Tuple[int, int]]] = {}
         if mdp is not None:
@@ -164,6 +173,18 @@ class SubtaskPlanner:
                     if positions:
                         break
             self._goal_positions[subtask] = positions
+        # Handoff subtasks target counter tiles.
+        # For place_on_counter, use ALL counter locations (agents can drop items
+        # on any reachable counter, not just shared ones).
+        # For pickup_from_counter, use shared counters (cross-agent handoffs).
+        all_counters = list(self._shared_counters)
+        if self._mdp is not None:
+            try:
+                all_counters = list(set(all_counters + self._mdp.get_counter_locations()))
+            except Exception:
+                pass
+        self._goal_positions["place_on_counter"] = all_counters
+        self._goal_positions["pickup_from_counter"] = list(self._shared_counters) if self._shared_counters else all_counters
 
     @staticmethod
     def _find_terrain(
@@ -191,23 +212,41 @@ class SubtaskPlanner:
         agent_pos = agent.position
         agent_or = agent.orientation
 
-        goal_positions = self._goal_positions.get(subtask, [])
+        goal_positions = list(self._goal_positions.get(subtask, []))
         if not goal_positions:
             return _STAY_ACTION
+
+        # For counter subtasks, filter to actionable positions.
+        if subtask == "pickup_from_counter":
+            goal_positions = [g for g in goal_positions if state.has_object(g)]
+            if not goal_positions:
+                return _STAY_ACTION
+        elif subtask == "place_on_counter":
+            goal_positions = [g for g in goal_positions if not state.has_object(g)]
+            if not goal_positions:
+                return _STAY_ACTION
 
         # Check if adjacent to AND facing a goal tile
         if self._can_interact_now(agent_pos, goal_positions, state, subtask, agent_or):
             return _INTERACT_ACTION
 
+        # Check if adjacent but facing wrong direction — turn to face the goal.
+        x, y = agent_pos
+        for gx, gy in goal_positions:
+            if abs(x - gx) + abs(y - gy) == 1:
+                needed_orient = (gx - x, gy - y)
+                if agent_or != needed_orient:
+                    # Return the direction as a movement action — in overcooked_ai,
+                    # moving toward a wall/counter turns the agent to face it.
+                    return needed_orient
+
         # For pickup_soup: if already adjacent and facing the pot but soup isn't
         # ready yet, STAY and wait — do not let the motion planner re-issue INTERACT.
         if subtask == "pickup_soup":
-            x, y = agent_pos
             for gx, gy in goal_positions:
                 if abs(x - gx) + abs(y - gy) == 1:
                     ox, oy = agent_or
                     if (x + ox, y + oy) == (gx, gy):
-                        # Adjacent and facing pot but soup not ready → wait
                         return _STAY_ACTION
 
         # Find closest goal and plan path
@@ -219,6 +258,12 @@ class SubtaskPlanner:
         # Build goal pos_and_or: stand adjacent to the goal tile, facing it
         goal_pos_and_or = self._adjacent_goal(closest_goal, state, actor_idx)
         if goal_pos_and_or is None:
+            # Fallback for counter subtasks: use greedy navigation.
+            # The motion planner may not support arbitrary counter positions.
+            if subtask in ("place_on_counter", "pickup_from_counter"):
+                return self._greedy_navigate_to_counter(
+                    closest_goal, agent_pos, state, actor_idx
+                )
             return _STAY_ACTION
 
         try:
@@ -228,7 +273,11 @@ class SubtaskPlanner:
             if plan:
                 return plan[0]
         except Exception:
-            pass
+            # Fallback for counter subtasks
+            if subtask in ("place_on_counter", "pickup_from_counter"):
+                return self._greedy_navigate_to_counter(
+                    closest_goal, agent_pos, state, actor_idx
+                )
 
         return _STAY_ACTION
 
@@ -255,9 +304,15 @@ class SubtaskPlanner:
                     ox, oy = agent_or
                     if (x + ox, y + oy) != (gx, gy):
                         continue  # adjacent but not facing — keep planning
-                # Additional check: for pickup_soup the soup must be ready
+                # Additional checks for specific subtasks
                 if subtask == "pickup_soup":
                     return self._soup_is_ready(state, (gx, gy))
+                if subtask == "pickup_from_counter":
+                    # Counter must have an object to pick up
+                    return state.has_object((gx, gy))
+                if subtask == "place_on_counter":
+                    # Counter must be empty to place on
+                    return not state.has_object((gx, gy))
                 return True
         return False
 
@@ -278,6 +333,78 @@ class SubtaskPlanner:
             pass
         return False
 
+    def _greedy_navigate_to_counter(
+        self,
+        counter_pos: Tuple[int, int],
+        agent_pos: Tuple[int, int],
+        state: Any,
+        actor_idx: int,
+    ) -> Any:
+        """
+        Simple greedy navigation to a counter tile, bypassing the motion planner.
+
+        The motion planner's precomputed graph may not include paths to counter
+        tiles (it's optimized for dispensers/pots/serving). This method uses
+        simple Manhattan-distance-based greedy movement.
+        """
+        cx, cy = counter_pos
+        ax, ay = agent_pos
+        other_idx = 1 - actor_idx
+        other_pos = state.players[other_idx].position
+
+        # Find the walkable cell adjacent to the counter that we should stand on.
+        best_neighbor = None
+        best_dist = float("inf")
+        for dx, dy in [(0, -1), (0, 1), (1, 0), (-1, 0)]:
+            neighbor = (cx + dx, cy + dy)
+            if neighbor == other_pos:
+                continue
+            try:
+                if self._mdp.get_terrain_type_at_pos(neighbor) != " ":
+                    continue
+            except Exception:
+                continue
+            dist = abs(neighbor[0] - ax) + abs(neighbor[1] - ay)
+            if dist < best_dist:
+                best_dist = dist
+                best_neighbor = neighbor
+
+        if best_neighbor is None:
+            return _STAY_ACTION
+
+        # If we're already at the target neighbor, face the counter.
+        if agent_pos == best_neighbor:
+            needed_orient = (cx - ax, cy - ay)
+            return needed_orient  # turn to face counter
+
+        # Move toward the target neighbor greedily.
+        nx, ny = best_neighbor
+        dx = nx - ax
+        dy = ny - ay
+        # Prefer the axis with larger distance.
+        if abs(dx) >= abs(dy):
+            move = (1 if dx > 0 else -1, 0)
+        else:
+            move = (0, 1 if dy > 0 else -1)
+
+        # Check if move is valid (walkable, not occupied).
+        target = (ax + move[0], ay + move[1])
+        if target == other_pos:
+            # Try the other axis.
+            if abs(dx) >= abs(dy):
+                move = (0, 1 if dy > 0 else (-1 if dy < 0 else 1))
+            else:
+                move = (1 if dx > 0 else (-1 if dx < 0 else 1), 0)
+            target = (ax + move[0], ay + move[1])
+
+        try:
+            if self._mdp.get_terrain_type_at_pos(target) != " ":
+                return _STAY_ACTION
+        except Exception:
+            return _STAY_ACTION
+
+        return move
+
     def _adjacent_goal(
         self,
         goal_tile: Tuple[int, int],
@@ -287,33 +414,62 @@ class SubtaskPlanner:
         """
         Return (position, orientation) for standing adjacent to *goal_tile*.
 
-        Tries the four cardinal neighbors and returns the first reachable one
-        (not a wall, not occupied by the other agent).
+        Tries the four cardinal neighbors and returns one that is:
+        - walkable (terrain ' ')
+        - not occupied by the other agent
+        - reachable by the assigned agent (verified via motion planner)
+
+        The closest reachable neighbor is preferred.
         """
         gx, gy = goal_tile
+        agent = state.players[actor_idx]
         other_idx = 1 - actor_idx
         other_pos = state.players[other_idx].position
 
         directions = [(0, -1), (0, 1), (1, 0), (-1, 0)]  # N, S, E, W
         orientations = [(0, 1), (0, -1), (-1, 0), (1, 0)]  # facing inward
 
+        candidates: List[Tuple] = []
         for (dx, dy), facing in zip(directions, orientations):
             neighbor = (gx + dx, gy + dy)
             if neighbor == other_pos:
                 continue
             try:
-                if self._mdp.get_terrain_type_at_pos(neighbor) == " ":
-                    return (neighbor, facing)
+                if self._mdp.get_terrain_type_at_pos(neighbor) != " ":
+                    continue
             except Exception:
                 continue
-        return None
+            # Verify the agent can actually reach this neighbor via motion planner.
+            if self._mlam is not None:
+                try:
+                    start = (agent.position, agent.orientation)
+                    goal = (neighbor, facing)
+                    if not self._mlam.motion_planner.is_valid_motion_start_goal_pair(
+                        start, goal
+                    ):
+                        continue
+                except Exception:
+                    continue
+            candidates.append((neighbor, facing))
+
+        if not candidates:
+            return None
+
+        # Return closest candidate by Manhattan distance.
+        return min(
+            candidates,
+            key=lambda c: abs(c[0][0] - agent.position[0]) + abs(c[0][1] - agent.position[1]),
+        )
 
 
 # ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 
-def build_planner(mdp: Any) -> Optional[SubtaskPlanner]:
+def build_planner(
+    mdp: Any,
+    shared_counter_positions: Optional[List[Tuple[int, int]]] = None,
+) -> Optional[SubtaskPlanner]:
     """
     Construct a ``SubtaskPlanner`` with a full MLAM if overcooked_ai_py is
     available, otherwise return ``None``.
@@ -322,16 +478,35 @@ def build_planner(mdp: Any) -> Optional[SubtaskPlanner]:
     ----------
     mdp:
         An ``OvercookedGridworld`` instance.
+    shared_counter_positions:
+        Counter tile positions accessible from both sides of the kitchen.
+        When provided, the MLAM is built with counter_drop / counter_pickup
+        support so the motion planner natively plans paths to/from counters.
+        This matches the original Overcooked AI benchmark's approach.
     """
     try:
         from overcooked_ai_py.planning.planners import (
             MediumLevelActionManager,
             NO_COUNTERS_PARAMS,
         )
+        counters = list(shared_counter_positions) if shared_counter_positions else []
+        if counters:
+            # Build with counter support — matches the original benchmark.
+            mlam_params = {
+                "start_orientations": False,
+                "wait_allowed": False,
+                "counter_goals": counters,
+                "counter_drop": counters,
+                "counter_pickup": counters,
+                "same_motion_goals": True,
+            }
+        else:
+            mlam_params = NO_COUNTERS_PARAMS
+
         mlam = MediumLevelActionManager.from_pickle_or_compute(
-            mdp, NO_COUNTERS_PARAMS, force_compute=False
+            mdp, mlam_params, force_compute=bool(counters)
         )
-        return SubtaskPlanner(mdp, mlam)
+        return SubtaskPlanner(mdp, mlam, shared_counter_positions=counters)
     except ImportError:
         return None
     except Exception:

@@ -92,7 +92,7 @@ class HBMConfig:
     # The partial-convergence of psi is what preserves phi's identifiability.
     # Reduced from 16→8: the psi ELBO is a scalar KL bowl and converges quickly;
     # fewer steps halve the MC gradient noise injected into phi on neutral episodes.
-    n_psi_steps: int = 10
+    n_psi_steps: int = 3
 
     # Mood confidence threshold for skipping the psi ELBO entirely.
     # If the neutral mood posterior exceeds this value at episode end, the episode
@@ -101,12 +101,12 @@ class HBMConfig:
     # At 0.85 the gate fires on ~80% of neutral episodes (posterior concentrates
     # quickly) while always staying open for genuinely moody episodes where
     # the neutral posterior stays low.  Set to 1.0 to disable.
-    psi_skip_neutral_threshold: float = 1.0
+    psi_skip_neutral_threshold: float = 0.85
     n_theta_steps: int = 12
     # lr_phi: Adam lr for phi and psi updates. Same rate for both keeps psi from
     # racing ahead of phi and stealing the learning signal.
     lr_phi: float = 3e-2
-    lr_psi: float = 3e-2  # keep equal to lr_phi — psi must not outpace phi
+    lr_psi: float = 1e-2  # lower than lr_phi so psi doesn't outpace phi during training
     lr_theta: float = 1e-2
     lr_hyper: float = 5e-3
     log_var_min: float = math.log(1e-6)
@@ -119,12 +119,10 @@ class MoodConfig:
     
     # Mood prior probabilities [all_self, neutral, none_self].
     # Controls the fraction of training and eval episodes that are moody.
-    # Original was (0.1, 0.8, 0.1) — too few moody episodes for a clear gap.
-    # (0.25, 0.5, 0.25) gives 50% moody — enough contamination to separate methods,
-    # but combined with strong psi_true (2.0) it overwhelms nuanced phi learning.
-    # Reduced to (0.2, 0.6, 0.2): 60% neutral gives cleaner phi signal for nuanced spices,
-    # while 40% moody episodes still provide enough mood signal to reward mood inference.
-    mood_prior: Tuple[float, float, float] = (0.25, 0.6, 0.25)
+    # 30% moody (15%+15%) gives enough mood signal to reward psi inference,
+    # while 70% neutral provides the clean phi signal needed for phi to
+    # outpace the psi-less ablation.
+    mood_prior: Tuple[float, float, float] = (0.15, 0.70, 0.15)
     
     # Mood inference smoothing
     mood_smoothing_alpha: float = 0.3  # EMA smoothing (30% new info, 70% old)
@@ -168,7 +166,7 @@ class MoodConfig:
     psi_true_mood_mean_abs: float = 2.0
     psi_true_mood_std: float = 0.5
     # Neutral episode psi_true std: small so neutral episodes give clean phi signal.
-    psi_true_neutral_std: float = 0.25
+    psi_true_neutral_std: float = 0.05
 
 
 @dataclass(frozen=True)
@@ -193,6 +191,11 @@ class SatisfactionConfig:
     
     # Continuous satisfaction: Beta distribution parameters
     satisfaction_beta_kappa: float = 10.0  # Concentration parameter for Beta distribution
+
+    # Coordination cost: additive penalty subtracted from satisfaction when the
+    # robot mispredicts (conflict or missed pass).  Models frustration from
+    # poor coordination independently of the underlying preference strength.
+    coordination_cost: float = 0.5
 
 
 @dataclass(frozen=True)

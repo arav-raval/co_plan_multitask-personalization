@@ -58,26 +58,34 @@ from multitask_personalization.structs import (
 # ---------------------------------------------------------------------------
 
 class _OvercookedCSPPolicy(CSPPolicy[OvercookedState, OvercookedAction]):
-    """Converts a CSP solution (actor assignment) into an OvercookedAction."""
+    """Converts a CSP solution (flag) into an OvercookedAction."""
 
     def __init__(
         self, csp_variables: Collection[CSPVariable], seed: int = 0
     ) -> None:
         super().__init__(csp_variables, seed)
-        self._actor: str | None = None
+        self._flag: int | None = None
         self._done_emitted: bool = False
 
     def reset(self, solution: dict[CSPVariable, Any]) -> None:
         super().reset(solution)
-        self._actor = self._get_value("actor")
-        self._done_emitted = False
+        self._flag = self._get_value("flag")
+        self._last_subtask: str | None = None
 
     def step(self, obs: OvercookedState) -> OvercookedAction:
-        assert self._actor in ("human", "robot")
-        return OvercookedAction(actor=self._actor)
+        assert self._flag in (0, 1)
+        self._last_subtask = obs.current_subtask
+        return OvercookedAction(flag=self._flag)
 
     def check_termination(self, obs: OvercookedState) -> bool:
-        return obs.current_subtask is None or self._done_emitted
+        # Recompute when the subtask changes — each subtask needs a fresh
+        # CSP decision. Without this, the same flag persists for all subtasks
+        # in the episode, preventing per-subtask preference learning.
+        if obs.current_subtask is None:
+            return True
+        if obs.current_subtask != self._last_subtask:
+            return True
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -98,6 +106,8 @@ class _AssignPreferenceGenerator(
         verbose: bool = False,
         config: OvercookedConfig | None = None,
         shared_hbm: OvercookedPreferenceModel | None = None,
+        preference_model: Any | None = None,
+        scalar_psi: bool = False,
     ) -> None:
         super().__init__(seed)
 
@@ -106,7 +116,12 @@ class _AssignPreferenceGenerator(
         self._layout_list: list[str] = layout_list if layout_list is not None else []
         self._verbose = verbose
 
-        if shared_hbm is not None:
+        if preference_model is not None:
+            self._hbm = preference_model
+            self._hbm.register_human(human_id)
+            for L in self._layout_list:
+                self._hbm.register_layout(human_id, L)
+        elif shared_hbm is not None:
             self._hbm = shared_hbm
             self._hbm.register_human(human_id)
             for L in self._layout_list:
@@ -121,16 +136,22 @@ class _AssignPreferenceGenerator(
                 sigma_r=self.config.hbm.sigma_r,
                 sigma_obs=self.config.hbm.sigma_obs,
                 config=self.config,
+                scalar_psi=scalar_psi,
             )
         self._current_layout_name: str | None = None
 
+        # Conflict tracking: decreasing conflict_rate signals HBM convergence.
+        self._episode_steps: int = 0
+        self._episode_conflicts: int = 0
+        self._conflict_rate: float = 0.0
+
     def save(self, model_dir: Path) -> None:
-        if self._verbose:
-            logging.info("[Save] Overcooked HBM (save not yet implemented)")
+        if hasattr(self._hbm, "save"):
+            self._hbm.save(model_dir)
 
     def load(self, model_dir: Path) -> None:
-        if self._verbose:
-            logging.info("[Load] Overcooked HBM (load not yet implemented)")
+        if hasattr(self._hbm, "load"):
+            self._hbm.load(model_dir)
 
     def generate(
         self,
@@ -138,17 +159,20 @@ class _AssignPreferenceGenerator(
         variables: list[CSPVariable],
         name: str,
     ) -> CSPConstraint:
-        (actor_var,) = variables
+        (flag_var,) = variables
         current = obs.current_subtask
 
-        def _logprob(actor: str) -> float:
+        def _logprob(flag: int) -> float:
             if self._current_layout_name and current:
+                # flag=1 → robot passes (predicts human will claim)
+                # flag=0 → robot claims (predicts human won't claim)
+                actor = "human" if flag == 1 else "robot"
                 return self._hbm.log_prob_prefer(
                     self._human_id, self._current_layout_name, current, actor
                 )
             return np.log(0.5)
 
-        return LogProbCSPConstraint(name, [actor_var], _logprob, threshold=np.log(0.3))
+        return LogProbCSPConstraint(name, [flag_var], _logprob, threshold=np.log(0.3))
 
     def learn_from_transition(
         self,
@@ -158,8 +182,36 @@ class _AssignPreferenceGenerator(
         done: bool,
         info: dict[str, Any],
     ) -> None:
-        """Update HBM on each observed transition."""
+        """Update preference model on each observed transition.
+
+        All models receive the same continuous satisfaction signal in [-1, +1].
+        This ensures fair comparison — the HBM doesn't get a richer signal
+        than baselines. The satisfaction encodes preference magnitude, session
+        effects, and coordination quality.
+
+        Conflict and timeout steps (task_score == 0) are skipped for all models.
+        """
         if info.get("last_subtask") is None or info.get("last_actor") is None:
+            return
+
+        # Track conflict rate as convergence diagnostic.
+        self._episode_steps += 1
+        if info.get("conflict", False):
+            self._episode_conflicts += 1
+
+        # Skip update on conflict steps or when there's no satisfaction signal.
+        # Note: forced steps (item continuations) DO have satisfaction != 0
+        # and should be processed — they carry preference information.
+        satisfaction = float(info.get("satisfaction", 0.0))
+        if info.get("conflict", False) or abs(satisfaction) < 1e-6:
+            if done:
+                self._conflict_rate = (
+                    self._episode_conflicts / self._episode_steps
+                    if self._episode_steps > 0 else 0.0
+                )
+                self._episode_steps = 0
+                self._episode_conflicts = 0
+                self._finalize_episode()
             return
 
         layout_name = obs.layout_name
@@ -169,12 +221,21 @@ class _AssignPreferenceGenerator(
 
         actor = str(info["last_actor"])
         subtask = str(info["last_subtask"])
-        task_score = float(info["task_score"])
 
         if layout_name:
-            self._hbm.observe(self._human_id, layout_name, subtask, actor, task_score)
+            # All models receive the same continuous satisfaction signal.
+            # This ensures fair comparison — all models get the same
+            # information quality from the environment.
+            sat = float(info.get("satisfaction", 0.0))
+            self._hbm.observe(self._human_id, layout_name, subtask, actor, sat)
 
         if done:
+            self._conflict_rate = (
+                self._episode_conflicts / self._episode_steps
+                if self._episode_steps > 0 else 0.0
+            )
+            self._episode_steps = 0
+            self._episode_conflicts = 0
             self._finalize_episode()
 
     def _finalize_episode(self) -> None:
@@ -183,10 +244,11 @@ class _AssignPreferenceGenerator(
             logging.info("[Episode] Overcooked HBM updated (theta, mu, psi)")
 
     def get_metrics(self) -> dict[str, float]:
-        """Return psi diagnostics (replaces mood metrics from spices)."""
+        """Return psi diagnostics and conflict-rate convergence metric."""
         psi_vec = self._hbm.get_psi_vec(self._human_id)
         return {
-            f"psi_{i}": float(v) for i, v in enumerate(psi_vec)
+            "conflict_rate": self._conflict_rate,
+            **{f"psi_{i}": float(v) for i, v in enumerate(psi_vec)},
         }
 
 
@@ -213,12 +275,21 @@ class OvercookedAssignCSPGenerator(
         verbose: bool = False,
         config: OvercookedConfig | None = None,
         shared_hbm: OvercookedPreferenceModel | None = None,
+        preference_model: Any | None = None,
+        feasibility: dict[str, dict[str, bool]] | None = None,
         seed: int = 0,
         explore_method: str = "max-entropy",
         disable_learning: bool = False,
+        mood_learning_enabled: bool = True,
+        scalar_psi: bool = False,
     ) -> None:
         super().__init__(seed=seed, explore_method=explore_method, disable_learning=disable_learning)
         self._subtasks = list(subtask_list)
+        self._feasibility = feasibility
+        if preference_model is not None:
+            self._baseline_model = preference_model
+        else:
+            self._baseline_model = None
         self._pref_gen = _AssignPreferenceGenerator(
             subtask_list=self._subtasks,
             human_id=human_id,
@@ -226,7 +297,9 @@ class OvercookedAssignCSPGenerator(
             seed=self._seed,
             verbose=verbose,
             config=config,
-            shared_hbm=shared_hbm,
+            shared_hbm=shared_hbm if preference_model is None else None,
+            preference_model=preference_model,
+            scalar_psi=scalar_psi,
         )
         self._init_rng = np.random.default_rng(self._seed)
 
@@ -263,9 +336,11 @@ class OvercookedAssignCSPGenerator(
     def _generate_variables(
         self, obs: OvercookedState
     ) -> tuple[list[CSPVariable], dict[CSPVariable, Any]]:
-        actor = CSPVariable("actor", EnumSpace(["human", "robot"]))
-        initialization = {actor: self._init_rng.choice(["human", "robot"])}
-        return [actor], initialization
+        # flag=0: robot claims the current subtask
+        # flag=1: robot passes (predicts human will claim)
+        flag = CSPVariable("flag", EnumSpace([0, 1]))
+        initialization = {flag: int(self._init_rng.integers(0, 2))}
+        return [flag], initialization
 
     def _generate_personal_constraints(
         self, obs: OvercookedState, variables: list[CSPVariable]
@@ -276,6 +351,41 @@ class OvercookedAssignCSPGenerator(
     def _generate_nonpersonal_constraints(
         self, obs: OvercookedState, variables: list[CSPVariable]
     ) -> list[CSPConstraint]:
+        """Physical feasibility constraints from layout reachability.
+
+        If the current subtask is infeasible for one agent, force the other.
+        E.g. in forced_coordination, robot can't reach onion dispensers,
+        so fetch_ingredient must go to human (flag=1).
+        """
+        if self._feasibility is None or obs.current_subtask is None:
+            return []
+
+        subtask = obs.current_subtask
+        robot_ok = self._feasibility.get("robot", {}).get(subtask, True)
+        human_ok = self._feasibility.get("human", {}).get(subtask, True)
+
+        if robot_ok and human_ok:
+            return []  # both can do it, no constraint needed
+
+        flag_var = variables[0]
+
+        if not robot_ok and human_ok:
+            # Robot can't reach — force human (flag=1).
+            def _must_be_human(flag: int) -> float:
+                return 0.0 if flag == 1 else -100.0
+            return [LogProbCSPConstraint(
+                "feasibility_human_only", [flag_var], _must_be_human, threshold=-1.0
+            )]
+
+        if robot_ok and not human_ok:
+            # Human can't reach — force robot (flag=0).
+            def _must_be_robot(flag: int) -> float:
+                return 0.0 if flag == 0 else -100.0
+            return [LogProbCSPConstraint(
+                "feasibility_robot_only", [flag_var], _must_be_robot, threshold=-1.0
+            )]
+
+        # Neither can reach — shouldn't happen, but don't constrain.
         return []
 
     def _generate_cost(
@@ -285,77 +395,79 @@ class OvercookedAssignCSPGenerator(
         Variance-weighted combined explore + exploit cost (max-entropy training).
 
         Identical structure to spices Stage 3:
-          cost(actor) = -log_prob_prefer(actor)           [exploit]
-                      + (-phi_entropy if actor != preferred)  [explore]
+          cost(flag=1) = -log_prob_prefer("human")   [pass → predict human claims]
+          cost(flag=0) = -log_prob_prefer("robot")   [claim → predict human won't]
+          + (-phi_entropy if flag doesn't match predicted preference)  [explore]
         """
         if self._train_or_eval != "train" or self._explore_method != "max-entropy":
             return self._generate_exploit_cost(obs, variables)
 
-        actor_var = variables[0]
+        flag_var = variables[0]
         current = obs.current_subtask
         hbm = self._pref_gen._hbm
         human_id = self._pref_gen._human_id
 
-        def _combined_cost(actor_val: str) -> float:
+        def _combined_cost(flag_val: int) -> float:
             layout = self._pref_gen._current_layout_name
             if not layout or not current:
                 return 0.0
-            log_p = hbm.log_prob_prefer(human_id, layout, current, actor_val)
+            actor_for_logprob = "human" if flag_val == 1 else "robot"
+            log_p = hbm.log_prob_prefer(human_id, layout, current, actor_for_logprob)
             exploit_cost = -log_p
 
             phi = hbm.get_phi(human_id, layout, current)
             psi = hbm.get_running_psi(human_id, current)
-            preferred = "human" if (phi + psi) >= 0 else "robot"
-            if actor_val != preferred:
+            preferred_flag = 1 if (phi + psi) >= 0 else 0
+            if flag_val != preferred_flag:
                 explore_cost = -hbm.get_phi_entropy(human_id, layout, current)
             else:
                 explore_cost = 0.0
 
             return exploit_cost + explore_cost
 
-        return CSPCost("variance_weighted_entropy", [actor_var], _combined_cost)
+        return CSPCost("variance_weighted_entropy", [flag_var], _combined_cost)
 
     def _generate_exploit_cost(
         self, obs: OvercookedState, variables: list[CSPVariable]
     ) -> CSPCost | None:
-        actor = variables[0]
+        flag = variables[0]
         current = obs.current_subtask
 
-        def _cost_fn(actor_val: str) -> float:
+        def _cost_fn(flag_val: int) -> float:
             layout = self._pref_gen._current_layout_name
             if layout and current:
+                actor_for_logprob = "human" if flag_val == 1 else "robot"
                 return -self._pref_gen._hbm.log_prob_prefer(
-                    self._pref_gen._human_id, layout, current, actor_val
+                    self._pref_gen._human_id, layout, current, actor_for_logprob
                 )
             return 0.0
 
-        return CSPCost("maximize_preference", [actor], _cost_fn)
+        return CSPCost("maximize_preference", [flag], _cost_fn)
 
     def _generate_samplers(
         self, obs: OvercookedState, csp: CSP
     ) -> list[CSPSampler]:
-        actor = csp.variables[0]
+        flag = csp.variables[0]
         current = obs.current_subtask
 
-        def _sample_actor(
+        def _sample_flag(
             sol: dict[CSPVariable, Any], rng: np.random.Generator
         ) -> dict[CSPVariable, Any]:
-            probs = []
-            for a in ["human", "robot"]:
-                layout = self._pref_gen._current_layout_name
-                if layout and current:
-                    logp = self._pref_gen._hbm.log_prob_prefer(
-                        self._pref_gen._human_id, layout, current, a
-                    )
-                    p = float(np.exp(logp))
-                else:
-                    p = 0.5
-                probs.append(max(p, 1e-6))
-            probs_arr = np.array(probs)
+            layout = self._pref_gen._current_layout_name
+            if layout and current:
+                logp_human = self._pref_gen._hbm.log_prob_prefer(
+                    self._pref_gen._human_id, layout, current, "human"
+                )
+                p_human = float(np.exp(logp_human))
+            else:
+                p_human = 0.5
+            p_human = max(p_human, 1e-6)
+            p_robot = max(1.0 - p_human, 1e-6)
+            probs_arr = np.array([p_robot, p_human])  # [flag=0, flag=1]
             probs_arr /= probs_arr.sum()
-            return {actor: rng.choice(["human", "robot"], p=probs_arr)}
+            return {flag: int(rng.choice([0, 1], p=probs_arr))}
 
-        return [FunctionalCSPSampler(_sample_actor, csp, {actor})]
+        return [FunctionalCSPSampler(_sample_flag, csp, {flag})]
 
     def _generate_policy(
         self, obs: OvercookedState, csp_variables: Collection[CSPVariable]

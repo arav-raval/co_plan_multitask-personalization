@@ -1,8 +1,9 @@
 defaults:
   - ours
 
-# Flat Beta-Bernoulli model: no hierarchy across recipes or humans.
-# Ablates Claims 2 & 3 (cross-recipe and cross-human transfer).
+# Flat Beta-Bernoulli model: independent posterior per (human, layout, subtask).
+# No hierarchy across layouts or humans. Same max-entropy exploration.
+# Ablates Claims 2 & 3 (cross-layout and cross-human transfer).
 preference_model_type: flat
-explore_method: exploit-only
+explore_method: max-entropy
 mood_learning_enabled: false

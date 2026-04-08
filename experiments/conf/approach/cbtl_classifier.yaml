@@ -1,8 +1,9 @@
 defaults:
   - ours
 
-# Original CBTL paper baseline: supervised logistic classifier per (human, spice).
-# No hierarchy, no psi, no mood handling. Direct paper comparison.
+# CBTL paper baseline: supervised logistic classifier per (human, subtask).
+# No hierarchy, no psi. Uses the same max-entropy exploration as the paper
+# (variance-weighted Bernoulli entropy with observation-count-based variance).
 preference_model_type: cbtl
-explore_method: exploit-only
+explore_method: max-entropy
 mood_learning_enabled: false

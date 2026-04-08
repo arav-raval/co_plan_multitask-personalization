@@ -45,13 +45,13 @@ from multitask_personalization.structs import (
 class _SpiceCSPPolicy(CSPPolicy[SpiceState, SpiceAction]):
     def __init__(self, csp_variables: Collection[CSPVariable], seed: int = 0) -> None:
         super().__init__(csp_variables, seed)
-        self._actor: str | None = None
+        self._flag: int | None = None
         self._done_emitted = False
         self._action_taken = False
 
     def reset(self, solution: dict[CSPVariable, Any]) -> None:
         super().reset(solution)
-        self._actor = self._get_value("actor")
+        self._flag = self._get_value("flag")
         self._done_emitted = False
         self._action_taken = False
 
@@ -62,9 +62,9 @@ class _SpiceCSPPolicy(CSPPolicy[SpiceState, SpiceAction]):
             self._done_emitted = True
             return (1, None)
 
-        assert self._actor in ("human", "robot")
+        assert self._flag in (0, 1)
         self._action_taken = True
-        return (0, self._actor)
+        return (self._flag, None)
 
     def check_termination(self, obs: SpiceState) -> bool:
         # Re-solve the CSP for each new spice so per-spice phi is used.
@@ -137,6 +137,11 @@ class _AssignPreferenceGenerator(CSPConstraintGenerator[SpiceState, SpiceAction]
         # Holds the last-updated HBM diagnostics. Persists across steps so the CSV
         # always has a value (from most recent episode end) rather than NaN.
         self._hbm_metrics: dict[str, float] = {}
+
+        # Conflict tracking: conflict rate decreases as HBM converges on human preferences.
+        self._episode_steps: int = 0
+        self._episode_conflicts: int = 0
+        self._conflict_rate: float = 0.0  # from most recent completed episode
 
     def _get_mood_posterior(self) -> np.ndarray:
         """Return mood posterior array, defaulting to neutral for non-HBM models."""
@@ -228,21 +233,38 @@ class _AssignPreferenceGenerator(CSPConstraintGenerator[SpiceState, SpiceAction]
                 hbm.log_sigma_r.copy_(state["log_sigma_r"])
                 hbm.log_sigma_obs.copy_(state["log_sigma_obs"])
             self._current_recipe_name = state["current_recipe_name"]
+
+            # Cross-recipe transfer: any recipe registered in this HBM but absent
+            # from the loaded checkpoint needs phi re-initialized from the (now
+            # loaded) theta.  This enables Claim 2: train on recipes A,B,C, load
+            # into an eval approach that has recipe D registered — phi_D gets
+            # warm-started from the learned theta.
+            loaded_recipes = set(state.get("phi_m", {}).get("human", {}).keys())
+            for h in list(hbm._phi_m.keys()):
+                for r in list(hbm._phi_m[h].keys()):
+                    if r not in loaded_recipes:
+                        # Re-register: overwrites phi with current theta values
+                        del hbm._phi_m[h][r]
+                        del hbm._phi_logv[h][r]
+                        hbm.register_recipe(h, r)
         else:
             self._hbm.load(model_dir)
 
     def generate(self, obs: SpiceState, variables: list[CSPVariable], name: str) -> CSPConstraint:
-        (actor_var,) = variables
+        (flag_var,) = variables
         current = obs.current_spice
 
-        def _logprob(actor: str) -> float:
-            if self._current_recipe_name:
+        def _logprob(flag: int) -> float:
+            if self._current_recipe_name and current:
+                # flag=1 means robot predicts human will claim → prefer when P(human) is high
+                # flag=0 means robot claims → prefer when P(robot) is high (P(human) is low)
+                actor = "human" if flag == 1 else "robot"
                 return self._hbm.log_prob_prefer(
                     self._human_id, self._current_recipe_name, current, actor
                 )
             return np.log(0.5)
 
-        return LogProbCSPConstraint(name, [actor_var], _logprob, threshold=np.log(0.3))
+        return LogProbCSPConstraint(name, [flag_var], _logprob, threshold=np.log(0.3))
 
     def learn_from_transition(
         self,
@@ -252,8 +274,32 @@ class _AssignPreferenceGenerator(CSPConstraintGenerator[SpiceState, SpiceAction]
         done: bool,
         info: dict[str, Any],
     ) -> None:
-        """Update mood posterior and HBM on each observed transition."""
+        """Update HBM on each observed transition.
+
+        Uses task_score as the behavioral observation signal:
+          +1  human claimed this spice
+          -1  human did not claim
+           0  conflict step — skip HBM update (human wins but signal is ambiguous)
+        """
         if info.get("last_spice") is None or info.get("last_actor") is None:
+            return
+
+        # Track conflict rate as convergence diagnostic.
+        self._episode_steps += 1
+        if info.get("conflict", False):
+            self._episode_conflicts += 1
+
+        # Skip HBM update on conflict steps (task_score == 0); no clean signal.
+        task_score = float(info.get("task_score", info.get("satisfaction", 0.0)))
+        if info.get("conflict", False) or task_score == 0.0:
+            if done:
+                self._conflict_rate = (
+                    self._episode_conflicts / self._episode_steps
+                    if self._episode_steps > 0 else 0.0
+                )
+                self._episode_steps = 0
+                self._episode_conflicts = 0
+                self._finalize_episode()
             return
 
         recipe_name = info.get("recipe_name") or self._current_recipe_name
@@ -264,10 +310,18 @@ class _AssignPreferenceGenerator(CSPConstraintGenerator[SpiceState, SpiceAction]
 
         actor = str(info["last_actor"])
         spice = str(info["last_spice"])
-        satisfaction = float(info["satisfaction"])
 
         if recipe_name:
-            self._hbm.observe(self._human_id, recipe_name, spice, actor, satisfaction)
+            if isinstance(self._hbm, HierarchicalPreferenceModel):
+                # HBM receives continuous satisfaction (Beta-sampled in [-1,+1]).
+                # This encodes preference magnitude via true hidden phi, giving the
+                # Gaussian likelihood term meaningful gradient signal beyond {±1} extremes.
+                sat = float(info.get("satisfaction", task_score))
+            else:
+                # CBTL/FlatModel: keep binary task_score for faithful comparison.
+                # Their soft-label weight (sat+1)/2 maps {+1,-1} → {1,0} cleanly.
+                sat = task_score
+            self._hbm.observe(self._human_id, recipe_name, spice, actor, sat)
 
         # Capture mood AFTER the observation update but BEFORE the episode reset
         # so callers always see the inferred mood for the current step.
@@ -275,6 +329,12 @@ class _AssignPreferenceGenerator(CSPConstraintGenerator[SpiceState, SpiceAction]
         info["expected_mood"] = self.get_expected_mood()
 
         if done:
+            self._conflict_rate = (
+                self._episode_conflicts / self._episode_steps
+                if self._episode_steps > 0 else 0.0
+            )
+            self._episode_steps = 0
+            self._episode_conflicts = 0
             self._finalize_episode()
 
     def learn_from_transition_eval(
@@ -288,15 +348,23 @@ class _AssignPreferenceGenerator(CSPConstraintGenerator[SpiceState, SpiceAction]
         """Update running_psi only (no phi/theta learning) for mid-episode eval adaptation."""
         if info.get("last_spice") is None or info.get("last_actor") is None:
             return
+        # Skip on conflict steps.
+        if info.get("conflict", False):
+            return
         recipe_name = info.get("recipe_name") or self._current_recipe_name
         if not recipe_name:
             return
         self._current_recipe_name = recipe_name
         actor = str(info["last_actor"])
         spice = str(info["last_spice"])
-        satisfaction = float(info["satisfaction"])
+        task_score = float(info.get("task_score", 0.0))
+        # HBM eval psi adaptation uses continuous satisfaction; CBTL uses binary task_score.
+        if isinstance(self._hbm, HierarchicalPreferenceModel):
+            sat = float(info.get("satisfaction", task_score))
+        else:
+            sat = task_score
         self._hbm.observe_eval(
-            self._human_id, recipe_name, spice, actor, satisfaction, done
+            self._human_id, recipe_name, spice, actor, sat, done
         )
 
     def _finalize_episode(self) -> None:
@@ -338,11 +406,9 @@ class _AssignPreferenceGenerator(CSPConstraintGenerator[SpiceState, SpiceAction]
         self._hbm_metrics = metrics
 
     def get_metrics(self) -> dict[str, float]:
-        """Return mood inference and HBM sentinel-spice diagnostics."""
-        mp = self._get_mood_posterior()
+        """Return HBM diagnostics and conflict-rate convergence metric."""
         return {
-            "expected_mood": self.get_expected_mood(),
-            "neutral_confidence": float(mp[MOODS.index("neutral")]),
+            "conflict_rate": self._conflict_rate,
             **self._hbm_metrics,
         }
 
@@ -410,9 +476,11 @@ class SpicesAssignCSPGenerator(CSPGenerator[SpiceState, SpiceAction]):
     def _generate_variables(
         self, obs: SpiceState
     ) -> tuple[list[CSPVariable], dict[CSPVariable, Any]]:
-        actor = CSPVariable("actor", EnumSpace(["human", "robot"]))
-        initialization = {actor: self._init_rng.choice(["human", "robot"])}
-        return [actor], initialization
+        # flag=0: robot claims the current spice
+        # flag=1: robot passes (predicts human will claim)
+        flag = CSPVariable("flag", EnumSpace([0, 1]))
+        initialization = {flag: int(self._init_rng.integers(0, 2))}
+        return [flag], initialization
 
     def _generate_personal_constraints(
         self, obs: SpiceState, variables: list[CSPVariable]
@@ -443,21 +511,21 @@ class SpicesAssignCSPGenerator(CSPGenerator[SpiceState, SpiceAction]):
         In max-entropy training mode, replaces the base class's variance-blind
         entropy cost with a combined exploit + explore cost:
 
-            cost(actor) = exploit_cost(actor) + explore_cost(actor)
+            cost(flag) = exploit_cost(flag) + explore_cost(flag)
 
         where:
-            exploit_cost(actor) = -log_prob_prefer(actor)
-                                  (lower for the preferred actor — pure exploitation)
-            explore_cost(actor) = 0                         if actor == preferred
-                                = -get_phi_entropy(spice)   if actor != preferred
-                                  (reward for trying the unexpected actor, scaled
-                                   by H(B(sigmoid(phi_mean))) * phi_var)
+            exploit_cost(flag=1) = -log_prob_prefer("human")   [pass → predict human claims]
+            exploit_cost(flag=0) = -log_prob_prefer("robot")   [claim → predict human won't]
+            explore_cost(flag)   = 0                           if flag matches predicted preference
+                                 = -get_phi_entropy(spice)     otherwise
+                                   (reward for exploring uncertainty, scaled by
+                                    H(B(sigmoid(phi_mean))) * phi_var)
 
         This naturally transitions from exploration to exploitation:
           - Large phi_var (few observations): explore_cost dominates → unexpected
-            actor gets negative cost bonus → CSP explores.
+            flag gets negative cost bonus → CSP explores.
           - Small phi_var (many observations): explore_cost ≈ 0 → exploit_cost
-            dominates → CSP picks the preferred actor.
+            dominates → CSP picks the flag that matches the model's preference.
 
         No explicit annealing schedule is needed; the posterior variance provides
         the signal automatically. This implements the CBTL entropy criterion from
@@ -468,25 +536,25 @@ class SpicesAssignCSPGenerator(CSPGenerator[SpiceState, SpiceAction]):
         if self._train_or_eval != "train" or self._explore_method != "max-entropy":
             return self._generate_exploit_cost(obs, variables)
 
-        actor_var = variables[0]
+        flag_var = variables[0]
         current = obs.current_spice
         hbm = self._pref_gen._hbm
         human_id = self._pref_gen._human_id
 
-        def _combined_cost(actor_val: str) -> float:
+        def _combined_cost(flag_val: int) -> float:
             recipe = self._pref_gen._current_recipe_name
             if not recipe or not current:
                 return 0.0
 
-            # Exploit component: lower cost for the actor the model prefers
-            log_p = hbm.log_prob_prefer(human_id, recipe, current, actor_val)
+            # flag=1 (pass) → robot predicts human will claim; flag=0 (claim) → robot predicts robot
+            actor_for_logprob = "human" if flag_val == 1 else "robot"
+            log_p = hbm.log_prob_prefer(human_id, recipe, current, actor_for_logprob)
             exploit_cost = -log_p
 
-            # Explore component: bonus for the unexpected actor, scaled by
-            # variance-weighted entropy (large early, shrinks as phi converges)
+            # Explore component: bonus for the uncertain flag, scaled by variance-weighted entropy.
             phi = hbm.get_phi(human_id, recipe, current)
-            preferred = "human" if phi >= 0 else "robot"
-            if actor_val != preferred:
+            preferred_flag = 1 if phi >= 0 else 0  # phi>0 → human prefers, robot should pass
+            if flag_val != preferred_flag:
                 explore_val = hbm.get_phi_entropy(human_id, recipe, current)
                 explore_cost = -explore_val
             else:
@@ -494,52 +562,53 @@ class SpicesAssignCSPGenerator(CSPGenerator[SpiceState, SpiceAction]):
 
             return exploit_cost + explore_cost
 
-        return CSPCost("variance_weighted_entropy", [actor_var], _combined_cost)
+        return CSPCost("variance_weighted_entropy", [flag_var], _combined_cost)
 
     def _generate_exploit_cost(
         self, obs: SpiceState, variables: list[CSPVariable]
     ) -> CSPCost | None:
-        """Minimize negative HBM log-probability of actor for the current spice."""
-        actor = variables[0]
+        """Minimize negative HBM log-probability for the predicted actor."""
+        flag = variables[0]
         current = obs.current_spice
 
-        def _cost_fn(actor_val: str) -> float:
-            if self._pref_gen._current_recipe_name:
+        def _cost_fn(flag_val: int) -> float:
+            if self._pref_gen._current_recipe_name and current:
+                actor_for_logprob = "human" if flag_val == 1 else "robot"
                 return -self._pref_gen._hbm.log_prob_prefer(
                     self._pref_gen._human_id,
                     self._pref_gen._current_recipe_name,
                     current,
-                    actor_val,
+                    actor_for_logprob,
                 )
             return 0.0
 
-        return CSPCost("maximize_preference", [actor], _cost_fn)
+        return CSPCost("maximize_preference", [flag], _cost_fn)
 
     def _generate_samplers(self, obs: SpiceState, csp: CSP) -> list[CSPSampler]:
-        actor = csp.variables[0]
+        flag = csp.variables[0]
         current_spice = obs.current_spice
 
-        def _sample_actor(
+        def _sample_flag(
             sol: dict[CSPVariable, Any], rng: np.random.Generator
         ) -> dict[CSPVariable, Any]:
-            probs = []
-            for a in ["human", "robot"]:
-                if self._pref_gen._current_recipe_name:
-                    logp = self._pref_gen._hbm.log_prob_prefer(
-                        self._pref_gen._human_id,
-                        self._pref_gen._current_recipe_name,
-                        current_spice,
-                        a,
-                    )
-                    p = float(np.exp(logp))
-                else:
-                    p = 0.5
-                probs.append(max(p, 1e-6))
-            probs_arr = np.array(probs)
+            # P(flag=1) = P(human will claim) — sample proportional to HBM posterior.
+            if self._pref_gen._current_recipe_name and current_spice:
+                logp_human = self._pref_gen._hbm.log_prob_prefer(
+                    self._pref_gen._human_id,
+                    self._pref_gen._current_recipe_name,
+                    current_spice,
+                    "human",
+                )
+                p_human = float(np.exp(logp_human))
+            else:
+                p_human = 0.5
+            p_human = max(p_human, 1e-6)
+            p_robot = max(1.0 - p_human, 1e-6)
+            probs_arr = np.array([p_robot, p_human])  # [flag=0, flag=1]
             probs_arr /= probs_arr.sum()
-            return {actor: rng.choice(["human", "robot"], p=probs_arr)}
+            return {flag: int(rng.choice([0, 1], p=probs_arr))}
 
-        return [FunctionalCSPSampler(_sample_actor, csp, {actor})]
+        return [FunctionalCSPSampler(_sample_flag, csp, {flag})]
 
     def _generate_policy(
         self, obs: SpiceState, csp_variables: Collection[CSPVariable]

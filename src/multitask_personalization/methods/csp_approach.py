@@ -25,6 +25,16 @@ from multitask_personalization.envs.pybullet.pybullet_env import PyBulletEnv
 from multitask_personalization.envs.pybullet.pybullet_scene_spec import (
     PyBulletSceneSpec,
 )
+from multitask_personalization.envs.overcooked.overcooked_baselines import (
+    OvercookedCBTLClassifierModel,
+    OvercookedFlatPreferenceModel,
+)
+from multitask_personalization.envs.overcooked.overcooked_csp import (
+    OvercookedAssignCSPGenerator,
+)
+from multitask_personalization.envs.overcooked.overcooked_env import (
+    OvercookedSceneSpec,
+)
 from multitask_personalization.envs.spices.recipes import get_recipe
 from multitask_personalization.envs.spices.spices_baselines import (
     CBTLClassifierModel,
@@ -59,6 +69,7 @@ class CSPApproach(BaseApproach[_ObsType, _ActType]):
         disable_learning: bool = False,
         mood_learning_enabled: bool = True,
         preference_model_type: str = "hbm",
+        psi_type: str = "vector",
         csp_save_dir: str | None = None,
         seed: int = 0,
         lifelong_learning: dict | None = None,
@@ -72,6 +83,7 @@ class CSPApproach(BaseApproach[_ObsType, _ActType]):
         self._disable_learning = disable_learning
         self._mood_learning_enabled = mood_learning_enabled
         self._preference_model_type = preference_model_type
+        self._psi_type = psi_type
         self._motion_planning_quality = motion_planning_quality
         self._csp_save_dir = Path(csp_save_dir) if csp_save_dir else None
         self._lifelong_learning = lifelong_learning
@@ -239,6 +251,30 @@ class CSPApproach(BaseApproach[_ObsType, _ActType]):
                 self._seed,
                 explore_method=self._explore_method,
                 disable_learning=self._disable_learning,
+            )
+        if isinstance(self._scene_spec, OvercookedSceneSpec):
+            spec = self._scene_spec
+            subtask_list = list(spec.subtask_list)
+            layout_list = [spec.layout_spec.name]
+            preference_model = None
+            if self._preference_model_type == "flat":
+                preference_model = OvercookedFlatPreferenceModel(
+                    subtasks=subtask_list, layouts=layout_list
+                )
+            elif self._preference_model_type == "cbtl":
+                preference_model = OvercookedCBTLClassifierModel(
+                    subtasks=subtask_list, layouts=layout_list
+                )
+            return OvercookedAssignCSPGenerator(
+                subtask_list=subtask_list,
+                layout_list=layout_list,
+                seed=self._seed,
+                explore_method=self._explore_method,
+                disable_learning=self._disable_learning,
+                mood_learning_enabled=self._mood_learning_enabled,
+                preference_model=preference_model,
+                feasibility=spec.feasibility,
+                scalar_psi=(self._psi_type == "scalar"),
             )
         if isinstance(self._scene_spec, SpiceSceneSpec):
             spec = self._scene_spec

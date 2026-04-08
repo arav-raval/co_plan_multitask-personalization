@@ -145,20 +145,51 @@ class SpiceState:
 # --- ACTION SPECIFICATIONS ---
 """
 Action: (flag, payload)
-flag = 0: add, flag = 1: done
-payload: the name of the actor assigned to add the next spice (only if flag = 0)
+flag = 0: robot claims the current spice for itself (predicting human won't want it)
+flag = 1: robot signals done / passes (predicting human will claim this spice)
+payload: None (unused in the new autonomous-human semantics)
+
+New semantics (human-led autonomous system):
+  At each step the human FIRST decides whether to claim the current spice, based on
+  their hidden preference phi and current session offset psi_true:
+      P(human claims) = sigma(phi[spice] + psi_true)
+
+  The robot simultaneously commits to either claiming the spice (flag=0) or passing (flag=1).
+
+  Outcomes:
+    - Robot claims (flag=0), human does NOT claim → robot adds spice. task_score = -1
+      (robot was right that human didn't want it, but signal is from the behavioral
+       observation: human not claiming = -1 for "human preferred").
+    - Robot claims (flag=0), human ALSO claims → CONFLICT. Human wins. Robot gets a
+      null step (task_score=0). Robot must replan next step.
+    - Robot passes (flag=1), human claims → human adds spice. task_score = +1
+      (correct prediction: human wanted it).
+    - Robot passes (flag=1), human does NOT claim → robot must add anyway (someone
+      must add the spice). task_score = -1 (robot mispredicted: thought human would
+      claim but they didn't).
+
+  The task_score fed to the HBM is:
+    +1  human claimed this spice (regardless of what robot did)
+    -1  human did not claim this spice
+     0  conflict step (no HBM update — robot replans)
+
+  This replaces the old satisfaction-proxy signal with a direct behavioral observation.
 """
 SpiceAction: TypeAlias = tuple[int, str | None]
 
 # --- SPICES ENVIRONMENT ---
 class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
     """
-    A symbolic environment where actors can follow a recipe to add spices to a pot.
-    The human actor:
-        - has a hidden preference about which spices they prefer to add to the pot.
-        - has a mood that affects their satisfaction on a given episode.
-    The robot actor:
-        - is a perfect planner that can add spices to the pot in the optimal order.
+    A symbolic environment where actors follow a recipe to add spices to a pot.
+
+    Human-led autonomous semantics (V = V_r ∪ V_h):
+      The human autonomously claims spices according to their hidden preferences
+      P(human claims spice s) = sigma(phi[s] + psi_true). The robot predicts which
+      spices the human will claim (V_h) and picks unclaimed spices for itself (V_r).
+      Conflicts (both attempt same spice) are resolved in favour of the human.
+
+    The HBM learns from direct behavioral observations (+1 / -1 / 0) rather than
+    a noisy satisfaction proxy, enabling cleaner preference inference.
     """
 
     def __init__(
@@ -204,7 +235,9 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
         self._last_actor: str | None = None
         self._last_satisfaction: float = 0.0
         self._satisfaction_history: list[float] = []
+        self._prediction_history: list[bool] = []
         self._action_history: list[SpiceAction] = []
+        self._conflict_count: int = 0
         # Stage 2: true session offset sampled once per episode (replaces per-step mood_adj)
         self._current_psi_true: float = 0.0
 
@@ -264,7 +297,9 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
         self._last_actor = None
         self._last_satisfaction = 0.0
         self._satisfaction_history = []
+        self._prediction_history = []
         self._action_history = []
+        self._conflict_count = 0
 
         if self._hidden_spec.force_neutral_mood:
             self._current_mood = "neutral"
@@ -288,42 +323,129 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
     def step(
         self, action: SpiceAction
     ) -> tuple[SpiceState, float, bool, bool, dict[str, Any]]:
-        status, payload = action
+        """
+        Autonomous-human step.
 
+        The robot commits to either claiming the current spice (flag=0) or
+        passing/predicting the human will claim it (flag=1). Simultaneously,
+        the human decides whether to claim based on their hidden phi + psi_true.
+
+        Returns task_score in info:
+          +1  human claimed (direct behavioral observation)
+          -1  human did not claim
+           0  conflict (human wins, robot replans — no HBM update)
+        """
+        flag, _payload = action
         self._action_history.append(action)
 
-        # Robot indicated done without adding a spice.
-        if status:
-            info = self._get_info(robot_indicated_done=True)
-            return self._get_state(), 0.0, True, False, info
-
-        # Add the assigned spice.
-        assert payload is not None, "Payload is not set"
-        assert payload in {"human", "robot"}, "Invalid actor"
         if self._current_spice is None:
             info = self._get_info(robot_indicated_done=True)
             return self._get_state(), 0.0, True, False, info
 
-        self._last_actor = str(payload)
-        self._added.append(self._current_spice)
-        self._t += 1
+        current_spice = self._current_spice
+        robot_claims = (flag == 0)  # flag=0: robot tries to claim; flag=1: robot passes
 
-        # Compute and record satisfaction for the spice just assigned.
-        last_spice = self._added[-1]
-        preferred = self._hidden_spec.preferred_actor[last_spice]
-        self._last_satisfaction = self._compute_satisfaction(preferred)
-        self._satisfaction_history.append(self._last_satisfaction)
+        # Human autonomously decides whether to claim based on hidden phi + psi.
+        human_claims = self._human_claims(current_spice)
 
-        # Advance to the next spice
+        # Determine true hidden preference for this spice (used by satisfaction model).
+        # phi > 0 → human preferred, phi < 0 → robot preferred.
+        try:
+            recipe_name = self.scene_spec.recipe.name
+            if self._hidden_spec.hidden_hbm is not None:
+                _phi = self._hidden_spec.hidden_hbm.get_phi(DEFAULT_HUMAN, recipe_name, current_spice)
+                true_preferred = "human" if float(_phi) >= 0 else "robot"
+            else:
+                true_preferred = self._hidden_spec.preferred_actor.get(current_spice, "robot")
+        except Exception:
+            true_preferred = "robot"
+
+        # --- Resolve outcomes ---
+        if robot_claims and human_claims:
+            # CONFLICT: human wins, robot gets null step.
+            self._conflict_count += 1
+            task_score = 0.0
+            actor = "human"
+            self._last_actor = actor
+            self._added.append(current_spice)
+            self._t += 1
+            conflict = True
+            # Conflict: robot was wrong (it competed when it should have passed).
+            prediction_correct = False
+        else:
+            conflict = False
+            if human_claims:
+                # Human claimed, robot passed — correct prediction.
+                actor = "human"
+                task_score = 1.0
+                prediction_correct = True
+            elif robot_claims:
+                # Robot claimed, human didn't — correct prediction.
+                actor = "robot"
+                task_score = -1.0
+                prediction_correct = True
+            else:
+                # Robot passed but human didn't claim — misprediction, robot must add.
+                actor = "robot"
+                task_score = -1.0
+                prediction_correct = False
+
+            self._last_actor = actor
+            self._added.append(current_spice)
+            self._t += 1
+
+        # Continuous satisfaction: reflects whether the right actor performed the spice,
+        # modulated by the robot's prediction quality.  When the robot mispredicts
+        # (conflict or missed pass), satisfaction is attenuated toward zero — the
+        # human's experience suffers from poor coordination even if the spice ends up
+        # with the right actor.  This makes satisfaction sensitive to method quality.
+        satisfaction = self._compute_satisfaction(true_preferred, prediction_correct)
+
+        self._satisfaction_history.append(satisfaction)
+        self._last_satisfaction = satisfaction
+        self._prediction_history.append(prediction_correct)
+
+        # Advance to the next spice.
         self._current_spice = self._pick_current_spice()
-
         terminated = not self._current_spice
-        info = self._get_info(robot_indicated_done=terminated)
+        info = self._get_info(robot_indicated_done=terminated, conflict=conflict,
+                               task_score=task_score, satisfaction=satisfaction,
+                               prediction_correct=prediction_correct)
 
         if self.verbose:
-            logging.info(f"[Step {self._t - 1}] Assign {info['last_spice']} → {info['last_actor']}")
+            status = "CONFLICT" if conflict else f"actor={actor}"
+            logging.info(
+                f"[Step {self._t - 1}] {current_spice} → {status}  "
+                f"human_claims={human_claims}  robot_claims={robot_claims}  "
+                f"task_score={task_score:.2f}"
+            )
 
         return self._get_state(), 0.0, terminated, False, info
+
+    def _human_claims(self, spice: str) -> bool:
+        """
+        Sample whether the human autonomously claims this spice.
+
+        P(human claims) = sigma(phi[spice] + psi_true)
+
+        Uses the hidden HBM's phi if available; otherwise uses
+        preferred_actor as a hard prior (probability 1 or 0).
+        """
+        if self._hidden_spec.hidden_hbm is not None:
+            try:
+                recipe_name = self.scene_spec.recipe.name
+                phi = float(self._hidden_spec.hidden_hbm.get_phi(DEFAULT_HUMAN, recipe_name, spice))
+            except Exception:
+                phi = 0.0
+            # psi_true shifts the human's claiming probability this session.
+            logit = phi + self._current_psi_true
+            p_claim = float(1.0 / (1.0 + np.exp(-logit)))
+        else:
+            # Fallback: use preferred_actor as a deterministic prior.
+            preferred = self._hidden_spec.preferred_actor.get(spice, "robot")
+            p_claim = 1.0 if preferred == "human" else 0.0
+
+        return bool(self._rng.random() < p_claim)
 
     def render(self) -> RenderFrame | list[RenderFrame] | None:
         raise NotImplementedError
@@ -373,7 +495,9 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
             current_spice=self._current_spice,
         )
 
-    def _compute_satisfaction(self, preferred: str) -> float:
+    def _compute_satisfaction(
+        self, preferred: str, prediction_correct: bool
+    ) -> float:
         """
         Compute satisfaction for the most recently assigned spice.
 
@@ -388,12 +512,24 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
             logit      = actor_sign * (phi_latent + psi_true)
             p          = (tanh(logit/T) + 1) / 2    ← maps logit to (0,1)
             sat      ~ Beta(p*kappa, (1-p)*kappa) rescaled to [-1, +1]
-        E[sat] = 2*p - 1 = tanh(logit/T), so satisfaction reaches near ±1 for
-        strong preferences (no +1 Laplace offset that previously capped the mean).
+
+        Coordination cost (additive penalty):
+            When the robot mispredicts (conflict or missed pass), a fixed
+            coordination_cost is subtracted from satisfaction.  This models
+            the human's frustration from poor coordination *independently* of
+            the underlying preference strength — a coordination failure is
+            equally annoying whether the spice was strongly or weakly preferred.
+
+            Example with coordination_cost = 0.5:
+              correct prediction, strong preference:  +0.9 → +0.9  (unchanged)
+              misprediction, strong preference:       +0.9 → +0.4  (penalized)
+              misprediction, weak preference:         +0.2 → -0.3  (can go negative)
+
+            This makes satisfaction sensitive to robot prediction quality,
+            differentiating methods that predict well from those that don't.
 
         psi_true is sampled once per episode from a mood-conditioned distribution
-        (see _sample_psi_from_mood). This replaces the old per-step actor-dependent
-        compute_mood_bias call, aligning the generative model with the HBM's scalar psi.
+        (see _sample_psi_from_mood).
         """
         actor_sign = 1.0 if self._last_actor == "human" else -1.0
         pref_sign = 1.0 if preferred == "human" else -1.0
@@ -403,8 +539,9 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
         if self._hidden_spec.hidden_hbm is not None and self._added:
             spice = self._added[-1]
             try:
-                theta_val = self._hidden_spec.hidden_hbm.get_theta(DEFAULT_HUMAN, spice)
-                phi_mag = max(abs(float(theta_val)), 1e-6)
+                recipe_name = self.scene_spec.recipe.name
+                phi_val = self._hidden_spec.hidden_hbm.get_phi(DEFAULT_HUMAN, recipe_name, spice)
+                phi_mag = max(abs(float(phi_val)), 1e-6)
             except Exception:
                 phi_mag = self._base_satisfaction_bias
         phi_latent = pref_sign * phi_mag
@@ -413,14 +550,18 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
         temp = max(float(DEFAULT_CONFIG.satisfaction.satisfaction_logit_temperature), 1e-6)
         p = float(np.tanh(logit / temp))
         # Rescale tanh output from [-1,1] to [0,1] for Beta params.
-        # Use alpha=p*kappa, beta=(1-p)*kappa without the +1 Laplace offset so
-        # E[Beta(p*k, (1-p)*k)] = p exactly — satisfaction reaches near ±1 for
-        # strong preferences. p is clamped to keep alpha,beta strictly positive.
         p = float(np.clip((p + 1.0) / 2.0, 1e-6, 1.0 - 1e-6))
         alpha = p * self._satisfaction_kappa
         beta = (1.0 - p) * self._satisfaction_kappa
         p_sampled = self._rng.beta(alpha, beta)
-        return float(np.clip(2.0 * p_sampled - 1.0, -1.0, 1.0))
+        raw_sat = float(np.clip(2.0 * p_sampled - 1.0, -1.0, 1.0))
+
+        # Additive coordination cost: misprediction subtracts a flat penalty.
+        if not prediction_correct:
+            raw_sat -= DEFAULT_CONFIG.satisfaction.coordination_cost
+            raw_sat = max(raw_sat, -1.0)
+
+        return raw_sat
 
     def _sample_psi_from_mood(self, mood: str) -> float:
         """
@@ -446,38 +587,63 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
             std = float(DEFAULT_CONFIG.mood.psi_true_neutral_std)
         return float(self._rng.normal(mean, std))
 
-    def _get_info(self, robot_indicated_done: bool = False) -> dict[str, Any]:
+    def _get_info(
+        self,
+        robot_indicated_done: bool = False,
+        conflict: bool = False,
+        task_score: float = 0.0,
+        satisfaction: float = 0.0,
+        prediction_correct: bool | None = None,
+    ) -> dict[str, Any]:
         info: dict[str, Any] = {
             "robot_indicated_done": robot_indicated_done,
+            "conflict": conflict,
+            "conflict_count": self._conflict_count,
             "current_spice": self._current_spice,
             "feasible_next": tuple(self._current_feasible),
             "action_history": list(self._action_history),
             "mood": self._current_mood,
             "recipe_name": self.scene_spec.recipe.name,
             "force_neutral_mood": self._hidden_spec.force_neutral_mood,
+            "psi_true": self._current_psi_true,
         }
         if not self._added:
             info.update({
+                "task_score": 0.0,
+                # satisfaction: continuous Beta-sampled signal for HBM learning.
+                # task_score: binary {+1,-1,0} behavioral label for CBTL and eval metrics.
                 "satisfaction": 0.0,
                 "user_satisfaction": 0.0,
-                "preferred_actor": None,
                 "last_spice": None,
                 "last_actor": None,
                 "average_satisfaction": 0.0,
                 "satisfaction_history": [],
-                "satisfaction_variance": 0.0,
+                "prediction_correct": None,
+                "prediction_accuracy": float("nan"),
             })
         else:
             last_spice = self._added[-1]
+            pred_acc = (
+                float(np.mean(self._prediction_history))
+                if self._prediction_history else float("nan")
+            )
             info.update({
-                "satisfaction": self._last_satisfaction,
-                "user_satisfaction": self._last_satisfaction,
-                "preferred_actor": self._hidden_spec.preferred_actor[last_spice],
+                # task_score: binary behavioral label (+1 human claimed, -1 didn't, 0 conflict).
+                # Used by CBTL classifier and eval metrics (prediction_accuracy).
+                "task_score": task_score,
+                # satisfaction: continuous Beta-sampled value in [-1,+1].
+                # Encodes preference magnitude via true hidden phi — used by HBM Gaussian likelihood.
+                # Positive when the right actor performed the spice, negative otherwise.
+                "satisfaction": satisfaction,
+                # user_satisfaction aliases satisfaction for backward compat with runner CSV columns.
+                "user_satisfaction": satisfaction,
                 "last_spice": last_spice,
                 "last_actor": self._last_actor,
                 "average_satisfaction": float(np.mean(self._satisfaction_history)),
                 "satisfaction_history": list(self._satisfaction_history),
-                "satisfaction_variance": float(np.var(self._satisfaction_history)),
+                # Prediction accuracy: did robot's flag match human's true behavior?
+                "prediction_correct": prediction_correct,
+                "prediction_accuracy": pred_acc,
             })
         return info
 
