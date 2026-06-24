@@ -1,11 +1,6 @@
-"""Cross-human transfer experiment (Claim 3).
-
-Two-phase protocol:
-  Phase 1 — Population training:  Train on K humans with related preferences.
-            The HBM's mu (global prior) captures population-level patterns.
-  Phase 2 — Transfer evaluation:  Introduce a new human.  The HBM warm-starts
-            theta from learned mu.  Baselines (CBTL, Flat) start from scratch.
-            Measure convergence speed on the new human.
+"""Cross-human transfer experiment
+Phase 1: Population Training 
+Phase 2: Transfer evaluation (introduce a new human)
 
 Usage:
   python experiments/run_transfer_experiment.py \
@@ -17,8 +12,6 @@ Outputs are written to logs/<date>/<time>/ with:
   - phase1_train_results.csv   (population training metrics)
   - phase2_train_results.csv   (new-human training metrics)
   - phase2_eval_results.csv    (new-human eval metrics — the main comparison)
-  - models/                    (checkpoints)
-  - config.yaml                (full config dump)
 """
 
 from __future__ import annotations
@@ -32,13 +25,31 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import pandas as pd
+import torch
+import yaml
+
+from multitask_personalization.csp_solvers import EnumerationCSPSolver
+from multitask_personalization.envs.spices.config.spices_config import DEFAULT_CONFIG
+from multitask_personalization.envs.spices.spices_env import SpiceEnv, SpiceHiddenSpec
+from multitask_personalization.envs.spices.spices_experiment import (
+    build_spice_experiment_hidden_hbm,
+    build_spice_scene_spec_multi,
+    MULTI_RECIPE_EXPERIMENT_POOL,
+    POPULATION_HUMAN_CONFIGS,
+    NEW_HUMAN_CONFIG,
+)
+from multitask_personalization.envs.spices.spices_hbm import (
+    HierarchicalPreferenceModel,
+)
+from multitask_personalization.methods.csp_approach import CSPApproach
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Cross-human transfer experiment")
-    p.add_argument("--approach", default="ours", choices=["ours", "without_mood_learning", "cbtl_classifier", "flat_model"])
+    p.add_argument("--approach", default="ours", choices=["ours", "without_mood_learning", "cbtl_adapted", "flat_model"])
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--phase1-steps", type=int, default=3000, help="Training steps per population human")
     p.add_argument("--phase2-steps", type=int, default=2000, help="Training steps on new human")
@@ -52,16 +63,11 @@ def _parse_args() -> argparse.Namespace:
 
 def _build_approach(approach_name: str, scene_spec: Any, action_space: Any, seed: int) -> Any:
     """Build a CSPApproach with the right preference model type."""
-    import sys
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-
-    from multitask_personalization.methods.csp_approach import CSPApproach
-    from multitask_personalization.csp_solvers import EnumerationCSPSolver
 
     preference_model_map = {
         "ours": ("hbm", "max-entropy", True),
         "without_mood_learning": ("hbm", "max-entropy", False),
-        "cbtl_classifier": ("cbtl", "exploit-only", True),
+        "cbtl_adapted": ("cbtl", "exploit-only", True),
         "flat_model": ("flat", "exploit-only", True),
     }
     pref_type, explore, mood_enabled = preference_model_map[approach_name]
@@ -83,9 +89,23 @@ def _run_training_phase(
     approach: Any,
     n_steps: int,
     sync_scene_spec: bool = True,
+    human_id: str = "human",
 ) -> list[dict[str, float]]:
-    """Run training loop, return per-step metrics."""
     metrics: list[dict[str, float]] = []
+
+    # Register this human with the preference model
+    try:
+        pref_gen = approach._csp_generator._pref_gen
+        pref_gen._human_id = human_id
+        hbm = pref_gen._hbm
+        if hasattr(hbm, "register_human"):
+            hbm.register_human(human_id)
+        if hasattr(hbm, "register_recipe"):
+            for recipe in list(pref_gen._recipe_list):
+                hbm.register_recipe(human_id, recipe)
+    except AttributeError:
+        pass
+
     obs, info = env.reset()
     approach.reset(obs, info)
     if sync_scene_spec:
@@ -99,6 +119,7 @@ def _run_training_phase(
 
         metrics.append({
             "step": t,
+            "human_id": human_id,
             "user_satisfaction": info.get("user_satisfaction", float("nan")),
             "prediction_accuracy": info.get("prediction_accuracy", float("nan")),
         })
@@ -164,19 +185,6 @@ def _run_eval(
 
 
 def main() -> None:
-    import sys
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
-
-    from multitask_personalization.envs.spices.spices_env import SpiceEnv, SpiceHiddenSpec
-    from multitask_personalization.envs.spices.spices_experiment import (
-        MULTI_RECIPE_EXPERIMENT_POOL,
-        POPULATION_HUMAN_CONFIGS,
-        NEW_HUMAN_CONFIG,
-        build_spice_scene_spec_multi,
-        build_spice_experiment_hidden_hbm,
-    )
-    from multitask_personalization.envs.spices.config.spices_config import DEFAULT_CONFIG
-
     args = _parse_args()
     recipe_names = list(MULTI_RECIPE_EXPERIMENT_POOL)
 
@@ -184,8 +192,7 @@ def main() -> None:
     if args.output_dir:
         out_dir = Path(args.output_dir)
     else:
-        now = datetime.now()
-        out_dir = Path("logs") / now.strftime("%Y-%m-%d") / now.strftime("%H-%M-%S")
+        out_dir = Path("logs") / "runs" / f"transfer_{args.env}_{args.approach}_seed{args.seed}"
     out_dir.mkdir(parents=True, exist_ok=True)
     model_dir = out_dir / "models"
     model_dir.mkdir(exist_ok=True)
@@ -198,10 +205,8 @@ def main() -> None:
     config["population_humans"] = [h for h, _ in POPULATION_HUMAN_CONFIGS]
     config["new_human"] = NEW_HUMAN_CONFIG[0]
     with open(out_dir / "config.yaml", "w") as f:
-        import yaml
         yaml.dump(config, f)
 
-    # =====================================================================
     # PHASE 1: Population training
     # =====================================================================
     logging.info("=" * 60)
@@ -210,8 +215,6 @@ def main() -> None:
 
     scene_spec = build_spice_scene_spec_multi(recipe_names)
 
-    # Build the LEARNER's approach (this is what we're training)
-    # We need a dummy env to get the action space
     dummy_hidden = SpiceHiddenSpec(
         preferred_actor={},
         hidden_hbm=build_spice_experiment_hidden_hbm(recipe_names, "SpiceSpecificHumanStrong"),
@@ -227,21 +230,18 @@ def main() -> None:
     for human_label, config_name in POPULATION_HUMAN_CONFIGS:
         logging.info(f"--- Training on {human_label} ({config_name}) ---")
 
-        # Build env with this human's true preferences
         hidden_hbm = build_spice_experiment_hidden_hbm(recipe_names, config_name)
         hidden_spec = SpiceHiddenSpec(preferred_actor={}, hidden_hbm=hidden_hbm)
         train_env = SpiceEnv(hidden_spec=hidden_spec, scene_spec=scene_spec, seed=args.seed)
 
-        # Run training
         human_metrics = _run_training_phase(
             train_env, train_approach, args.phase1_steps,
+            human_id=human_label,
         )
-        for m in human_metrics:
-            m["human"] = human_label
         phase1_metrics.extend(human_metrics)
         train_env.close()
 
-    # Save Phase 1 model (contains learned mu, sigma_h, sigma_r, etc.)
+    # Save Phase 1 model
     phase1_model_dir = model_dir / "phase1_final"
     phase1_model_dir.mkdir(exist_ok=True)
     train_approach.save(phase1_model_dir)
@@ -254,7 +254,6 @@ def main() -> None:
             writer.writeheader()
             writer.writerows(phase1_metrics)
 
-    # =====================================================================
     # PHASE 2: New human with warm-started mu
     # =====================================================================
     logging.info("=" * 60)
@@ -263,8 +262,6 @@ def main() -> None:
 
     new_human_label, new_human_config = NEW_HUMAN_CONFIG
 
-    # Each approach gets its own train env (seeded identically for fair comparison).
-    # This avoids the BaseApproach assertion issue where update() requires step() first.
     def _make_new_human_env(seed: int, eval_mode: bool = False) -> SpiceEnv:
         hbm = build_spice_experiment_hidden_hbm(recipe_names, new_human_config)
         spec = SpiceHiddenSpec(preferred_actor={}, hidden_hbm=hbm)
@@ -274,55 +271,60 @@ def main() -> None:
     cold_train_env = _make_new_human_env(args.seed + 1000)  # same seed for identical episodes
     new_eval_env = _make_new_human_env(args.seed + 2000, eval_mode=True)
 
-    # --- WARM-STARTED approach: load Phase 1 model ---
     warm_approach = _build_approach(args.approach, scene_spec, warm_train_env.action_space, args.seed + 500)
     warm_approach.train()
     warm_approach.load(phase1_model_dir)
 
-    # Reset learned variance hyperparameters to defaults.
-    # Phase 1 tightened sigma_h and sigma_r to match the population, but the
-    # new human may have very different variation patterns (e.g. recipe-specific
-    # conflicts).  Keeping tight sigmas traps phi near theta and prevents
-    # adaptation.  We preserve mu (population prior) and theta (initialized
-    # from mu) — those are the transfer benefit — but give the new human
-    # fresh variance to learn freely.
-    import math as _math
-    import torch as _torch
+    def _register_new_human(approach_obj, new_id: str) -> None:
+        try:
+            pref_gen = approach_obj._csp_generator._pref_gen
+            pref_gen._human_id = new_id
+            hbm = pref_gen._hbm
+            if hasattr(hbm, "register_human"):
+                hbm.register_human(new_id)
+            if hasattr(hbm, "register_recipe"):
+                for recipe in list(pref_gen._recipe_list):
+                    hbm.register_recipe(new_id, recipe)
+        except AttributeError:
+            pass
+
+    _register_new_human(warm_approach, new_human_label)
+
+    # Reset learned variance hyperparameters to defaults. 
     try:
         hbm = warm_approach._csp_generator._pref_gen._hbm
-        from multitask_personalization.envs.spices.spices_hbm import HierarchicalPreferenceModel
         if isinstance(hbm, HierarchicalPreferenceModel):
             default_sigma_h = DEFAULT_CONFIG.hbm.sigma_h
             default_sigma_r = DEFAULT_CONFIG.hbm.sigma_r
             default_sigma_obs = DEFAULT_CONFIG.hbm.sigma_obs
-            with _torch.no_grad():
-                hbm.log_sigma_h.fill_(_math.log(default_sigma_h))
-                hbm.log_sigma_r.fill_(_math.log(default_sigma_r))
-                hbm.log_sigma_obs.fill_(_math.log(default_sigma_obs))
+            with torch.no_grad():
+                hbm.log_sigma_h.fill_(math.log(default_sigma_h))
+                hbm.log_sigma_r.fill_(math.log(default_sigma_r))
+                hbm.log_sigma_obs.fill_(math.log(default_sigma_obs))
             logging.info(
                 f"Reset sigmas to defaults: sigma_h={default_sigma_h}, "
                 f"sigma_r={default_sigma_r}, sigma_obs={default_sigma_obs}"
             )
     except AttributeError:
-        pass  # Non-HBM models don't have these
+        pass 
 
     logging.info("Loaded Phase 1 model into warm-started approach (mu transfer)")
 
-    # --- COLD-START baseline: fresh approach, no Phase 1 ---
     cold_approach = _build_approach(args.approach, scene_spec, cold_train_env.action_space, args.seed + 600)
     cold_approach.train()
+    _register_new_human(cold_approach, new_human_label)
     logging.info("Created cold-start approach (no transfer)")
 
-    # Eval approach copies (one warm, one cold)
     warm_eval = _build_approach(args.approach, scene_spec, new_eval_env.action_space, args.seed + 700)
     warm_eval.eval()
+    _register_new_human(warm_eval, new_human_label)
     cold_eval = _build_approach(args.approach, scene_spec, new_eval_env.action_space, args.seed + 800)
     cold_eval.eval()
+    _register_new_human(cold_eval, new_human_label)
 
     phase2_train_metrics: list[dict[str, float]] = []
     phase2_eval_metrics: list[dict[str, float]] = []
 
-    # Each approach trains on its own env (same seed → identical episode sequences).
     warm_obs, warm_info = warm_train_env.reset()
     cold_obs, cold_info = cold_train_env.reset()
     warm_approach.reset(warm_obs, warm_info)
@@ -371,8 +373,6 @@ def main() -> None:
         if t >= args.phase2_steps:
             break
 
-        # Training step — each approach steps its own env independently.
-        # Envs are seeded identically so episode sequences match.
         warm_act = warm_approach.step()
         warm_obs, warm_rew, warm_term, warm_trunc, warm_info = warm_train_env.step(warm_act)
         warm_done = bool(warm_term or warm_trunc)
@@ -405,7 +405,6 @@ def main() -> None:
     new_eval_env.close()
 
     # Save Phase 2 results
-    import pandas as pd
     if phase2_train_metrics:
         pd.DataFrame(phase2_train_metrics).to_csv(out_dir / "phase2_train_results.csv", index=False)
     if phase2_eval_metrics:

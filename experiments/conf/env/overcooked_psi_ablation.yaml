@@ -1,0 +1,49 @@
+# Psi Ablation Test
+# Two phase design: 
+# 1. TRAINING: neutral sessions are frequent (~80%), so phi learns cleanly
+# 2. EVAL: natural sessions (50% non-neutral sessions), so phi vs. psi is tested
+
+defaults:
+  - _self_
+
+env:
+  _target_: "multitask_personalization.envs.overcooked.overcooked_env.OvercookedEnv"
+  layout_spec:
+    _target_: "multitask_personalization.envs.overcooked.layouts.get_layout"
+    name: "CrampedRoom"
+  hidden_spec:
+    _target_: "multitask_personalization.envs.overcooked.overcooked_experiment.build_overcooked_hidden_spec"
+    layout_name: "CrampedRoom"
+    hidden_hbm_config_name: "RealisticCook"
+  config:
+    _target_: "multitask_personalization.envs.overcooked.config.overcooked_config.OvercookedConfig"
+    session:
+      _target_: "multitask_personalization.envs.overcooked.config.overcooked_config.SessionConfig"
+      session_nonneutral_mean_abs: 1.0   
+      session_nonneutral_std: 0.3
+      session_neutral_std: 0.15
+      session_profile_name: "ExtremeAsymmetric"  
+      prob_neutral_session: 0.8           
+
+train_env: {}
+
+eval_env:
+  config:
+    _target_: "multitask_personalization.envs.overcooked.config.overcooked_config.OvercookedConfig"
+    session:
+      _target_: "multitask_personalization.envs.overcooked.config.overcooked_config.SessionConfig"
+      session_nonneutral_mean_abs: 1.0
+      session_nonneutral_std: 0.3
+      session_neutral_std: 0.15
+      session_profile_name: "ExtremeAsymmetric"
+      prob_neutral_session: 0.5           
+
+max_environment_steps: 6000
+eval_frequency: 300
+max_eval_episode_length: 200
+num_eval_trials: 15
+dt: 0.01
+csp_solver:
+  max_iters: 2500
+  num_improvements: 500
+  max_improvement_attempts: 100

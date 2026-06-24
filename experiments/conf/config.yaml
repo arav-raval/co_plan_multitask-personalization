@@ -1,8 +1,8 @@
 hydra:
   run:
-    dir: /Users/aravraval/PRPL/co_plan_multitask-personalization/logs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    dir: logs/runs/${hydra:runtime.choices.env}_${hydra:runtime.choices.approach}_seed${seed}
   sweep:
-    dir: /Users/aravraval/PRPL/co_plan_multitask-personalization/logs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    dir: logs/runs/${hydra:runtime.choices.env}_${hydra:runtime.choices.approach}
     subdir: ${hydra.job.num}
 
 wandb:
@@ -11,7 +11,7 @@ wandb:
   entity: null
   group: null
   run_name: null
-  dir: ./logs/wandb
+  dir: logs/wandb
 
 video_dir: ${hydra:runtime.output_dir}/videos
 model_dir: ${hydra:runtime.output_dir}/models

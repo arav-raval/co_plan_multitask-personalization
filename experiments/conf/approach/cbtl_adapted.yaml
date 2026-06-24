@@ -1,0 +1,6 @@
+defaults:
+  - ours
+
+preference_model_type: cbtl
+explore_method: max-entropy
+mood_learning_enabled: false

@@ -92,11 +92,6 @@ def sample_episode_mood(
     return str(rng.choice(MOODS, p=prior))
 
 
-def compute_mood_bias(mood: str, actor: str) -> float:
-    bias_dict = DEFAULT_CONFIG.get_mood_bias()
-    return bias_dict.get(mood, {}).get(actor, 0.0)
-
-
 class MoodModel:
     """Unchanged from original."""
     def __init__(self, rng: np.random.Generator) -> None:
@@ -1252,28 +1247,7 @@ class HierarchicalPreferenceModel:
             )
 
     # ------------------------------------------------------------------
-    # Public update (kept for backward compat with any direct callers)
-    # ------------------------------------------------------------------
-
-    def update_phi(
-        self, human_id: str, recipe_name: str, spice: str, g: float
-    ) -> None:
-        """
-        Backward-compatible direct phi update.
-        In Stage 1 this converts g back to a synthetic observation and
-        runs the ELBO update. Callers should prefer observe() directly.
-        g > 0 is treated as actor=human, g < 0 as actor=robot.
-        satisfaction is set to |g| / base_satisfaction_bias, clipped to [0,1].
-        """
-        self._ensure_registered(human_id, recipe_name)
-        actor = "human" if g >= 0 else "robot"
-        sat = float(np.clip(abs(g) / max(self.base_satisfaction_bias, 1e-6), 0.0, 1.0))
-        # Add a synthetic entry so _update_phi_elbo has data to work with
-        self._episode_data[human_id].append((actor, spice, sat))
-        self._update_phi_elbo(human_id, recipe_name, spice, actor, sat)
-
-    # ------------------------------------------------------------------
-    # Getters (all unchanged from original — CSP interface preserved)
+    # Getters
     # ------------------------------------------------------------------
 
     def get_phi(self, human_id: str, recipe_name: str, spice: str) -> float:

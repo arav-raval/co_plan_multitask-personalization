@@ -1,0 +1,29 @@
+# Non-stationarity: flip MEDIUM preferences (1.0 < |theta| <= 2.0, 14 spices).
+# Sign-flip preserves magnitude so satisfaction ceiling is unchanged.
+env:
+  _target_: "multitask_personalization.envs.spices.spices_env.SpiceEnv"
+  scene_spec:
+    _target_: "multitask_personalization.envs.spices.spices_experiment.build_spice_scene_spec_default_multi"
+  hidden_spec:
+    _target_: "multitask_personalization.envs.spices.spices_env.SpiceHiddenSpec"
+    preferred_actor: {}
+    stochastic_preferences: false
+    hidden_hbm:
+      _target_: "multitask_personalization.envs.spices.spices_experiment.build_spice_experiment_hidden_hbm_default_multi"
+      hidden_hbm_config_name: SpiceSpecificHumanRecipeConflict
+    shift_hidden_hbm:
+      _target_: "multitask_personalization.envs.spices.spices_experiment.build_spice_shift_hidden_hbm_default_multi"
+      shift_config_name: SpiceShiftMedium
+    preference_shift_step: 2500
+  verbose: false
+train_env: {}
+eval_env: {}
+max_environment_steps: 5000
+eval_frequency: 250
+max_eval_episode_length: 50
+num_eval_trials: 50
+dt: 0.01
+csp_solver:
+  max_iters: 2500
+  num_improvements: 500
+  max_improvement_attempts: 100

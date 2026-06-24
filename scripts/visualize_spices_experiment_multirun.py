@@ -1,12 +1,4 @@
-"""Visualize SPICES multirun logs from run_single_experiment.py.
-
-This script compares methods (e.g., ours/no_learning/nothing_personal) averaged
-across seeds from a Hydra multirun folder.
-
-It produces:
-  1) User satisfaction over training steps (mean +/- SE by method)
-  2) Phi learning progress over training steps (phi sign accuracy vs. hidden theta)
-
+"""
 Usage:
   python scripts/visualize_spices_experiment_multirun.py \
     --log-dir logs/2026-04-02/10-55-47
@@ -37,18 +29,11 @@ from multitask_personalization.envs.spices.config import (
 
 DEFAULT_HUMAN = "human"
 
-
-# Theta magnitude bands for stratified sign-accuracy analysis.
-# Boundaries chosen to align with _SPICE_SPECIFIC_THETA clusters:
-#   nuanced  (0.3, 0.8]: turmeric, basil, coriander, paprika, ghee, …
-#   mid      (0.8, 1.5]: garlic, ginger, saffron, harissa, fenugreek, …
-#   strong   (1.5, ∞):   salt (+2.0), pepper (−2.0), chili/gochujang (−1.5)
 THETA_BANDS: list[tuple[str, float, float]] = [
     ("nuanced\n(0.3–0.8]",   0.3, 0.8),
     ("mid\n(0.8–1.5]",       0.8, 1.5),
     ("strong\n(>1.5)",        1.5, float("inf")),
 ]
-# Short labels used as dict keys (no newlines).
 _BAND_KEYS: list[str] = ["nuanced", "mid", "strong"]
 
 
@@ -216,7 +201,7 @@ def _load_phi_from_checkpoint(ckpt: Path) -> dict[str, dict[str, float]] | None:
     Supports:
     - spice_hbm.pkl  (HierarchicalPreferenceModel):  phi_m[human][recipe][spice] tensor
     - flat_model.pkl (FlatPreferenceModel):           alpha/beta -> logit(mean)
-    - cbtl_classifier.pkl (CBTLClassifierModel):      w[human][spice] shared across recipes
+    - cbtl_adapted.pkl (CBTLClassifierModel):      w[human][spice] shared across recipes
 
     Returns None if no recognised file is found.
     """
@@ -260,7 +245,7 @@ def _load_phi_from_checkpoint(ckpt: Path) -> dict[str, dict[str, float]] | None:
     # (including recipe-specific overrides).  This is fair: the HBM is also
     # evaluated per-recipe, and CBTL's structural limitation (no recipe-level
     # split) should be visible as higher error on conflict spices.
-    cbtl_path = ckpt / "cbtl_classifier.pkl"
+    cbtl_path = ckpt / "cbtl_adapted.pkl"
     if cbtl_path.exists():
         with cbtl_path.open("rb") as f:
             state = pickle.load(f)
@@ -291,7 +276,7 @@ def _load_phi_error_series(
     """Compute phi MAE/RMSE/tanh_phi_mae/sign_accuracy at each checkpoint.
 
     Supports HierarchicalPreferenceModel (spice_hbm.pkl), FlatPreferenceModel
-    (flat_model.pkl), and CBTLClassifierModel (cbtl_classifier.pkl).
+    (flat_model.pkl), and CBTLClassifierModel (cbtl_adapted.pkl).
 
     Metrics compare learned phi against the *intended phi_true* for each (recipe, spice):
       - For stable spices: phi_true == theta (same across recipes).
@@ -472,7 +457,7 @@ _METHOD_LABELS: dict[str, str] = {
     "with_mood_learning":    "HBM (with psi)",
     "without_mood_learning": "HBM (Ours; no psi)",
     "flat_model":            "Flat Bayesian",
-    "cbtl_classifier":       "CBTL",
+    "cbtl_adapted":       "CBTL",
     "exploit_only":          "Exploit Only",
     "no_learning":           "No Learning",
 }
@@ -483,7 +468,7 @@ _METHOD_COLORS: dict[str, str] = {
     "with_mood_learning":    "#0072B2",  # blue
     "without_mood_learning": "#E69F00",  # amber
     "flat_model":            "#009E73",  # green
-    "cbtl_classifier":       "#CC79A7",  # pink
+    "cbtl_adapted":       "#CC79A7",  # pink
     "exploit_only":          "#D55E00",  # vermillion
     "no_learning":           "#999999",  # grey
 }
@@ -494,7 +479,7 @@ _METHOD_LINESTYLES: dict[str, str] = {
     "with_mood_learning":    "-",
     "without_mood_learning": "--",
     "flat_model":            "-.",
-    "cbtl_classifier":       ":",
+    "cbtl_adapted":       ":",
     "exploit_only":          (0, (3, 1, 1, 1)),
     "no_learning":           (0, (5, 5)),
 }
@@ -504,7 +489,7 @@ _METHOD_MARKERS: dict[str, str] = {
     "with_mood_learning":    "o",
     "without_mood_learning": "s",
     "flat_model":            "^",
-    "cbtl_classifier":       "D",
+    "cbtl_adapted":       "D",
     "exploit_only":          "v",
     "no_learning":           "x",
 }
@@ -653,7 +638,7 @@ def _plot_sign_accuracy_by_band(
         "with_mood_learning",
         "without_mood_learning",
         "flat_model",
-        "cbtl_classifier",
+        "cbtl_adapted",
         "exploit_only",
         "no_learning",
     ]

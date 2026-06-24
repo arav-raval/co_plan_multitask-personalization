@@ -146,6 +146,7 @@ class EnumerationCSPSolver(CSPSolver):
     def __init__(self, seed: int, max_enumeration_size: int = 10_000) -> None:
         super().__init__(seed)
         self._max_enumeration_size = max_enumeration_size
+        self._rng = np.random.default_rng(seed)
 
     def solve(
         self,
@@ -168,11 +169,21 @@ class EnumerationCSPSolver(CSPSolver):
         if total > self._max_enumeration_size:
             return None
 
-        # Enumerate all combinations and find best valid solution
+        # Enumerate all combinations and find best valid solution.
+        # Shuffle to randomize tie-breaking when multiple solutions share
+        # the minimum cost (e.g., binary domains with symmetric entropy).
+        # This matches the original CBTL RandomWalkCSPSolver's behavior:
+        # the strict > rejection check (not >=) means equal-cost solutions
+        # replace the current best, and random sampler ordering determines
+        # which candidate wins.  Shuffling the enumeration order achieves
+        # the same effect for exhaustive enumeration.
         best_sol: dict[CSPVariable, Any] | None = None
         best_cost: float = np.inf
 
-        for values in itertools.product(*domain_values):
+        all_combos = list(itertools.product(*domain_values))
+        self._rng.shuffle(all_combos)
+
+        for values in all_combos:
             sol = {var: val for var, val in zip(csp.variables, values)}
             if not csp.check_solution(sol):
                 continue

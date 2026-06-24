@@ -58,24 +58,31 @@ from multitask_personalization.structs import (
 # ---------------------------------------------------------------------------
 
 class _OvercookedCSPPolicy(CSPPolicy[OvercookedState, OvercookedAction]):
-    """Converts a CSP solution (flag) into an OvercookedAction."""
+    """Converts a CSP solution (flag, optional count) into an OvercookedAction."""
 
     def __init__(
         self, csp_variables: Collection[CSPVariable], seed: int = 0
     ) -> None:
         super().__init__(csp_variables, seed)
         self._flag: int | None = None
+        self._count: int | None = None
+        self._has_count_var: bool = any(
+            v.name == "ingredient_count" for v in csp_variables
+        )
         self._done_emitted: bool = False
 
     def reset(self, solution: dict[CSPVariable, Any]) -> None:
         super().reset(solution)
         self._flag = self._get_value("flag")
+        self._count = self._get_value("ingredient_count") if self._has_count_var else None
         self._last_subtask: str | None = None
 
     def step(self, obs: OvercookedState) -> OvercookedAction:
         assert self._flag in (0, 1)
         self._last_subtask = obs.current_subtask
-        return OvercookedAction(flag=self._flag)
+        # Only attach count when the current subtask is load_pot (matches env).
+        count = self._count if obs.current_subtask == "load_pot" else None
+        return OvercookedAction(flag=self._flag, ingredient_count=count)
 
     def check_termination(self, obs: OvercookedState) -> bool:
         # Recompute when the subtask changes — each subtask needs a fresh
@@ -108,6 +115,7 @@ class _AssignPreferenceGenerator(
         shared_hbm: OvercookedPreferenceModel | None = None,
         preference_model: Any | None = None,
         scalar_psi: bool = False,
+        continuous_pref_model: Any | None = None,
     ) -> None:
         super().__init__(seed)
 
@@ -139,6 +147,7 @@ class _AssignPreferenceGenerator(
                 scalar_psi=scalar_psi,
             )
         self._current_layout_name: str | None = None
+        self._continuous_pref_model = continuous_pref_model
 
         # Conflict tracking: decreasing conflict_rate signals HBM convergence.
         self._episode_steps: int = 0
@@ -148,10 +157,18 @@ class _AssignPreferenceGenerator(
     def save(self, model_dir: Path) -> None:
         if hasattr(self._hbm, "save"):
             self._hbm.save(model_dir)
+        if self._continuous_pref_model is not None and hasattr(
+            self._continuous_pref_model, "save"
+        ):
+            self._continuous_pref_model.save(model_dir)
 
     def load(self, model_dir: Path) -> None:
         if hasattr(self._hbm, "load"):
             self._hbm.load(model_dir)
+        if self._continuous_pref_model is not None and hasattr(
+            self._continuous_pref_model, "load"
+        ):
+            self._continuous_pref_model.load(model_dir)
 
     def generate(
         self,
@@ -185,11 +202,10 @@ class _AssignPreferenceGenerator(
         """Update preference model on each observed transition.
 
         All models receive the same continuous satisfaction signal in [-1, +1].
-        This ensures fair comparison — the HBM doesn't get a richer signal
-        than baselines. The satisfaction encodes preference magnitude, session
-        effects, and coordination quality.
-
-        Conflict and timeout steps (task_score == 0) are skipped for all models.
+        Conflict observations are NOT skipped — they carry valid behavioral
+        information (the human acted) and the satisfaction signal includes the
+        coordination penalty that reflects the misprediction. Only timeout
+        steps (no subtask completion → satisfaction == 0) are skipped.
         """
         if info.get("last_subtask") is None or info.get("last_actor") is None:
             return
@@ -199,11 +215,9 @@ class _AssignPreferenceGenerator(
         if info.get("conflict", False):
             self._episode_conflicts += 1
 
-        # Skip update on conflict steps or when there's no satisfaction signal.
-        # Note: forced steps (item continuations) DO have satisfaction != 0
-        # and should be processed — they carry preference information.
+        # Skip only on timeout steps (subtask not completed → satisfaction == 0).
         satisfaction = float(info.get("satisfaction", 0.0))
-        if info.get("conflict", False) or abs(satisfaction) < 1e-6:
+        if abs(satisfaction) < 1e-6:
             if done:
                 self._conflict_rate = (
                     self._episode_conflicts / self._episode_steps
@@ -229,6 +243,19 @@ class _AssignPreferenceGenerator(
             sat = float(info.get("satisfaction", 0.0))
             self._hbm.observe(self._human_id, layout_name, subtask, actor, sat)
 
+            # Continuous preference observation (phase 1: ingredient_count).
+            # Only feed observations that carry a continuous-preference signal.
+            cont_sat = info.get("continuous_satisfaction")
+            count = info.get("ingredient_count")
+            if (
+                self._continuous_pref_model is not None
+                and cont_sat is not None
+                and count is not None
+            ):
+                self._continuous_pref_model.observe(
+                    self._human_id, layout_name, int(count), float(cont_sat)
+                )
+
         if done:
             self._conflict_rate = (
                 self._episode_conflicts / self._episode_steps
@@ -238,8 +265,50 @@ class _AssignPreferenceGenerator(
             self._episode_conflicts = 0
             self._finalize_episode()
 
+    def learn_from_transition_eval(
+        self,
+        obs: OvercookedState,
+        act: OvercookedAction,
+        next_obs: OvercookedState,
+        done: bool,
+        info: dict[str, Any],
+    ) -> None:
+        """Eval-time update: running psi only (no phi/theta/mu learning).
+
+        Buffers observations and updates running psi so the CSP can adapt to
+        session effects (fatigue/energy) mid-episode. At episode end, decays
+        psi and resets episode buffers without updating phi/theta/mu.
+        """
+        if info.get("last_subtask") is None or info.get("last_actor") is None:
+            return
+
+        # Skip only on timeout steps; conflicts are valid observations.
+        satisfaction = float(info.get("satisfaction", 0.0))
+        if abs(satisfaction) < 1e-6:
+            if done:
+                self._hbm.end_episode_eval(self._human_id)
+            return
+
+        layout_name = obs.layout_name
+        if layout_name and layout_name not in self._layout_list:
+            self._layout_list.append(layout_name)
+        self._current_layout_name = layout_name
+
+        actor = str(info["last_actor"])
+        subtask = str(info["last_subtask"])
+
+        if layout_name:
+            self._hbm.observe(self._human_id, layout_name, subtask, actor, satisfaction)
+
+        if done:
+            self._hbm.end_episode_eval(self._human_id)
+
     def _finalize_episode(self) -> None:
         self._hbm.end_episode(self._human_id)
+        if self._continuous_pref_model is not None and hasattr(
+            self._continuous_pref_model, "end_episode"
+        ):
+            self._continuous_pref_model.end_episode(self._human_id)
         if self._verbose:
             logging.info("[Episode] Overcooked HBM updated (theta, mu, psi)")
 
@@ -282,6 +351,8 @@ class OvercookedAssignCSPGenerator(
         disable_learning: bool = False,
         mood_learning_enabled: bool = True,
         scalar_psi: bool = False,
+        continuous_pref_model: Any | None = None,
+        ingredient_count_choices: list[int] | None = None,
     ) -> None:
         super().__init__(seed=seed, explore_method=explore_method, disable_learning=disable_learning)
         self._subtasks = list(subtask_list)
@@ -290,6 +361,12 @@ class OvercookedAssignCSPGenerator(
             self._baseline_model = preference_model
         else:
             self._baseline_model = None
+        self._continuous_pref_model = continuous_pref_model
+        self._ingredient_count_choices: list[int] = (
+            list(ingredient_count_choices)
+            if ingredient_count_choices is not None
+            else [1, 2, 3]
+        )
         self._pref_gen = _AssignPreferenceGenerator(
             subtask_list=self._subtasks,
             human_id=human_id,
@@ -300,6 +377,7 @@ class OvercookedAssignCSPGenerator(
             shared_hbm=shared_hbm if preference_model is None else None,
             preference_model=preference_model,
             scalar_psi=scalar_psi,
+            continuous_pref_model=continuous_pref_model,
         )
         self._init_rng = np.random.default_rng(self._seed)
 
@@ -336,17 +414,72 @@ class OvercookedAssignCSPGenerator(
     def _generate_variables(
         self, obs: OvercookedState
     ) -> tuple[list[CSPVariable], dict[CSPVariable, Any]]:
+        # Ensure layout name is set from observation (critical for eval mode
+        # where learn_from_transition doesn't run to set it).
+        if obs.layout_name:
+            self._pref_gen._current_layout_name = obs.layout_name
+            if obs.layout_name not in self._pref_gen._layout_list:
+                self._pref_gen._layout_list.append(obs.layout_name)
+                self._pref_gen._hbm.register_layout(
+                    self._pref_gen._human_id, obs.layout_name
+                )
         # flag=0: robot claims the current subtask
         # flag=1: robot passes (predicts human will claim)
         flag = CSPVariable("flag", EnumSpace([0, 1]))
-        initialization = {flag: int(self._init_rng.integers(0, 2))}
-        return [flag], initialization
+        initialization: dict[CSPVariable, Any] = {
+            flag: int(self._init_rng.integers(0, 2))
+        }
+        variables: list[CSPVariable] = [flag]
+        # Add ingredient_count variable only when applicable.
+        if (
+            self._continuous_pref_model is not None
+            and obs.current_subtask == "load_pot"
+        ):
+            count_var = CSPVariable(
+                "ingredient_count",
+                EnumSpace(list(self._ingredient_count_choices)),
+            )
+            variables.append(count_var)
+            initialization[count_var] = int(
+                self._init_rng.choice(self._ingredient_count_choices)
+            )
+        return variables, initialization
 
     def _generate_personal_constraints(
         self, obs: OvercookedState, variables: list[CSPVariable]
     ) -> list[CSPConstraint]:
-        """Soft preference constraint from HBM (phi + running_psi)."""
-        return [self._pref_gen.generate(obs, variables, "user_preference")]
+        """Soft preference constraint from HBM (phi + running_psi).
+
+        If an ingredient_count variable is present (i.e. load_pot subtask +
+        continuous pref model), also add a soft constraint from the continuous
+        preference model.
+        """
+        flag_var = next(v for v in variables if v.name == "flag")
+        constraints: list[CSPConstraint] = [
+            self._pref_gen.generate(obs, [flag_var], "user_preference")
+        ]
+        count_var = next(
+            (v for v in variables if v.name == "ingredient_count"), None
+        )
+        if count_var is not None and self._continuous_pref_model is not None:
+            layout = obs.layout_name or self._pref_gen._current_layout_name
+            human_id = self._pref_gen._human_id
+            cont_model = self._continuous_pref_model
+
+            def _count_logprob(count: int) -> float:
+                if layout is None:
+                    return float(np.log(0.5))
+                return float(cont_model.log_prob_accept(int(count), human_id, layout))
+
+            constraints.append(
+                LogProbCSPConstraint(
+                    "continuous_pref",
+                    [count_var],
+                    _count_logprob,
+                    threshold=np.log(0.05),
+                )
+            )
+        return constraints
 
     def _generate_nonpersonal_constraints(
         self, obs: OvercookedState, variables: list[CSPVariable]
@@ -402,7 +535,7 @@ class OvercookedAssignCSPGenerator(
         if self._train_or_eval != "train" or self._explore_method != "max-entropy":
             return self._generate_exploit_cost(obs, variables)
 
-        flag_var = variables[0]
+        flag_var = next(v for v in variables if v.name == "flag")
         current = obs.current_subtask
         hbm = self._pref_gen._hbm
         human_id = self._pref_gen._human_id
@@ -430,7 +563,7 @@ class OvercookedAssignCSPGenerator(
     def _generate_exploit_cost(
         self, obs: OvercookedState, variables: list[CSPVariable]
     ) -> CSPCost | None:
-        flag = variables[0]
+        flag = next(v for v in variables if v.name == "flag")
         current = obs.current_subtask
 
         def _cost_fn(flag_val: int) -> float:
@@ -447,7 +580,10 @@ class OvercookedAssignCSPGenerator(
     def _generate_samplers(
         self, obs: OvercookedState, csp: CSP
     ) -> list[CSPSampler]:
-        flag = csp.variables[0]
+        flag = next(v for v in csp.variables if v.name == "flag")
+        count_var = next(
+            (v for v in csp.variables if v.name == "ingredient_count"), None
+        )
         current = obs.current_subtask
 
         def _sample_flag(
@@ -467,7 +603,32 @@ class OvercookedAssignCSPGenerator(
             probs_arr /= probs_arr.sum()
             return {flag: int(rng.choice([0, 1], p=probs_arr))}
 
-        return [FunctionalCSPSampler(_sample_flag, csp, {flag})]
+        samplers: list[CSPSampler] = [FunctionalCSPSampler(_sample_flag, csp, {flag})]
+
+        if count_var is not None and self._continuous_pref_model is not None:
+            choices = list(self._ingredient_count_choices)
+            cont_model = self._continuous_pref_model
+            human_id = self._pref_gen._human_id
+
+            def _sample_count(
+                sol: dict[CSPVariable, Any], rng: np.random.Generator
+            ) -> dict[CSPVariable, Any]:
+                layout = self._pref_gen._current_layout_name
+                if layout is None:
+                    return {count_var: int(rng.choice(choices))}
+                probs = np.array(
+                    [
+                        max(cont_model.acceptance_prob(int(c), human_id, layout), 1e-6)
+                        for c in choices
+                    ],
+                    dtype=float,
+                )
+                probs /= probs.sum()
+                return {count_var: int(rng.choice(choices, p=probs))}
+
+            samplers.append(FunctionalCSPSampler(_sample_count, csp, {count_var}))
+
+        return samplers
 
     def _generate_policy(
         self, obs: OvercookedState, csp_variables: Collection[CSPVariable]
@@ -484,6 +645,14 @@ class OvercookedAssignCSPGenerator(
     ) -> None:
         if not self._disable_learning:
             self._pref_gen.learn_from_transition(obs, act, next_obs, done, info)
+
+    # NOTE: observe_transition_eval is intentionally omitted for now.
+    # When present, csp_approach.py calls it during eval, which triggers
+    # hbm.observe() + _update_running_psi() on every eval step. This causes
+    # hangs in some seeds due to numerical issues in the psi optimizer after
+    # loading saved models. The eval psi adaptation is only needed for
+    # transfer/multi-human claims; for single-layout claims (1,2,3,5) it is
+    # not required. Re-enable and debug for transfer experiments later.
 
     def get_metrics(self) -> dict[str, float]:
         return self._pref_gen.get_metrics()

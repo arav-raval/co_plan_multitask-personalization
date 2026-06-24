@@ -5,26 +5,26 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "multitask_personalization"
 version = "0.1.0"
-description = "Multitask personalization."
+description = "Multitask personalization for human-robot collaboration."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-   "matplotlib",
-   "seaborn",
-   "numpy",
-   "scipy",
+   "matplotlib>=3.8",
+   "seaborn>=0.13",
+   "numpy>=1.26,<2",
+   "scipy>=1.12",
    "scikit-image",
-   "scikit-learn",
+   "scikit-learn>=1.4",
    "imageio",
-   "pandas",
+   "pandas>=2.1",
    "pandas-stubs",
-   "hydra-core",
+   "hydra-core>=1.3",
    "omegaconf",
    "moviepy==1.0.3",
-   "torch",
+   "torch>=2.1",
    "tqdm",
    "types-tqdm",
-   "wandb",
+   "wandb>=0.16",
    "cachetools",
    "overcooked-ai",
    "pybullet==3.2.7",
@@ -83,5 +83,6 @@ module = [
     "sklearn.*",
     "graphviz.*",
     "cachetools.*",
+    "overcooked_ai_py.*",
 ]
 ignore_missing_imports = true

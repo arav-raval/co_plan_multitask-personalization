@@ -46,6 +46,16 @@ class SessionProfile:
             idx = ALL_SUBTASKS.index(subtask)
             return self.weights[idx] if idx < len(self.weights) else 1.0
         except ValueError:
+            # Subtask not in ALL_SUBTASKS (e.g., fetch_onion, fetch_tomato).
+            # Map to fetch_ingredient's weight as a reasonable default.
+            if subtask in ("fetch_onion", "fetch_tomato"):
+                try:
+                    idx = ALL_SUBTASKS.index("fetch_ingredient")
+                    return self.weights[idx] if idx < len(self.weights) else 1.0
+                except ValueError:
+                    pass
+            return 1.0
+        except ValueError:
             return 1.0
 
 
@@ -134,6 +144,51 @@ STRONG_DIFFERENTIATION = SessionProfile(
     ),
 )
 
+EXTREME_ASYMMETRIC = SessionProfile(
+    name="ExtremeAsymmetric",
+    description=(
+        "Opposite-sign session effects per subtask, tuned so the scalar "
+        "optimum is exactly zero (weights sum to 0). Uses larger magnitudes "
+        "than AsymmetricFatigue so each subtask's effect saturates the "
+        "sigmoid when paired with a larger session_nonneutral_mean_abs. "
+        "Designed for the scalar-vs-vector-psi ablation: training should "
+        "use neutral-dominant sessions to let phi learn cleanly, and eval "
+        "should use force_neutral_mood=False with a low prob_neutral_session "
+        "so ψ is exercised at test time."
+    ),
+    weights=(
+        +2.0,   # fetch_ingredient — strong avoidance when fatigued
+        -2.0,   # load_pot — strong eagerness (stationary)
+        +2.0,   # fetch_dish — avoidance
+        -2.0,   # pickup_soup — eagerness (stationary, timing)
+        +2.0,   # deliver — avoidance (long walk)
+        -1.0,   # place_on_counter — mild eagerness
+        -1.0,   # pickup_from_counter — mild eagerness
+    ),  # sum = 0.0 → scalar optimum is exactly 0
+)
+
+
+ASYMMETRIC_FATIGUE = SessionProfile(
+    name="AsymmetricFatigue",
+    description=(
+        "Opposite-sign session effects per subtask. Fatigue makes the human "
+        "avoid navigation-heavy subtasks but paradoxically makes them MORE "
+        "eager to do stationary tasks (they want to rest in one spot). "
+        "Negative weights flip the sign relative to the session type. This "
+        "cannot be captured by scalar psi: a single shared offset cannot have "
+        "opposite effects on different subtasks. Maximises vector psi advantage."
+    ),
+    weights=(
+        1.8,   # fetch_ingredient — avoidance (fatigue -> don't want to walk)
+        -1.5,  # load_pot — stationary, MORE eager when fatigued
+        1.5,   # fetch_dish — avoidance
+        -1.2,  # pickup_soup — stationary, MORE eager
+        1.8,   # deliver — avoidance (long walk)
+        -0.8,  # place_on_counter — short stationary, mildly MORE eager
+        -0.8,  # pickup_from_counter — short stationary, mildly MORE eager
+    ),
+)
+
 
 # ---------------------------------------------------------------------------
 # Registry
@@ -147,6 +202,8 @@ _REGISTRY: Dict[str, SessionProfile] = {
         UNIFORM,
         MENTAL_FATIGUE,
         STRONG_DIFFERENTIATION,
+        ASYMMETRIC_FATIGUE,
+        EXTREME_ASYMMETRIC,
     ]
 }
 

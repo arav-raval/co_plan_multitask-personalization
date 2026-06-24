@@ -23,6 +23,8 @@ from .layouts import ALL_SUBTASKS
 # Maps subtask name → terrain character that the agent must be adjacent to.
 _SUBTASK_TERRAIN: Dict[str, str] = {
     "fetch_ingredient": "O",  # onion dispenser (or 'T' for tomato)
+    "fetch_onion":      "O",  # onion dispenser only
+    "fetch_tomato":     "T",  # tomato dispenser only
     "load_pot":         "P",  # pot
     "fetch_dish":       "D",  # dish dispenser
     "pickup_soup":      "P",  # pot (to scoop cooked soup)

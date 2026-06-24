@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Playing — {{ player_name }}</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #1e1e28;
+      color: #e0e0e0;
+      margin: 0;
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+    h1 { color: #b4dcff; margin: 5px 0 15px; font-size: 1.4em; }
+    #status {
+      color: #c0c0c0;
+      margin-bottom: 10px;
+      font-size: 1em;
+    }
+    #frame-container {
+      border: 2px solid #444;
+      border-radius: 6px;
+      background: #000;
+      padding: 4px;
+    }
+    #frame {
+      display: block;
+      max-width: 90vw;
+    }
+    #controls {
+      margin-top: 15px;
+      color: #888;
+      font-size: 0.9em;
+      text-align: center;
+    }
+    kbd {
+      background: #333;
+      border: 1px solid #555;
+      border-radius: 3px;
+      padding: 2px 6px;
+      font-family: monospace;
+      color: #e0e0e0;
+    }
+  </style>
+</head>
+<body>
+  <h1>{{ player_name }} — {{ group }}</h1>
+  <div id="status">Connecting...</div>
+  <div id="frame-container">
+    <img id="frame" src="" alt="game">
+  </div>
+  <div id="controls">
+    <kbd>↑</kbd> <kbd>↓</kbd> <kbd>←</kbd> <kbd>→</kbd> Move &nbsp;&nbsp;
+    <kbd>Space</kbd> Interact &nbsp;&nbsp;
+    Click the game area first to focus
+  </div>
+
+  <script>
+    const sid = "{{ sid }}";
+    const wsProto = location.protocol === "https:" ? "wss:" : "ws:";
+    const ws = new WebSocket(`${wsProto}//${location.host}/ws/${sid}`);
+    const statusEl = document.getElementById("status");
+    const frameEl = document.getElementById("frame");
+
+    ws.onopen = () => { statusEl.textContent = "Connected. Get ready..."; };
+    ws.onclose = () => { statusEl.textContent = "Disconnected."; };
+    ws.onerror = (e) => { statusEl.textContent = "Connection error."; };
+
+    ws.onmessage = (msg) => {
+      const data = JSON.parse(msg.data);
+      if (data.type === "frame") {
+        frameEl.src = "data:image/png;base64," + data.png;
+        statusEl.textContent = data.status || "";
+      } else if (data.type === "session_done") {
+        window.location.href = "/thanks?name={{ player_name }}";
+      } else if (data.type === "ready") {
+        statusEl.textContent = `Ready: ${data.layout}. Press any arrow key to begin.`;
+      } else if (data.type === "error") {
+        statusEl.textContent = "Error: " + data.message;
+      }
+    };
+
+    // Keyboard input
+    const keyMap = {
+      "ArrowUp": "north",
+      "ArrowDown": "south",
+      "ArrowLeft": "west",
+      "ArrowRight": "east",
+      " ": "interact",
+      "Space": "interact",
+    };
+    document.addEventListener("keydown", (e) => {
+      const action = keyMap[e.key];
+      if (action) {
+        e.preventDefault();
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: "input", action: action }));
+        }
+      }
+    });
+  </script>
+</body>
+</html>

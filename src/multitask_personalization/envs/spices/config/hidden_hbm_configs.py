@@ -464,6 +464,35 @@ SPICE_SPECIFIC_HUMAN_RECIPE_CONFLICT = HiddenHBMConfig(
             "coriander": +2.0,
             "paprika":   +2.0,
         },
+        # --- Expanded pool overrides (4 new recipes) ---
+        "MoroccanTagine": {
+            # Familiar with Moroccan spice blends from Med cooking background
+            "cumin":     +3.0,
+            "coriander": +2.0,
+            "cinnamon":  +1.6,   # sweet spice use — confident
+            # But defers on saffron and preserved lemon (specialty ingredients)
+            "honey":     -2.0,   # tagine-specific glazing technique — defers
+        },
+        "EthiopianWat": {
+            # Unfamiliar cuisine — defers on most technique-dependent spices
+            "cumin":     -2.0,
+            "onion":     -3.0,   # Ethiopian onion caramelization technique
+            "coriander": -1.6,
+            "cinnamon":  -1.0,   # savory cinnamon use — unfamiliar
+        },
+        "ThaiCurryComplex": {
+            # Similar to Asian — defers on unfamiliar technique
+            "cumin":     -2.0,
+            "coriander": -2.0,   # Thai ground coriander usage
+            "turmeric":  -1.6,
+        },
+        "SpanishPaella": {
+            # Mediterranean-adjacent — confident
+            "cumin":     +2.5,
+            "onion":     +3.0,
+            "coriander": +1.6,
+            "paprika":   +2.5,   # pimenton/paprika — very confident
+        },
     },
 )
 
@@ -482,6 +511,107 @@ SPICE_SPECIFIC_HUMAN_AROMATIC_GENTLE = HiddenHBMConfig(
     sigma_h=0.5,
     theta_generator=_spice_specific_theta_aromatic_gentle,
 )
+
+# ---------------------------------------------------------------------------
+# Non-stationarity: magnitude-preserving sign-flip shift configs
+# ---------------------------------------------------------------------------
+# Sign-flip shifts negate theta for a selected set of spices, preserving the
+# absolute magnitude so the satisfaction ceiling is unchanged.  This isolates
+# the effect of preference *direction* changing from preference *strength*.
+#
+# Band thresholds (on 2x strong scale):
+#   SOFT:   |theta| <= 1.0   (16 spices)
+#   MEDIUM: 1.0 < |theta| <= 2.0  (14 spices)
+#   STRONG: |theta| > 2.0   (7 spices)
+
+
+def _sign_flip_theta(
+    spices: list[str],
+    flip_band: str | None = None,
+    flip_fraction: float = 0.4,
+    seed: int | None = None,
+) -> dict[str, float]:
+    """Generate post-shift theta by negating selected spices.
+
+    Args:
+        flip_band: "soft", "medium", "strong", or None for random selection.
+        flip_fraction: fraction of spices to flip when flip_band is None.
+        seed: RNG seed for random selection (ignored when flip_band is set).
+    """
+    base = _spice_specific_theta_strong(spices)
+
+    if flip_band is not None:
+        # Deterministic band-based flip
+        for s in spices:
+            mag = abs(base[s])
+            if flip_band == "soft" and mag <= 1.0:
+                base[s] = -base[s]
+            elif flip_band == "medium" and 1.0 < mag <= 2.0:
+                base[s] = -base[s]
+            elif flip_band == "strong" and mag > 2.0:
+                base[s] = -base[s]
+    else:
+        # Random flip: select flip_fraction of spices to negate
+        import random
+        rng = random.Random(seed)
+        n_flip = max(1, int(len(spices) * flip_fraction))
+        to_flip = set(rng.sample(spices, n_flip))
+        for s in to_flip:
+            base[s] = -base[s]
+
+    return base
+
+
+def _make_band_flip_generator(band: str):
+    """Factory for band-specific flip generators."""
+    def gen(spices: list[str]) -> dict[str, float]:
+        return _sign_flip_theta(spices, flip_band=band)
+    return gen
+
+
+SPICE_SPECIFIC_HUMAN_SHIFTED = HiddenHBMConfig(
+    name="SpiceSpecificHumanShifted",
+    theta_mean={},
+    sigma_r=0.5,
+    sigma_h=0.5,
+    # Default: flip soft band (backward compat with earlier runs)
+    theta_generator=_make_band_flip_generator("soft"),
+)
+
+SPICE_SHIFT_SOFT = HiddenHBMConfig(
+    name="SpiceShiftSoft",
+    theta_mean={},
+    sigma_r=0.5,
+    sigma_h=0.5,
+    theta_generator=_make_band_flip_generator("soft"),
+)
+
+SPICE_SHIFT_MEDIUM = HiddenHBMConfig(
+    name="SpiceShiftMedium",
+    theta_mean={},
+    sigma_r=0.5,
+    sigma_h=0.5,
+    theta_generator=_make_band_flip_generator("medium"),
+)
+
+SPICE_SHIFT_STRONG = HiddenHBMConfig(
+    name="SpiceShiftStrong",
+    theta_mean={},
+    sigma_r=0.5,
+    sigma_h=0.5,
+    theta_generator=_make_band_flip_generator("strong"),
+)
+
+# Random flip config: the theta_generator is overridden at experiment build
+# time with a seed-specific closure. This entry exists for the registry.
+SPICE_SHIFT_RANDOM = HiddenHBMConfig(
+    name="SpiceShiftRandom",
+    theta_mean={},
+    sigma_r=0.5,
+    sigma_h=0.5,
+    theta_generator=_make_band_flip_generator("soft"),  # placeholder
+)
+
 
 CONSISTENT_HUMAN = HiddenHBMConfig(
     name="ConsistentHuman",
@@ -540,6 +670,11 @@ ALL_HIDDEN_HBM_CONFIGS: dict[str, HiddenHBMConfig] = {
     "SpiceSpecificHumanRecipeConflict": SPICE_SPECIFIC_HUMAN_RECIPE_CONFLICT,
     "SpiceSpecificHumanHeatSeeking": SPICE_SPECIFIC_HUMAN_HEAT_SEEKING,
     "SpiceSpecificHumanAromaticGentle": SPICE_SPECIFIC_HUMAN_AROMATIC_GENTLE,
+    "SpiceSpecificHumanShifted": SPICE_SPECIFIC_HUMAN_SHIFTED,
+    "SpiceShiftSoft": SPICE_SHIFT_SOFT,
+    "SpiceShiftMedium": SPICE_SHIFT_MEDIUM,
+    "SpiceShiftStrong": SPICE_SHIFT_STRONG,
+    "SpiceShiftRandom": SPICE_SHIFT_RANDOM,
     "ConsistentHuman": CONSISTENT_HUMAN,
     "VariableHuman": VARIABLE_HUMAN,
     "StrongPreferencesHuman": STRONG_PREFERENCES_HUMAN,

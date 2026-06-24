@@ -20,13 +20,11 @@ ENV_TO_DISPLAY_NAME = {
 }
 
 APPROACH_TO_DISPLAY_NAME = {
-    # Spices comparison approaches
     "ours": "HBM (Ours)",
-    "cbtl_classifier": "CBTL Classifier",
+    "cbtl_adapted": "CBTL Classifier",
     "flat_model": "Flat Bayesian",
     "without_mood_learning": "HBM (no psi)",
     "exploit_only": "Exploit Only",
-    # Legacy cooking approaches
     "nothing_personal": "Free Explore",
     "epsilon_greedy": "Epsilon Greedy",
     "no_learning": "No Learning",
@@ -34,13 +32,11 @@ APPROACH_TO_DISPLAY_NAME = {
 
 # https://colorbrewer2.org/#type=diverging&scheme=Spectral&n=8
 APPROACH_TO_COLOR = {
-    # Spices comparison
     "ours": "#3288bd",
-    "cbtl_classifier": "#d53e4f",
+    "cbtl_adapted": "#d53e4f",
     "flat_model": "#f46d43",
     "without_mood_learning": "#66c2a5",
     "exploit_only": "#fee08b",
-    # Legacy cooking
     "nothing_personal": "#abdda4",
     "epsilon_greedy": "#e6f598",
     "no_learning": "#fdae61",
@@ -154,10 +150,8 @@ def _main(results_dir: Path, outfile: Path) -> None:
                 print(f"WARNING: no data found for {env_name}: {approach_name}")
                 continue
             check_for_missing_results(df)
-            # Use neutral_eval (forced neutral mood) as the primary metric for spices:
-            # it isolates learned phi from transient psi effects, giving the cleanest
-            # measure of preference learning quality. Fall back to eval_mean for
-            # legacy cooking environments that don't have the neutral/natural split.
+
+            # Satisfaction in neutral eval episodes are primary metric
             y_col = (
                 "neutral_eval_mean_user_satisfaction"
                 if "neutral_eval_mean_user_satisfaction" in df.columns

@@ -1999,6 +1999,35 @@ CHEF_COMPLEX = ProfileSpec(
 # RECIPE LOOKUP
 # # ---------------------------------------------------------------------------
 
+THESIS_MIXED_CURRY = RecipeSpec(
+    name="SpicedHoneyTagine",
+    spices=(
+        "salt", "pepper", "garlic", "cumin", "chili", "cardamom",
+        "coriander", "basil", "clove", "fenugreek", "honey", "oregano",
+    ),
+    predecessors={
+        # Layer 0: base
+        "salt": (),
+        "pepper": (),
+
+        # Layer 1: aromatics branch from base
+        "garlic": ("salt",),
+        "cumin": ("salt",),
+        "chili": ("pepper",),
+        "cardamom": ("pepper",),
+
+        # Layer 2: spice blending
+        "coriander": ("garlic", "cumin"),
+        "basil": ("garlic",),
+        "clove": ("cardamom", "chili"),
+        "fenugreek": ("cardamom",),
+
+        # Layer 3: finishing
+        "honey": ("coriander", "basil"),
+        "oregano": ("clove", "fenugreek"),
+    },
+)
+
 ALL_RECIPES = {
     "SimpleDal": SIMPLE_DAL,
     "BreakingBread": BREAKING_BREAD,
@@ -2064,6 +2093,7 @@ ALL_RECIPES = {
     "NigerianJollof": NIGERIAN_Jollof,
     "PeruvianJapaneseFusion": PERUVIAN_JAPANESE_FUSION,
     "FortyStepFeast": FORTY_STEP_FEAST,
+    "SpicedHoneyTagine": THESIS_MIXED_CURRY,
 }
 
 def get_recipe(name: str) -> RecipeSpec:

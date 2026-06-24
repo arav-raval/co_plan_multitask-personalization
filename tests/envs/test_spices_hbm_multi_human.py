@@ -3,15 +3,22 @@ import numpy as np
 from multitask_personalization.envs.spices.spices_hbm import HierarchicalPreferenceModel
 
 
+def _observe_and_learn(hbm, human_id, recipe, spice, actor, sat=0.9, n=20):
+    """Helper: feed n observations and run end_episode to trigger ELBO updates."""
+    for _ in range(n):
+        hbm.observe(human_id, recipe, spice, actor, sat)
+    hbm.end_episode(human_id)
+
+
 def test_multi_human_hbm_single_human_single_recipe_reduces_to_two_level():
     """With one human and one recipe, μ and θ should largely track the same direction as φ."""
     spices = ["salt", "pepper"]
     hbm = HierarchicalPreferenceModel(spices=spices)
 
-    # Provide strong positive evidence for salt, negative for pepper for H1 on R1.
+    # Provide strong positive evidence for salt (human prefers), negative for pepper (robot prefers).
     for _ in range(20):
-        hbm.update_phi("H1", "R1", "salt", g=+3.0)
-        hbm.update_phi("H1", "R1", "pepper", g=-3.0)
+        _observe_and_learn(hbm, "H1", "R1", "salt", "human", sat=0.9, n=1)
+        _observe_and_learn(hbm, "H1", "R1", "pepper", "robot", sat=0.9, n=1)
 
     hbm.update_theta_and_mu()
 
@@ -36,10 +43,10 @@ def test_multi_human_hbm_two_humans_one_recipe_pools_into_mu():
     spices = ["salt"]
     hbm = HierarchicalPreferenceModel(spices=spices)
 
-    # H1 strongly prefers human (+g), H2 strongly prefers robot (-g)
+    # H1 strongly prefers human, H2 strongly prefers robot
     for _ in range(20):
-        hbm.update_phi("H1", "R1", "salt", g=+3.0)
-        hbm.update_phi("H2", "R1", "salt", g=-3.0)
+        _observe_and_learn(hbm, "H1", "R1", "salt", "human", sat=0.9, n=1)
+        _observe_and_learn(hbm, "H2", "R1", "salt", "robot", sat=0.9, n=1)
 
     hbm.update_theta_and_mu()
 
@@ -62,10 +69,10 @@ def test_multi_human_hbm_multiple_recipes_per_human_pool_into_theta():
     spices = ["salt"]
     hbm = HierarchicalPreferenceModel(spices=spices)
 
-    # Human H1 likes salt in R1 (+3) but dislikes it in R2 (-1).
+    # Human H1 likes salt in R1 (human actor) but dislikes it in R2 (robot actor).
     for _ in range(10):
-        hbm.update_phi("H1", "R1", "salt", g=+3.0)
-        hbm.update_phi("H1", "R2", "salt", g=-1.0)
+        _observe_and_learn(hbm, "H1", "R1", "salt", "human", sat=0.9, n=1)
+        _observe_and_learn(hbm, "H1", "R2", "salt", "robot", sat=0.3, n=1)
 
     hbm.update_theta_and_mu()
 
@@ -91,8 +98,7 @@ def test_new_human_warm_started_from_global_mu():
     hbm = HierarchicalPreferenceModel(spices=spices)
 
     # Train H1 with strong positive evidence so μ shifts positive.
-    for _ in range(20):
-        hbm.update_phi("H1", "R1", "salt", g=+3.0)
+    _observe_and_learn(hbm, "H1", "R1", "salt", "human", sat=0.9, n=20)
     hbm.update_theta_and_mu()
 
     mu_before = hbm.get_mu("salt")
@@ -114,8 +120,7 @@ def test_new_recipe_warm_started_from_theta():
     hbm = HierarchicalPreferenceModel(spices=spices)
 
     # Build up θ for H1 via R1.
-    for _ in range(20):
-        hbm.update_phi("H1", "R1", "salt", g=+3.0)
+    _observe_and_learn(hbm, "H1", "R1", "salt", "human", sat=0.9, n=20)
     hbm.update_theta_and_mu()
 
     theta_before = hbm.get_theta("H1", "salt")

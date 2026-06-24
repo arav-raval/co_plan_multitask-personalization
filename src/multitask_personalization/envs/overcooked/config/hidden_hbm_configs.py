@@ -177,6 +177,97 @@ CONSISTENT_HUMAN = HiddenHBMConfig(
     sigma_r=0.1,
 )
 
+# Strong preferences — higher theoretical accuracy ceiling (~88-95%).
+# Same pattern as RealisticCook but with |theta| = 2.5-3.0.
+_STRONG_THETA: dict[str, float] = {
+    "fetch_ingredient": +1.5,
+    "load_pot":         +2.0,
+    "fetch_dish":       +1.5,
+    "pickup_soup":      -1.5,
+    "deliver":          -2.0,
+}
+
+def _strong_theta(subtasks: list[str]) -> dict[str, float]:
+    return {s: _STRONG_THETA.get(s, 0.0) for s in subtasks}
+
+STRONG_COOK = HiddenHBMConfig(
+    name="StrongCook",
+    theta_generator=_strong_theta,
+    sigma_h=0.5,
+    sigma_r=0.5,
+)
+
+# MildPrep — similar to RealisticCook but milder on prep, stronger on serve.
+# Used as a "similar but different" human for multi-human transfer.
+# 3/5 preferences match RealisticCook.
+_MILD_PREP_THETA: dict[str, float] = {
+    "fetch_ingredient": +0.5,   # mild (RC: +1.0, same direction)
+    "load_pot":         +1.0,   # similar (RC: +1.5, same direction)
+    "fetch_dish":       -0.5,   # DIFFERENT from RC (+0.5)
+    "pickup_soup":      -1.0,   # same direction, stronger (RC: -0.5)
+    "deliver":          -1.0,   # same direction, weaker (RC: -1.5)
+}
+
+def _mild_prep_theta(subtasks: list[str]) -> dict[str, float]:
+    return {s: _MILD_PREP_THETA.get(s, 0.0) for s in subtasks}
+
+MILD_PREP = HiddenHBMConfig(
+    name="MildPrep",
+    theta_generator=_mild_prep_theta,
+    sigma_h=0.5,
+    sigma_r=0.5,
+)
+
+# NuancedCook — moderate preferences. |theta| ∈ [0.4, 0.8].
+# Covers ALL 8 subtasks including handoff subtasks used in separated layouts
+# like ForcedCoordination. Moderate strength prevents trivial learning; 8
+# dimensions give hierarchy room to pool.
+_NUANCED_THETA: dict[str, float] = {
+    "fetch_ingredient":     +0.5,
+    "fetch_onion":          +0.5,
+    "fetch_tomato":         +0.4,
+    "load_pot":             +0.8,
+    "fetch_dish":           +0.4,
+    "pickup_soup":          -0.5,
+    "deliver":              -0.8,
+    "place_on_counter":     -0.6,  # mild aversion to handoffs
+    "pickup_from_counter":  -0.4,  # mild aversion to receiving
+}
+
+
+def _nuanced_theta(subtasks: list[str]) -> dict[str, float]:
+    return {s: _NUANCED_THETA.get(s, 0.0) for s in subtasks}
+
+
+NUANCED_COOK = HiddenHBMConfig(
+    name="NuancedCook",
+    theta_generator=_nuanced_theta,
+    sigma_h=0.5,
+    sigma_r=0.5,
+)
+
+
+# Tomato layout human: likes fetching onions, dislikes fetching tomatoes.
+# This creates per-ingredient preference variation that vector psi can capture.
+_TOMATO_COOK_THETA: dict[str, float] = {
+    "fetch_onion":    +1.5,   # strongly prefers fetching onions
+    "fetch_tomato":   -1.0,   # dislikes fetching tomatoes (far walk)
+    "load_pot":       +1.5,   # enjoys loading
+    "fetch_dish":     +0.5,   # mild preference
+    "pickup_soup":    -0.5,   # mild aversion
+    "deliver":        -1.5,   # dislikes delivery
+}
+
+def _tomato_cook_theta(subtasks: list[str]) -> dict[str, float]:
+    return {s: _TOMATO_COOK_THETA.get(s, 0.0) for s in subtasks}
+
+TOMATO_COOK = HiddenHBMConfig(
+    name="TomatoCook",
+    theta_generator=_tomato_cook_theta,
+    sigma_h=0.5,
+    sigma_r=0.5,
+)
+
 
 # ---------------------------------------------------------------------------
 # Registry
@@ -194,6 +285,10 @@ _REGISTRY: dict[str, HiddenHBMConfig] = {
         ROBOT_CENTRIC,
         VARIABLE_HUMAN,
         CONSISTENT_HUMAN,
+        STRONG_COOK,
+        MILD_PREP,
+        TOMATO_COOK,
+        NUANCED_COOK,
     ]
 }
 

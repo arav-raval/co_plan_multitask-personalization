@@ -29,6 +29,11 @@ from multitask_personalization.envs.overcooked.overcooked_baselines import (
     OvercookedCBTLClassifierModel,
     OvercookedFlatPreferenceModel,
 )
+from multitask_personalization.envs.overcooked.continuous_prefs import (
+    ContinuousPreferenceCBTL,
+    ContinuousPreferenceFlat,
+    ContinuousPreferenceHBM,
+)
 from multitask_personalization.envs.overcooked.overcooked_csp import (
     OvercookedAssignCSPGenerator,
 )
@@ -70,6 +75,7 @@ class CSPApproach(BaseApproach[_ObsType, _ActType]):
         mood_learning_enabled: bool = True,
         preference_model_type: str = "hbm",
         psi_type: str = "vector",
+        cbtl_pooled_across_humans: bool = True,
         csp_save_dir: str | None = None,
         seed: int = 0,
         lifelong_learning: dict | None = None,
@@ -84,6 +90,7 @@ class CSPApproach(BaseApproach[_ObsType, _ActType]):
         self._mood_learning_enabled = mood_learning_enabled
         self._preference_model_type = preference_model_type
         self._psi_type = psi_type
+        self._cbtl_pooled_across_humans = cbtl_pooled_across_humans
         self._motion_planning_quality = motion_planning_quality
         self._csp_save_dir = Path(csp_save_dir) if csp_save_dir else None
         self._lifelong_learning = lifelong_learning
@@ -263,8 +270,36 @@ class CSPApproach(BaseApproach[_ObsType, _ActType]):
                 )
             elif self._preference_model_type == "cbtl":
                 preference_model = OvercookedCBTLClassifierModel(
-                    subtasks=subtask_list, layouts=layout_list
+                    subtasks=subtask_list, layouts=layout_list,
+                    pooled_across_humans=self._cbtl_pooled_across_humans,
                 )
+            # --- FUTURE WORK: continuous preferences model (phase 1) ---
+            # Gated skeleton; only triggered by overcooked_continuous.yaml.
+            # See envs/overcooked/continuous_prefs.py for status.
+            continuous_pref_model: Any = None
+            if getattr(spec, "continuous_prefs_enabled", False):
+                choices = tuple(getattr(spec, "ingredient_count_choices", (1, 2, 3)))
+                param_min = float(min(choices))
+                param_max = float(max(choices))
+                if self._preference_model_type == "flat":
+                    continuous_pref_model = ContinuousPreferenceFlat(
+                        param_min=param_min, param_max=param_max
+                    )
+                elif self._preference_model_type == "cbtl":
+                    continuous_pref_model = ContinuousPreferenceCBTL(
+                        param_min=param_min,
+                        param_max=param_max,
+                        pooled_across_humans=self._cbtl_pooled_across_humans,
+                    )
+                else:
+                    continuous_pref_model = ContinuousPreferenceHBM(
+                        param_min=param_min, param_max=param_max
+                    )
+            ingredient_count_choices = (
+                list(getattr(spec, "ingredient_count_choices", (1, 2, 3)))
+                if getattr(spec, "continuous_prefs_enabled", False)
+                else None
+            )
             return OvercookedAssignCSPGenerator(
                 subtask_list=subtask_list,
                 layout_list=layout_list,
@@ -275,6 +310,8 @@ class CSPApproach(BaseApproach[_ObsType, _ActType]):
                 preference_model=preference_model,
                 feasibility=spec.feasibility,
                 scalar_psi=(self._psi_type == "scalar"),
+                continuous_pref_model=continuous_pref_model,
+                ingredient_count_choices=ingredient_count_choices,
             )
         if isinstance(self._scene_spec, SpiceSceneSpec):
             spec = self._scene_spec
@@ -296,7 +333,8 @@ class CSPApproach(BaseApproach[_ObsType, _ActType]):
                 )
             elif self._preference_model_type == "cbtl":
                 preference_model = CBTLClassifierModel(
-                    spices=spice_list, recipes=recipe_list
+                    spices=spice_list, recipes=recipe_list,
+                    pooled_across_humans=self._cbtl_pooled_across_humans,
                 )
             return SpicesAssignCSPGenerator(
                 spice_list=spice_list,

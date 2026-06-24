@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Thanks!</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #1e1e28;
+      color: #e0e0e0;
+      max-width: 600px;
+      margin: 100px auto;
+      padding: 20px;
+      text-align: center;
+    }
+    h1 { color: #b4dcff; font-size: 2em; }
+    p { color: #c0c0c0; line-height: 1.6; }
+    a {
+      display: inline-block;
+      margin-top: 20px;
+      padding: 10px 20px;
+      background: #4a6fa5;
+      color: white;
+      text-decoration: none;
+      border-radius: 4px;
+    }
+  </style>
+</head>
+<body>
+  <h1>Thanks for playing{% if name %}, {{ name }}{% endif %}!</h1>
+  <p>Your data has been saved. The robot learned a lot from you.</p>
+  <a href="/">Start a new session</a>
+</body>
+</html>

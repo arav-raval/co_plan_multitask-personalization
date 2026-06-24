@@ -1,0 +1,26 @@
+# Expanded LOO: hold out SpanishPaella, train on 7 remaining.
+env:
+  _target_: "multitask_personalization.envs.spices.spices_env.SpiceEnv"
+  scene_spec:
+    _target_: "multitask_personalization.envs.spices.spices_experiment.build_spice_scene_spec_exp_loo_train_spanish"
+  hidden_spec:
+    _target_: "multitask_personalization.envs.spices.spices_env.SpiceHiddenSpec"
+    preferred_actor: {}
+    stochastic_preferences: false
+    hidden_hbm:
+      _target_: "multitask_personalization.envs.spices.spices_experiment.build_spice_experiment_hidden_hbm_expanded_loo"
+      hidden_hbm_config_name: SpiceSpecificHumanRecipeConflict
+  verbose: false
+train_env: {}
+eval_env:
+  scene_spec:
+    _target_: "multitask_personalization.envs.spices.spices_experiment.build_spice_scene_spec_exp_loo_eval_spanish"
+max_environment_steps: 5000
+eval_frequency: 250
+max_eval_episode_length: 50
+num_eval_trials: 50
+dt: 0.01
+csp_solver:
+  max_iters: 2500
+  num_improvements: 500
+  max_improvement_attempts: 100

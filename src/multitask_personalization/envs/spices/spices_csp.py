@@ -277,9 +277,13 @@ class _AssignPreferenceGenerator(CSPConstraintGenerator[SpiceState, SpiceAction]
         """Update HBM on each observed transition.
 
         Uses task_score as the behavioral observation signal:
-          +1  human claimed this spice
-          -1  human did not claim
-           0  conflict step — skip HBM update (human wins but signal is ambiguous)
+          +1  human claimed this spice (including conflicts where human won)
+          -1  human did not claim this spice
+
+        Conflict information is preserved in info["conflict"] for the
+        conflict_rate metric, and the coordination penalty in the satisfaction
+        signal captures coordination quality separately. We do NOT skip
+        observations on conflict — every step provides a clean behavioral label.
         """
         if info.get("last_spice") is None or info.get("last_actor") is None:
             return
@@ -289,18 +293,7 @@ class _AssignPreferenceGenerator(CSPConstraintGenerator[SpiceState, SpiceAction]
         if info.get("conflict", False):
             self._episode_conflicts += 1
 
-        # Skip HBM update on conflict steps (task_score == 0); no clean signal.
         task_score = float(info.get("task_score", info.get("satisfaction", 0.0)))
-        if info.get("conflict", False) or task_score == 0.0:
-            if done:
-                self._conflict_rate = (
-                    self._episode_conflicts / self._episode_steps
-                    if self._episode_steps > 0 else 0.0
-                )
-                self._episode_steps = 0
-                self._episode_conflicts = 0
-                self._finalize_episode()
-            return
 
         recipe_name = info.get("recipe_name") or self._current_recipe_name
         if recipe_name and recipe_name not in self._recipe_list:
@@ -347,9 +340,6 @@ class _AssignPreferenceGenerator(CSPConstraintGenerator[SpiceState, SpiceAction]
     ) -> None:
         """Update running_psi only (no phi/theta learning) for mid-episode eval adaptation."""
         if info.get("last_spice") is None or info.get("last_actor") is None:
-            return
-        # Skip on conflict steps.
-        if info.get("conflict", False):
             return
         recipe_name = info.get("recipe_name") or self._current_recipe_name
         if not recipe_name:

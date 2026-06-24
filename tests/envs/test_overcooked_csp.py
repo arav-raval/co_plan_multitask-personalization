@@ -168,16 +168,35 @@ class TestObserveTransition:
         # Episode end should have cleared episode data
         assert len(gen._pref_gen._hbm._episode_data[DEFAULT_HUMAN]) == 0
 
-    def test_conflict_step_not_buffered(self):
+    def test_conflict_step_is_buffered(self):
+        """Under the new convention, conflict steps carry a clean +1 behavioral
+        label (the human acted) and a non-zero satisfaction signal with the
+        coordination penalty applied. They should be buffered like any other
+        observation."""
         gen = make_csp_gen()
         obs = make_obs("load_pot")
         act = OvercookedAction(flag=0)  # robot claimed, conflict
         next_obs = make_obs("load_pot")
-        info = make_transition_info("load_pot", "human", 0.0, conflict=True)
+        # Conflict: human won, task_score=+1, satisfaction reflects coordination penalty
+        info = make_transition_info("load_pot", "human", 1.0, conflict=True)
 
         gen.observe_transition(obs, act, next_obs, done=False, info=info)
 
-        # Conflict step should NOT be buffered
+        # Conflict step IS buffered — it carries valid behavioral information.
+        assert len(gen._pref_gen._hbm._episode_data[DEFAULT_HUMAN]) == 1
+
+    def test_timeout_step_not_buffered(self):
+        """Timeout steps (subtask not completed → satisfaction == 0) are skipped."""
+        gen = make_csp_gen()
+        obs = make_obs("load_pot")
+        act = OvercookedAction(flag=0)
+        next_obs = make_obs("load_pot")
+        # Timeout: satisfaction == 0
+        info = make_transition_info("load_pot", "human", 0.0, conflict=False)
+
+        gen.observe_transition(obs, act, next_obs, done=False, info=info)
+
+        # Timeout step should NOT be buffered
         assert len(gen._pref_gen._hbm._episode_data[DEFAULT_HUMAN]) == 0
 
     def test_multiple_transitions_accumulate(self):

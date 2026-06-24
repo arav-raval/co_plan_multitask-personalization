@@ -252,9 +252,10 @@ def test_spices_csp_single_recipe():
                 assert np.isclose(reward, 0.0)
                 csp_gen.observe_transition(prev_obs, act, obs, done, info)
                 # Diagnostics for neutral episodes: robot prediction accuracy.
-                # Under autonomous-human semantics, task_score=+1 means human claimed
-                # (robot correctly passed), task_score=-1 means human didn't claim.
-                # A conflict (task_score=0) is excluded from match-rate computation.
+                # Under autonomous-human semantics, task_score=+1 means human claimed,
+                # task_score=-1 means human didn't claim. Conflicts also produce
+                # task_score=+1 (the human won) but are excluded from prediction
+                # accuracy since they reflect coordination, not preference recovery.
                 task_score = float(info.get("task_score", 0.0))
                 conflict = bool(info.get("conflict", False))
                 robot_flag = act[0]  # 0=claim, 1=pass

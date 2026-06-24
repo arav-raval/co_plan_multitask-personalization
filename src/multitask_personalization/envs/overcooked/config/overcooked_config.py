@@ -60,10 +60,9 @@ class HBMConfig:
 
     # Prior std for each psi dimension.  Fixed (not learned) to prevent
     # psi prior collapse, same reasoning as scalar-psi in spices.
-    # Prior std for psi. Must be wide enough to absorb session effects
-    # (nonneutral_mean_abs=2.0) without the KL penalty pulling psi to 0
-    # and contaminating phi.
-    sigma_session: float = 2.0
+    # Prior std for psi. Wide enough to absorb session effects without
+    # the KL penalty pulling psi to 0 and contaminating phi.
+    sigma_session: float = 1.0
 
     # Aggressive decay at episode end (same as spices psi_decay).
     psi_decay: float = 0.05
@@ -77,7 +76,7 @@ class HBMConfig:
     n_mc_samples: int = 8
     n_phi_steps: int = 12
     n_theta_steps: int = 12
-    lr_phi: float = 5e-2
+    lr_phi: float = 3e-2
     lr_theta: float = 1e-2
     lr_hyper: float = 5e-3
     log_var_min: float = math.log(1e-6)
@@ -122,8 +121,9 @@ class SessionConfig:
     # "Uniform": all tasks equally affected (equivalent to scalar psi baseline).
     session_profile_name: str = "PhysicalFatigue"
 
-    # Session type prior (probability of neutral vs. non-neutral session).
-    prob_neutral_session: float = 0.8
+    # Session type prior. Higher non-neutral rate makes vector psi more
+    # valuable — the model must absorb per-subtask fatigue/energy effects.
+    prob_neutral_session: float = 0.6
 
 
 @dataclass(frozen=True)

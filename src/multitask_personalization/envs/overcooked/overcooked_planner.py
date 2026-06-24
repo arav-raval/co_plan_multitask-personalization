@@ -53,6 +53,8 @@ _INTERACT_ACTION = "interact"
 # they need to *interact* they stand adjacent and take INTERACT.
 _SUBTASK_TERRAIN: Dict[str, str] = {
     "fetch_ingredient": "O",   # onion dispenser (most layouts); also 'T'
+    "fetch_onion":      "O",   # onion dispenser only
+    "fetch_tomato":     "T",   # tomato dispenser only
     "load_pot":         "P",   # pot
     "fetch_dish":       "D",   # dish dispenser
     "pickup_soup":      "P",   # pot again (this time to pick up cooked soup)

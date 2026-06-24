@@ -38,25 +38,25 @@ _METHOD_LABELS: dict[str, str] = {
     "ours":                  "HBM (Ours)",
     "without_mood_learning": "HBM (no psi)",
     "flat_model":            "Flat Bayesian",
-    "cbtl_classifier":       "CBTL",
+    "cbtl_adapted":       "CBTL",
 }
 _METHOD_COLORS: dict[str, str] = {
     "ours":                  "#0072B2",
     "without_mood_learning": "#E69F00",
     "flat_model":            "#009E73",
-    "cbtl_classifier":       "#CC79A7",
+    "cbtl_adapted":       "#CC79A7",
 }
 _METHOD_LINESTYLES: dict[str, str] = {
     "ours":                  "-",
     "without_mood_learning": "--",
     "flat_model":            "-.",
-    "cbtl_classifier":       ":",
+    "cbtl_adapted":       ":",
 }
 _METHOD_MARKERS: dict[str, str] = {
     "ours":                  "o",
     "without_mood_learning": "s",
     "flat_model":            "^",
-    "cbtl_classifier":       "D",
+    "cbtl_adapted":       "D",
 }
 
 # Transfer-specific: warm vs cold within a method

@@ -132,6 +132,12 @@ class SpiceHiddenSpec:
     hidden_hbm: "HierarchicalPreferenceModel | None" = None
     force_neutral_mood: bool = False  # If True, all episodes use neutral mood (training mode)
     stochastic_preferences: bool = False  # If True, phi ~ N(theta, sigma_r²) resampled each episode
+    # Non-stationarity: a second hidden HBM whose phi values replace the primary
+    # HBM's phi at ``preference_shift_step``.  When set, ``info["preference_shift"]``
+    # is emitted once at the swap step so downstream code (run_single_experiment)
+    # can track recovery.
+    shift_hidden_hbm: "HierarchicalPreferenceModel | None" = None
+    preference_shift_step: int = -1  # global env step at which the shift fires (-1 = never)
 
 @dataclass(frozen=True)
 class SpiceState:
@@ -168,12 +174,14 @@ New semantics (human-led autonomous system):
       must add the spice). task_score = -1 (robot mispredicted: thought human would
       claim but they didn't).
 
-  The task_score fed to the HBM is:
-    +1  human claimed this spice (regardless of what robot did)
+  The task_score fed to the HBM is a clean binary behavioral label:
+    +1  human ended up claiming this spice (including conflict cases — human wins)
     -1  human did not claim this spice
-     0  conflict step (no HBM update — robot replans)
 
-  This replaces the old satisfaction-proxy signal with a direct behavioral observation.
+  Conflict information is captured separately in info["conflict"] and via the
+  coordination penalty subtracted from the continuous satisfaction signal. This
+  separation ensures that the behavioral signal is always informative, while
+  coordination quality is tracked through the satisfaction channel and metrics.
 """
 SpiceAction: TypeAlias = tuple[int, str | None]
 
@@ -240,6 +248,10 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
         self._conflict_count: int = 0
         # Stage 2: true session offset sampled once per episode (replaces per-step mood_adj)
         self._current_psi_true: float = 0.0
+
+        # Global step counter (persists across episodes) for preference-shift scheduling.
+        self._global_step: int = 0
+        self._preference_shifted: bool = False
 
         self.verbose = verbose
 
@@ -337,6 +349,23 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
         """
         flag, _payload = action
         self._action_history.append(action)
+        self._global_step += 1
+
+        # --- Non-stationarity: fire preference shift once ---
+        preference_shift_fired = False
+        if (
+            not self._preference_shifted
+            and self._hidden_spec.shift_hidden_hbm is not None
+            and self._hidden_spec.preference_shift_step >= 0
+            and self._global_step >= self._hidden_spec.preference_shift_step
+        ):
+            self._hidden_spec.hidden_hbm = self._hidden_spec.shift_hidden_hbm
+            self._preference_shifted = True
+            preference_shift_fired = True
+            if self.verbose:
+                logging.info(
+                    f"[SpiceEnv] PREFERENCE SHIFT at global step {self._global_step}!"
+                )
 
         if self._current_spice is None:
             info = self._get_info(robot_indicated_done=True)
@@ -362,9 +391,12 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
 
         # --- Resolve outcomes ---
         if robot_claims and human_claims:
-            # CONFLICT: human wins, robot gets null step.
+            # CONFLICT: human wins. Task score is still +1 (the human acted),
+            # since task_score is a clean behavioral label. The conflict
+            # information is captured separately in info["conflict"] and via
+            # the coordination penalty applied to the satisfaction signal.
             self._conflict_count += 1
-            task_score = 0.0
+            task_score = 1.0
             actor = "human"
             self._last_actor = actor
             self._added.append(current_spice)
@@ -411,6 +443,7 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
         info = self._get_info(robot_indicated_done=terminated, conflict=conflict,
                                task_score=task_score, satisfaction=satisfaction,
                                prediction_correct=prediction_correct)
+        info["preference_shift"] = preference_shift_fired
 
         if self.verbose:
             status = "CONFLICT" if conflict else f"actor={actor}"
@@ -572,8 +605,7 @@ class SpiceEnv(gym.Env[SpiceState, SpiceAction]):
         the mean to ±psi_true_mood_mean_abs (configurable, independent of base bias)
         with std psi_true_mood_std.
 
-        Stage 2: replaces per-step compute_mood_bias. The HBM infers a latent scalar
-        psi without knowing the mood category.
+        The HBM infers a latent scalar psi without knowing the mood category.
         """
         mean_abs = DEFAULT_CONFIG.mood.psi_true_mood_mean_abs
         std = DEFAULT_CONFIG.mood.psi_true_mood_std

@@ -58,6 +58,20 @@ ALL_SUBTASKS: list[str] = [
 # The 5 core subtasks used in layouts where both agents can reach everything.
 CORE_SUBTASKS: list[str] = ALL_SUBTASKS[:5]
 
+# Extended subtasks for layouts with both onion and tomato dispensers.
+# Splits fetch_ingredient into fetch_onion and fetch_tomato for finer-grained
+# preference learning (e.g., human prefers fetching onions but not tomatoes).
+TOMATO_SUBTASKS: list[str] = [
+    "fetch_onion",         # pick up onion from dispenser (O)
+    "fetch_tomato",        # pick up tomato from dispenser (T)
+    "load_pot",
+    "fetch_dish",
+    "pickup_soup",
+    "deliver",
+    "place_on_counter",
+    "pickup_from_counter",
+]
+
 
 # ---------------------------------------------------------------------------
 # Layout specification
@@ -90,11 +104,12 @@ class LayoutSpec:
     description: str = ""
 
     def __post_init__(self) -> None:
+        valid = set(ALL_SUBTASKS) | set(TOMATO_SUBTASKS)
         for s in self.subtasks:
-            if s not in ALL_SUBTASKS:
+            if s not in valid:
                 raise ValueError(
                     f"Unknown subtask '{s}' in layout '{self.name}'. "
-                    f"Valid subtasks: {ALL_SUBTASKS}"
+                    f"Valid subtasks: {sorted(valid)}"
                 )
 
 
@@ -115,6 +130,19 @@ CRAMPED_ROOM = LayoutSpec(
         "Tight 5×4 grid with one pot and two onion dispensers on opposite "
         "sides.  Counter space is scarce so agents collide frequently — the "
         "key preference is who handles prep (fetch+load) vs. serve (dish+deliver)."
+    ),
+)
+
+CRAMPED_ROOM_TOMATO = LayoutSpec(
+    name="CrampedRoomTomato",
+    layout_name="cramped_room_tomato",
+    subtasks=TOMATO_SUBTASKS[:6],  # 6 core (no handoff subtasks)
+    episode_length=800,
+    description=(
+        "CrampedRoom with onion (O) and tomato (T) dispensers. 6 subtask "
+        "dimensions (fetch_onion, fetch_tomato, load_pot, fetch_dish, "
+        "pickup_soup, deliver) enable finer-grained preference learning "
+        "and a stronger test of vector psi."
     ),
 )
 
@@ -175,6 +203,7 @@ _LAYOUT_REGISTRY: dict[str, LayoutSpec] = {
     spec.name: spec
     for spec in [
         CRAMPED_ROOM,
+        CRAMPED_ROOM_TOMATO,
         ASYMMETRIC_ADVANTAGES,
         COORDINATION_RING,
         FORCED_COORDINATION,

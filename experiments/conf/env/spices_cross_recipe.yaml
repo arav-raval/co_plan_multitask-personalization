@@ -1,6 +1,5 @@
-# Claim 2: Cross-recipe generalization.
+# Cross-recipe generalization
 # Train on 3 recipes (Ultra, Asian, Indian), evaluate on held-out MediterraneanComplex.
-# The HBM's theta prior should transfer to the new recipe via phi ~ N(theta, sigma_r^2).
 env:
   _target_: "multitask_personalization.envs.spices.spices_env.SpiceEnv"
   scene_spec:
@@ -14,7 +13,6 @@ env:
       hidden_hbm_config_name: SpiceSpecificHumanRecipeConflict
   verbose: false
 train_env: {}
-# Eval env uses the HELD-OUT recipe (MediterraneanComplex).
 eval_env:
   scene_spec:
     _target_: "multitask_personalization.envs.spices.spices_experiment.build_spice_scene_spec_cross_recipe_eval"

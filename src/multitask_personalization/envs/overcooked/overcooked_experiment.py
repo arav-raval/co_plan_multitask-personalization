@@ -35,6 +35,7 @@ def build_overcooked_scene_spec(layout_name: str = "CrampedRoom") -> OvercookedS
 def build_overcooked_hidden_spec(
     layout_name: str = "CrampedRoom",
     hidden_hbm_config_name: str = "RealisticCook",
+    preferred_ingredient_count: dict | None = None,
 ) -> OvercookedHiddenSpec:
     """Build a hidden spec with a ground-truth HBM for Hydra instantiation.
 
@@ -63,7 +64,9 @@ def build_overcooked_hidden_spec(
     # Derive preferred_actor from theta sign (for oracle / metric tracking).
     preferred_actor = {s: ("human" if theta[s] > 0 else "robot") for s in subtasks}
 
+    pref_count = dict(preferred_ingredient_count) if preferred_ingredient_count else {}
     return OvercookedHiddenSpec(
         preferred_actor=preferred_actor,
         hidden_hbm=hbm,
+        preferred_ingredient_count=pref_count,
     )

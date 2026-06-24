@@ -94,6 +94,14 @@ class OvercookedSceneSpec(PublicSceneSpec):
     feasibility: Optional[Dict[str, Dict[str, bool]]] = None
     # Multi-layout training: list of layout names to rotate through.
     train_layout_names: Optional[tuple[str, ...]] = None
+    # --- FUTURE WORK: continuous preferences (phase 1) ---
+    # Gated skeleton; default False. When True, the CSP adds a joint
+    # ingredient_count decision variable on load_pot subtasks, and the env
+    # evaluates continuous satisfaction from hidden_spec.preferred_ingredient_count.
+    # Only enabled by the dedicated overcooked_continuous.yaml Hydra config.
+    # See src/.../overcooked/continuous_prefs.py for status and known issues.
+    continuous_prefs_enabled: bool = False
+    ingredient_count_choices: tuple[int, ...] = (1, 2, 3)
 
 
 @dataclass(frozen=True)
@@ -110,12 +118,26 @@ class OvercookedAction:
 
     Outcomes (simultaneous commitment, human wins conflicts):
       flag=0, human does NOT claim → robot executes, task_score = -1
-      flag=0, human ALSO claims   → CONFLICT: human executes, task_score = 0
+      flag=0, human ALSO claims   → CONFLICT: human executes, task_score = +1
       flag=1, human claims        → human executes, task_score = +1
       flag=1, human does NOT claim→ robot must execute anyway, task_score = -1
+
+    The task_score is a clean binary behavioral label: +1 if the human ended up
+    performing the subtask, -1 if the robot did. Conflict information is captured
+    separately in info["conflict"] and via the coordination penalty applied to
+    the satisfaction signal.
+
+    Continuous preferences (phase 1, opt-in):
+      ingredient_count: optional int in {1, 2, 3} that specifies how many
+      ingredients to place in a pot before triggering cooking. When set, the
+      environment treats this as the chosen continuous parameter value and
+      evaluates the human's preference satisfaction against it. When None
+      (default), no continuous preference is active — the legacy binary-only
+      behavior is preserved.
     """
 
     flag: int  # 0 = robot claims, 1 = robot passes
+    ingredient_count: Optional[int] = None  # continuous pref: ingredients before cook trigger
 
 
 @dataclass(frozen=False)
@@ -126,6 +148,10 @@ class OvercookedHiddenSpec:
     hidden_hbm: Optional[OvercookedPreferenceModel] = None
     psi_true: List[float] = field(default_factory=list)
     force_neutral_session: bool = False
+    # Continuous preferences (phase 1): ground-truth preferred ingredient count.
+    # Dict maps layout_name -> (preferred_mean, preferred_std). If empty, no
+    # continuous preference is active and continuous satisfaction contributes 0.
+    preferred_ingredient_count: Dict[str, tuple] = field(default_factory=dict)
 
     @property
     def force_neutral_mood(self) -> bool:
@@ -284,14 +310,12 @@ class _SubtaskExecutor:
             agent = state.players[actor_idx]
             held = agent.get_object().name if agent.has_object() else None
 
-            if subtask == "fetch_ingredient":
+            if subtask in ("fetch_ingredient", "fetch_onion", "fetch_tomato"):
                 if held in ("onion", "tomato"):
-                    return "fetch_ingredient"  # already has it; will complete
+                    return subtask  # already has ingredient; will complete
                 if held is None:
-                    return "fetch_ingredient"
-                # Holding wrong item (soup/dish) — can't fetch. Return subtask
-                # which will fail/timeout; sequencer will reassign next step.
-                return subtask
+                    return subtask
+                return subtask  # holding wrong item; will timeout
 
             if subtask == "load_pot":
                 if held in ("onion", "tomato"):
@@ -656,9 +680,15 @@ class OvercookedEnv(gym.Env):
         self.layout_spec = layout_spec
         self.hidden_spec = hidden_spec
         self._hidden_spec = hidden_spec  # alias for run_single_experiment compat
+        # If the hidden spec has a populated preferred_ingredient_count, turn on
+        # the continuous preferences branch in the CSP.
+        cont_enabled = bool(
+            hidden_spec and getattr(hidden_spec, "preferred_ingredient_count", {})
+        )
         self.scene_spec = OvercookedSceneSpec(
             layout_spec=layout_spec,
             subtask_list=tuple(layout_spec.subtasks),
+            continuous_prefs_enabled=cont_enabled,
         )
         self.config = config if config is not None else DEFAULT_CONFIG
         self._rng = np.random.default_rng(seed)
@@ -777,11 +807,17 @@ class OvercookedEnv(gym.Env):
                     "robot": {s: True for s in ALL_SUBTASKS},
                     "human": {s: True for s in ALL_SUBTASKS},
                 }
-            # Update scene_spec with feasibility info.
+            # Update scene_spec with feasibility info (preserve
+            # continuous_prefs_enabled from the initial construction).
+            cont_enabled = bool(
+                self.hidden_spec
+                and getattr(self.hidden_spec, "preferred_ingredient_count", {})
+            )
             self.scene_spec = OvercookedSceneSpec(
                 layout_spec=self.layout_spec,
                 subtask_list=tuple(self.layout_spec.subtasks),
                 feasibility=self._feasibility,
+                continuous_prefs_enabled=cont_enabled,
             )
             return True
         except ImportError:
@@ -847,7 +883,7 @@ class OvercookedEnv(gym.Env):
         """
         available = self._get_available_subtasks()
         if not available:
-            available = [("fetch_ingredient", None)]
+            available = [(self._fetch_ingredient_subtask(), None)]
 
         primary_subtask, primary_forced = available[0]
         current_subtask = primary_subtask
@@ -891,9 +927,13 @@ class OvercookedEnv(gym.Env):
             human_claims = self._human_claims(current_subtask)
 
             if robot_claims and human_claims:
+                # Conflict: human wins. task_score is +1 (clean behavioral label
+                # — the human acted). The conflict diagnostic is preserved
+                # separately in info["conflict"] and via the satisfaction
+                # coordination penalty.
                 self._conflict_count += 1
                 actor = "human"
-                task_score = 0.0
+                task_score = 1.0
                 conflict = True
                 prediction_correct = False
             else:
@@ -1103,22 +1143,35 @@ class OvercookedEnv(gym.Env):
         primary_actor_idx = 0 if actor == "robot" else 1
         subtask_completed = result[f"completed_{primary_actor_idx}"]
 
-        # If primary subtask wasn't completed, override task_score.
+        # If primary subtask wasn't completed (timeout), override task_score
+        # to indicate no information. Conflicts still produce a clean +1 label
+        # since the human ended up acting.
         if not subtask_completed:
             task_score = 0.0
 
         # --- Satisfaction for primary subtask ---
-        # Emit satisfaction even for forced steps (item continuations and
-        # layout-forced assignments). A human forced to do a disliked task
-        # still produces negative satisfaction — this is important for the
-        # HBM to learn the full preference landscape and for transfer learning.
-        # Only skip on conflicts (ambiguous signal) and timeouts (no completion).
-        if subtask_completed and not conflict:
+        # Emit satisfaction for any completed subtask, including conflicts.
+        # On conflicts, prediction_correct=False so the coordination penalty is
+        # applied — this captures coordination quality through the satisfaction
+        # channel rather than discarding the observation. Only timeouts (no
+        # completion) produce a zero satisfaction signal.
+        if subtask_completed:
             satisfaction = self._compute_satisfaction(
                 current_subtask, actor, prediction_correct
             )
         else:
             satisfaction = 0.0
+
+        # --- FUTURE WORK: continuous preferences (phase 1: ingredient_count) ---
+        # Gated: only fires when an ingredient_count is attached to the action
+        # AND hidden_spec.preferred_ingredient_count is populated (empty dict by
+        # default). For all existing configs this is a no-op.
+        continuous_sat = self._compute_continuous_satisfaction(
+            current_subtask, action.ingredient_count
+        )
+        if continuous_sat is not None and subtask_completed and not conflict:
+            # Blend: 50% binary + 50% continuous
+            satisfaction = 0.5 * satisfaction + 0.5 * continuous_sat
 
         self._satisfaction_history.append(satisfaction)
         self._prediction_history.append(prediction_correct)
@@ -1183,6 +1236,9 @@ class OvercookedEnv(gym.Env):
             "psi_true": self._psi_true,
             "session_type": self._session_type,
             "time_left": time_left,
+            # Continuous preference info (phase 1: ingredient_count)
+            "ingredient_count": action.ingredient_count,
+            "continuous_satisfaction": continuous_sat,
         }
         return obs, 0.0, terminated or truncated, False, info
 
@@ -1261,6 +1317,45 @@ class OvercookedEnv(gym.Env):
             raw_sat = max(raw_sat, -1.0)
 
         return raw_sat
+
+    def _compute_continuous_satisfaction(
+        self, subtask: str, chosen_count: Optional[int]
+    ) -> Optional[float]:
+        """
+        Compute the continuous-preference satisfaction contribution for an
+        ingredient-count decision. Returns None if no continuous preference
+        is configured or the action doesn't carry an ingredient count.
+
+        Generative model (Gaussian acceptance):
+            preferred_mean, preferred_std = hidden_spec.preferred_ingredient_count[layout]
+            s_raw = exp(-(chosen - preferred_mean)^2 / (2 * preferred_std^2))
+            s = 2 * s_raw - 1  (rescale to [-1, +1])
+
+        This is only applicable for the load_pot subtask since that's where
+        the ingredient count decision is meaningful. For other subtasks, the
+        function returns None (no contribution).
+        """
+        if chosen_count is None:
+            return None
+        if subtask != "load_pot":
+            return None
+        # Try both the pretty name and the canonical layout_name so configs
+        # can key on either.
+        pref = self.hidden_spec.preferred_ingredient_count.get(
+            self.layout_spec.name
+        ) or self.hidden_spec.preferred_ingredient_count.get(
+            self.layout_spec.layout_name
+        )
+        if pref is None:
+            return None
+        try:
+            mu, sigma = float(pref[0]), float(pref[1])
+        except (TypeError, ValueError, IndexError):
+            return None
+        if sigma <= 0:
+            sigma = 0.5  # fall back
+        acceptance = float(np.exp(-((chosen_count - mu) ** 2) / (2.0 * sigma * sigma)))
+        return 2.0 * acceptance - 1.0  # rescale to [-1, +1]
 
     def _human_claims(self, subtask: str) -> bool:
         """
@@ -1522,7 +1617,7 @@ class OvercookedEnv(gym.Env):
                 )
                 supply = in_hand + on_counter
                 if supply < needed:
-                    _add("fetch_ingredient", None)
+                    _add(self._fetch_ingredient_subtask(), None)
 
             # Pots cooking → pre-fetch dish for when they're ready.
             if cooking_pots:
@@ -1532,17 +1627,32 @@ class OvercookedEnv(gym.Env):
             # only if pots actually need filling.
             if not available:
                 if partial_pots or empty_pots:
-                    available.append(("fetch_ingredient", None))
+                    available.append((self._fetch_ingredient_subtask(), None))
                 elif cooking_pots:
                     available.append(("fetch_dish", None))
                 else:
-                    available.append(("fetch_ingredient", None))
+                    available.append((self._fetch_ingredient_subtask(), None))
 
             return available
 
         except Exception:
             st = self._subtasks[self._current_subtask_idx] if self._subtasks else None
             return [(st, None)] if st else []
+
+    def _fetch_ingredient_subtask(self) -> str:
+        """Return the appropriate fetch subtask for this layout.
+
+        In tomato layouts (fetch_onion/fetch_tomato in subtask list),
+        alternates between onion and tomato to give both dimensions
+        equal observation time. In standard layouts, returns fetch_ingredient.
+        """
+        if "fetch_onion" in self._subtasks:
+            # Alternate based on timestep
+            if self._timestep % 2 == 0:
+                return "fetch_onion"
+            else:
+                return "fetch_tomato"
+        return "fetch_ingredient"
 
     def _get_pot_states(self) -> Optional[Dict[str, Any]]:
         """
@@ -1740,7 +1850,7 @@ class OvercookedEnv(gym.Env):
                     self._forced_actor = _force_holder_if_needed(h, "load_pot")
                     return "load_pot"
                 self._forced_actor = None
-                return "fetch_ingredient"
+                return self._fetch_ingredient_subtask()
 
             # P5b. Agent holds surplus ingredient (no pot needs it).
             # In separated layouts: drop on counter for handoff.

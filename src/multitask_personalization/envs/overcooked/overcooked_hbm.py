@@ -433,7 +433,9 @@ class OvercookedPreferenceModel:
         """Register a layout for a human, initialising phi from theta."""
         if human_id not in self._theta_m:
             self.register_human(human_id)
-        if layout_name in self._phi_logv.get(human_id, {}):
+        if layout_name in self._phi_logv.get(human_id, {}) and \
+           layout_name in self._phi_m.get(human_id, {}) and \
+           len(self._phi_m[human_id][layout_name]) == len(self.subtasks):
             return
 
         for s in self.subtasks:
@@ -673,7 +675,7 @@ class OvercookedPreferenceModel:
         m_psi_running = self._running_psi_m[human_id]
         if not m_psi_running.requires_grad:
             m_psi_running = m_psi_running.detach().clone().requires_grad_(True)
-        n_steps = max(1, self.n_phi_steps // 2)
+        n_steps = max(1, self.n_phi_steps // 2)  # half steps for running psi (fast mid-episode tracking)
         optimizer = optim.Adam([m_psi_running], lr=self.lr_phi)
         for _ in range(n_steps):
             optimizer.zero_grad()
@@ -696,6 +698,11 @@ class OvercookedPreferenceModel:
         """Batch-update phi for all (layout, subtask) pairs observed this episode."""
         seen_pairs = set(self._episode_layout_subtasks.get(human_id, []))
         for layout_name, subtask in seen_pairs:
+            # Ensure phi exists for this (human, layout, subtask).
+            if subtask not in self._phi_m.get(human_id, {}).get(layout_name, {}):
+                self._ensure_registered(human_id, layout_name)
+                if subtask not in self._phi_m.get(human_id, {}).get(layout_name, {}):
+                    continue  # subtask not in this model's subtask list
             elbo_val = self._update_phi_elbo(human_id, layout_name, subtask)
             self._elbo_history.append(elbo_val)
 
@@ -755,10 +762,18 @@ class OvercookedPreferenceModel:
         self._ensure_registered(human_id, layout_name)
         self._episode_data[human_id].append((actor, subtask, task_score))
         self._episode_layout_subtasks[human_id].append((layout_name, subtask))
+        if layout_name not in self._obs_count.get(human_id, {}):
+            # Safety: ensure _obs_count is populated even if register_layout
+            # was called before _obs_count was initialised for this human.
+            if human_id not in self._obs_count:
+                self._obs_count[human_id] = {}
+            self._obs_count[human_id][layout_name] = {s: 0 for s in self.subtasks}
         self._obs_count[human_id][layout_name][subtask] = (
             self._obs_count[human_id][layout_name].get(subtask, 0) + 1
         )
-        self._total_observations[human_id] += 1
+        self._total_observations[human_id] = self._total_observations.get(human_id, 0) + 1
+        if human_id not in self._layout_total_obs:
+            self._layout_total_obs[human_id] = {}
         self._layout_total_obs[human_id][layout_name] = (
             self._layout_total_obs[human_id].get(layout_name, 0) + 1
         )
@@ -786,6 +801,30 @@ class OvercookedPreferenceModel:
             self.update_theta_and_mu()
 
         # Aggressive psi decay: 95% of session signal discarded between episodes
+        psi_decay = self.config.hbm.psi_decay
+        self._psi_m[human_id] = torch.tensor(
+            self._psi_m[human_id].detach().numpy() * psi_decay,
+            dtype=torch.float32,
+            requires_grad=True,
+        )
+
+        # Reset episode state
+        self._episode_data[human_id] = []
+        self._episode_layout_subtasks[human_id] = []
+        self._running_psi_m[human_id] = torch.zeros(
+            self._psi_dim, dtype=torch.float32, requires_grad=True
+        )
+
+    def end_episode_eval(self, human_id: str) -> None:
+        """Eval-time end-of-episode: update psi only, no phi/theta/mu learning.
+
+        Infers psi from the episode's observations (for logging/diagnostics),
+        then decays psi and resets episode state. This allows session-effect
+        tracking during eval without modifying learned preference parameters.
+        """
+        self._update_psi_episode(human_id)
+
+        # Aggressive psi decay (same as training)
         psi_decay = self.config.hbm.psi_decay
         self._psi_m[human_id] = torch.tensor(
             self._psi_m[human_id].detach().numpy() * psi_decay,
@@ -1065,3 +1104,17 @@ class OvercookedPreferenceModel:
         self.log_sigma_r = torch.tensor(
             state["log_sigma_r"], dtype=torch.float32, requires_grad=True
         )
+
+        # Re-initialize phi for layouts that were registered BEFORE theta was
+        # loaded (e.g., eval layout registered in constructor with theta=0).
+        # These layouts have stale phi=0; re-register to initialize from loaded theta.
+        saved_layouts = set()
+        for h, ldict in state.get("phi_m", {}).items():
+            saved_layouts.update(ldict.keys())
+        for h in list(self._phi_m.keys()):
+            for L in list(self._phi_m[h].keys()):
+                if L not in saved_layouts:
+                    # This layout wasn't in the saved model — re-init from theta.
+                    del self._phi_m[h][L]
+                    del self._phi_logv[h][L]
+                    self.register_layout(h, L)

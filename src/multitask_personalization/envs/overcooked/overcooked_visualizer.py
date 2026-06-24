@@ -218,7 +218,7 @@ class OvercookedVisualizer:
             small_line_h = 16
 
             # Compute table panel width
-            table_w = 280
+            table_w = 340
             if table_rows and table_header:
                 # Estimate width from content
                 max_row_text = max(
@@ -227,12 +227,18 @@ class OvercookedVisualizer:
                 )
                 table_w = max(table_w, max_row_text * 8 + 20)
 
-            # Compute status area height
+            # Compute status area height and width
             n_status = len(status_lines) if status_lines else 0
             status_h = max(n_status * line_h + 8, 0)
 
-            # Total canvas size
-            total_w = gw + table_w
+            # Ensure the game side is wide enough for status text
+            status_w = 0
+            if status_lines:
+                status_w = max(len(line) * 8 + 16 for line in status_lines)
+
+            # Total canvas size — expand game side if status text is wider
+            left_w = max(gw, status_w)
+            total_w = left_w + table_w
             total_h = max(gh + status_h, 300)
 
             canvas = pygame.Surface((total_w, total_h))
@@ -251,7 +257,7 @@ class OvercookedVisualizer:
 
             # --- Draw preference table (right panel) ---
             if table_header and table_rows:
-                panel_x = gw + 4
+                panel_x = left_w + 4
                 y = 4
 
                 # Table title
@@ -299,7 +305,7 @@ class OvercookedVisualizer:
             # --- Config footer (below table, right panel) ---
             if table_footer:
                 y_footer = max(y + 12, status_h + gh - len(table_footer) * small_line_h - 8)
-                panel_x = gw + 4
+                panel_x = left_w + 4
                 pygame.draw.line(
                     canvas, (80, 80, 100),
                     (panel_x + 4, y_footer - 4),
